@@ -1,0 +1,49 @@
+{
+  "id": "test-building-polygon-001",
+  "kind": "building",
+  "source": "OSM",
+  "sourceId": "way/123456789",
+  "geometry": {
+    "type": "Polygon",
+    "coordinates": [[
+      [0.590500, 43.647500],
+      [0.591200, 43.647500],
+      [0.591200, 43.648000],
+      [0.590500, 43.648000],
+      [0.590500, 43.647500]
+    ]]
+  },
+  "properties": {
+    "name": "Test Building Alpha",
+    "height": 6.0,
+    "building": "yes"
+  },
+  "confidence": "high",
+  "status": "active",
+  "provenance": [
+    {
+      "featureId": "test-building-polygon-001",
+      "property": "geometry",
+      "winner": "OSM",
+      "contenders": ["OSM"],
+      "priority": 3,
+      "timestamp": "2026-08-25T10:00:00Z"
+    },
+    {
+      "featureId": "test-building-polygon-001",
+      "property": "height",
+      "winner": "OSM",
+      "contenders": ["OSM"],
+      "priority": 3,
+      "timestamp": "2026-08-25T10:00:00Z"
+    }
+  ],
+  "_acquisition": {
+    "source": "OSM",
+    "url": "https://www.openstreetmap.org/api/0.6/way/123456789",
+    "timestamp": "2026-08-25T10:00:00Z",
+    "license": "ODbL-1.0",
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "recordCount": 1
+  }
+}

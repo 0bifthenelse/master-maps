@@ -1,0 +1,55 @@
+{
+  "id": "test-building-multipolygon-001",
+  "kind": "building",
+  "source": "OSM",
+  "sourceId": "way/987654321",
+  "geometry": {
+    "type": "MultiPolygon",
+    "coordinates": [[[
+      [0.591500, 43.648500],
+      [0.592500, 43.648500],
+      [0.592500, 43.649500],
+      [0.591500, 43.649500],
+      [0.591500, 43.648500]
+    ], [
+      [0.591750, 43.648750],
+      [0.591750, 43.649000],
+      [0.592000, 43.649000],
+      [0.592000, 43.648750],
+      [0.591750, 43.648750]
+    ]]]
+  },
+  "properties": {
+    "name": "Test Courtyard Building",
+    "height": 8.0,
+    "building": "apartments"
+  },
+  "confidence": "high",
+  "status": "active",
+  "provenance": [
+    {
+      "featureId": "test-building-multipolygon-001",
+      "property": "geometry",
+      "winner": "OSM",
+      "contenders": ["OSM"],
+      "priority": 3,
+      "timestamp": "2026-08-25T10:05:00Z"
+    },
+    {
+      "featureId": "test-building-multipolygon-001",
+      "property": "height",
+      "winner": "OSM",
+      "contenders": ["OSM"],
+      "priority": 3,
+      "timestamp": "2026-08-25T10:05:00Z"
+    }
+  ],
+  "_acquisition": {
+    "source": "OSM",
+    "url": "https://www.openstreetmap.org/api/0.6/way/987654321",
+    "timestamp": "2026-08-25T10:05:00Z",
+    "license": "ODbL-1.0",
+    "sha256": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b",
+    "recordCount": 1
+  }
+}

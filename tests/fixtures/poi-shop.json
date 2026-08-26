@@ -1,0 +1,46 @@
+{
+  "id": "test-poi-shop-001",
+  "kind": "poi",
+  "source": "OSM",
+  "sourceId": "node/444555666",
+  "geometry": {
+    "type": "Point",
+    "coordinates": [0.591800, 43.647900]
+  },
+  "properties": {
+    "name": "Boulangerie d'Alsace",
+    "amenity": "shop",
+    "shop": "bakery",
+    "opening_hours": "Mo-Sa 07:00-19:00",
+    "addr:street": "Avenue d'Alsace",
+    "addr:housenumber": "15"
+  },
+  "confidence": "high",
+  "status": "active",
+  "provenance": [
+    {
+      "featureId": "test-poi-shop-001",
+      "property": "geometry",
+      "winner": "OSM",
+      "contenders": ["OSM"],
+      "priority": 3,
+      "timestamp": "2026-08-25T10:30:00Z"
+    },
+    {
+      "featureId": "test-poi-shop-001",
+      "property": "name",
+      "winner": "OSM",
+      "contenders": ["OSM"],
+      "priority": 3,
+      "timestamp": "2026-08-25T10:30:00Z"
+    }
+  ],
+  "_acquisition": {
+    "source": "OSM",
+    "url": "https://www.openstreetmap.org/api/0.6/node/444555666",
+    "timestamp": "2026-08-25T10:30:00Z",
+    "license": "ODbL-1.0",
+    "sha256": "ef2d127de37b942baad06145e54b0c619a4f08c0d7c3af76d8a4b4b5f2f3c5d6",
+    "recordCount": 1
+  }
+}

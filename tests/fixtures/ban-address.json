@@ -1,0 +1,53 @@
+{
+  "id": "test-address-ban-001",
+  "kind": "address",
+  "source": "BAN",
+  "sourceId": "32013_0050_00028",
+  "geometry": {
+    "type": "Point",
+    "coordinates": [0.591913, 43.648231]
+  },
+  "properties": {
+    "id": "32013_0050_00028",
+    "street": "Avenue d'Alsace",
+    "housenumber": "28",
+    "postcode": "32000",
+    "city": "Auch",
+    "citycode": "32013",
+    "department": "32",
+    "region": "76",
+    "source": "ban",
+    "type": "housenumber",
+    "distance": 0
+  },
+  "confidence": "high",
+  "status": "active",
+  "provenance": [
+    {
+      "featureId": "test-address-ban-001",
+      "property": "geometry",
+      "winner": "BAN",
+      "contenders": ["BAN"],
+      "priority": 4,
+      "timestamp": "2026-08-25T10:45:00Z"
+    },
+    {
+      "featureId": "test-address-ban-001",
+      "property": "address",
+      "winner": "BAN",
+      "contenders": ["BAN"],
+      "priority": 4,
+      "timestamp": "2026-08-25T10:45:00Z"
+    }
+  ],
+  "_acquisition": {
+    "source": "BAN",
+    "url": "https://api-adresse.data.gouv.fr/search/?q=28+avenue+d%27Alsace+32000+Auch&limit=1",
+    "timestamp": "2026-08-25T10:45:00Z",
+    "license": "ODbL-1.0",
+    "sha256": "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1",
+    "recordCount": 1,
+    "departmentResource": "https://geocoding-api.openstreetmap.org/",
+    "banId": "32013_0050_00028"
+  }
+}

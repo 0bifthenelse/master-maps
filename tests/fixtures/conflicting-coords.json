@@ -1,0 +1,125 @@
+{
+  "id": "test-conflicting-coords-001",
+  "kind": "poi",
+  "sourceRefs": [
+    {
+      "source": "OSM",
+      "sourceId": "node/666777888",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [0.591200, 43.648300]
+      },
+      "properties": {
+        "name": "Pharmacie d'Alsace",
+        "amenity": "pharmacy",
+        "addr:street": "Avenue d'Alsace",
+        "addr:housenumber": "22",
+        "addr:postcode": "32000",
+        "addr:city": "Auch"
+      },
+      "_acquisition": {
+        "source": "OSM",
+        "url": "https://www.openstreetmap.org/api/0.6/node/666777888",
+        "timestamp": "2026-08-25T10:50:00Z",
+        "license": "ODbL-1.0",
+        "sha256": "f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3",
+        "recordCount": 1
+      }
+    },
+    {
+      "source": "BAN",
+      "sourceId": "32013_0050_00022",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [0.591150, 43.648350]
+      },
+      "properties": {
+        "street": "Avenue d'Alsace",
+        "housenumber": "22",
+        "postcode": "32000",
+        "city": "Auch"
+      },
+      "_acquisition": {
+        "source": "BAN",
+        "url": "https://api-adresse.data.gouv.fr/search/?q=22+avenue+d%27Alsace+32000+Auch&limit=1",
+        "timestamp": "2026-08-26T09:00:00Z",
+        "license": "ODbL-1.0",
+        "sha256": "b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2",
+        "recordCount": 1
+      }
+    },
+    {
+      "source": "Google Maps",
+      "sourceId": null,
+      "geometry": {
+        "type": "Point",
+        "coordinates": [0.591250, 43.648320]
+      },
+      "properties": {
+        "name": "Pharmacie Auch"
+      },
+      "_acquisition": {
+        "source": "Google Maps",
+        "timestamp": "2026-08-26T09:05:00Z",
+        "license": "proprietary (corroboration only)",
+        "sha256": "c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3",
+        "recordCount": 1,
+        "note": "Google Maps result from snippet/search — not used as primary geometry source"
+      }
+    }
+  ],
+  "merged": {
+    "id": "test-conflicting-coords-001",
+    "kind": "poi",
+    "source": "OSM",
+    "sourceId": "node/666777888",
+    "geometry": {
+      "type": "Point",
+      "coordinates": [0.591200, 43.648300]
+    },
+    "properties": {
+      "name": "Pharmacie d'Alsace",
+      "amenity": "pharmacy",
+      "addr:street": "Avenue d'Alsace",
+      "addr:housenumber": "22",
+      "addr:postcode": "32000",
+      "addr:city": "Auch"
+    },
+    "confidence": "medium",
+    "status": "uncertain"
+  },
+  "provenance": [
+    {
+      "featureId": "test-conflicting-coords-001",
+      "property": "name",
+      "winner": "OSM",
+      "contenders": ["OSM", "Google Maps"],
+      "priority": 3,
+      "timestamp": "2026-08-26T09:10:00Z"
+    },
+    {
+      "featureId": "test-conflicting-coords-001",
+      "property": "geometry",
+      "winner": "OSM",
+      "contenders": ["OSM", "BAN", "Google Maps"],
+      "priority": 3,
+      "timestamp": "2026-08-26T09:10:00Z",
+      "note": "OSM (0.591200,43.648300) differs from BAN (0.591150,43.648350) by ~0.00007° (~6m). Google Maps coordinate (0.591250,43.648320) is corroboration only. OSM chosen as winner due to higher source priority (3 vs BAN 4)."
+    },
+    {
+      "featureId": "test-conflicting-coords-001",
+      "property": "address",
+      "winner": "BAN",
+      "contenders": ["BAN", "OSM"],
+      "priority": 4,
+      "timestamp": "2026-08-26T09:10:00Z",
+      "note": "BAN address structure used as canonical; OSM address was consistent."
+    }
+  ],
+  "_acquisition": {
+    "source": "merged",
+    "timestamp": "2026-08-26T09:10:00Z",
+    "recordCount": 3,
+    "note": "Three-source conflict: OSM, BAN, and Google Maps all return slightly different coordinates for same address (22 Avenue d'Alsace). Confidence set to medium, status uncertain. Primary geometry from OSM (priority 3), address from BAN (priority 4). Coordinate spread ~10m."
+  }
+}

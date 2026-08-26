@@ -1,0 +1,58 @@
+{
+  "id": "test-building-levels-001",
+  "kind": "building",
+  "source": "OSM",
+  "sourceId": "way/555666777",
+  "geometry": {
+    "type": "Polygon",
+    "coordinates": [[
+      [0.592000, 43.646500],
+      [0.592500, 43.646500],
+      [0.592500, 43.647000],
+      [0.592000, 43.647000],
+      [0.592000, 43.646500]
+    ]]
+  },
+  "properties": {
+    "name": "Test Building Levels",
+    "building:levels": 3,
+    "building": "apartments",
+    "height": 9.0
+  },
+  "confidence": "high",
+  "status": "active",
+  "provenance": [
+    {
+      "featureId": "test-building-levels-001",
+      "property": "geometry",
+      "winner": "OSM",
+      "contenders": ["OSM"],
+      "priority": 3,
+      "timestamp": "2026-08-25T10:10:00Z"
+    },
+    {
+      "featureId": "test-building-levels-001",
+      "property": "building:levels",
+      "winner": "OSM",
+      "contenders": ["OSM"],
+      "priority": 3,
+      "timestamp": "2026-08-25T10:10:00Z"
+    },
+    {
+      "featureId": "test-building-levels-001",
+      "property": "height",
+      "winner": "OSM",
+      "contenders": ["OSM"],
+      "priority": 3,
+      "timestamp": "2026-08-25T10:10:00Z"
+    }
+  ],
+  "_acquisition": {
+    "source": "OSM",
+    "url": "https://www.openstreetmap.org/api/0.6/way/555666777",
+    "timestamp": "2026-08-25T10:10:00Z",
+    "license": "ODbL-1.0",
+    "sha256": "6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b",
+    "recordCount": 1
+  }
+}

@@ -1,0 +1,107 @@
+{
+  "id": "test-business-nocibe-001",
+  "kind": "business",
+  "source": "BAN",
+  "sourceId": "32013_0050_00028",
+  "geometry": {
+    "type": "Point",
+    "coordinates": [0.591913, 43.648231]
+  },
+  "properties": {
+    "name": "Nocibé",
+    "searchKey": "nocibe",
+    "brand": "Nocibé",
+    "category": "beauty/cosmetics",
+    "addr:street": "Avenue d'Alsace",
+    "addr:housenumber": "28",
+    "addr:postcode": "32000",
+    "addr:city": "Auch",
+    "phone": "+33581051034",
+    "website": "https://www.nocibe.fr",
+    "opening_hours": "Mo-Sa 09:00-19:00",
+    "description": "Parfumerie et cosmétiques"
+  },
+  "confidence": "high",
+  "status": "active",
+  "provenance": [
+    {
+      "featureId": "test-business-nocibe-001",
+      "property": "geometry",
+      "winner": "BAN",
+      "contenders": ["BAN", "PagesJaunes"],
+      "priority": 4,
+      "timestamp": "2026-08-25T10:35:00Z"
+    },
+    {
+      "featureId": "test-business-nocibe-001",
+      "property": "address",
+      "winner": "BAN",
+      "contenders": ["BAN", "PagesJaunes"],
+      "priority": 4,
+      "timestamp": "2026-08-25T10:35:00Z"
+    },
+    {
+      "featureId": "test-business-nocibe-001",
+      "property": "name",
+      "winner": "BAN",
+      "contenders": ["BAN", "PagesJaunes"],
+      "priority": 4,
+      "timestamp": "2026-08-25T10:35:00Z"
+    },
+    {
+      "featureId": "test-business-nocibe-001",
+      "property": "phone",
+      "winner": "PagesJaunes",
+      "contenders": ["PagesJaunes", "BAN"],
+      "priority": 7,
+      "timestamp": "2026-08-25T10:35:00Z"
+    },
+    {
+      "featureId": "test-business-nocibe-001",
+      "property": "website",
+      "winner": "business website",
+      "contenders": ["business website", "PagesJaunes"],
+      "priority": 6,
+      "timestamp": "2026-08-25T10:35:00Z"
+    }
+  ],
+  "focusAnchors": [
+    {
+      "name": "Avenue d'Alsace Nocibé",
+      "type": "business",
+      "coordinates": [0.591913, 43.648231],
+      "source": "BAN",
+      "sourceId": "32013_0050_00028"
+    },
+    {
+      "name": "Place de Verdun",
+      "type": "anchor",
+      "coordinates": [0.592746, 43.648079],
+      "source": "BAN",
+      "sourceId": null
+    },
+    {
+      "name": "Place Villaret Joyeuse",
+      "type": "anchor",
+      "coordinates": [0.588099, 43.649466],
+      "source": "BAN",
+      "sourceId": null
+    }
+  ],
+  "_acquisition": {
+    "source": "BAN",
+    "url": "https://api-adresse.data.gouv.fr/search/?q=28+avenue+d%27Alsace+32000+Auch&limit=1",
+    "timestamp": "2026-08-25T10:35:00Z",
+    "license": "ODbL-1.0",
+    "sha256": "4fc82b26a8d4e1e3ef2c8c0b8e1f7c4e8f3d3c5a6b7c8d9e0f1a2b3c4d5e6f7",
+    "recordCount": 1,
+    "secondarySources": [
+      {
+        "source": "PagesJaunes",
+        "url": "https://www.pagesjaunes.fr/pros/08905195",
+        "timestamp": "2026-08-25T10:36:00Z",
+        "license": "proprietary"
+      }
+    ]
+  }
+}

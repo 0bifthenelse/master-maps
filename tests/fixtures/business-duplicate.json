@@ -1,0 +1,118 @@
+{
+  "id": "test-business-duplicate-001",
+  "kind": "business",
+  "sourceRefs": [
+    {
+      "source": "OSM",
+      "sourceId": "node/555666777",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [0.590500, 43.648500]
+      },
+      "properties": {
+        "name": "Café Auch",
+        "amenity": "cafe",
+        "addr:street": "Place de Verdun",
+        "addr:housenumber": "3",
+        "addr:postcode": "32000",
+        "addr:city": "Auch"
+      },
+      "_acquisition": {
+        "source": "OSM",
+        "url": "https://www.openstreetmap.org/api/0.6/node/555666777",
+        "timestamp": "2026-08-25T10:40:00Z",
+        "license": "ODbL-1.0",
+        "sha256": "d7a8fbb307d7809469ca9abcb0082e4f8d5651e46d3cdb762d02d0bf7c9e4d5c",
+        "recordCount": 1
+      }
+    },
+    {
+      "source": "Annuaire des Entreprises",
+      "sourceId": "12345678901234",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [0.590550, 43.648470]
+      },
+      "properties": {
+        "name": "Café Auch",
+        "siren": "123456789",
+        "nic": "01234",
+        "addr:street": "Place de Verdun",
+        "addr:housenumber": "3",
+        "addr:postcode": "32000",
+        "addr:city": "Auch"
+      },
+      "_acquisition": {
+        "source": "Annuaire des Entreprises",
+        "url": "https://annuaire-entreprises.data.gouv.fr/etablissement/12345678901234",
+        "timestamp": "2026-08-26T08:00:00Z",
+        "license": "License Ouverture v2.0",
+        "sha256": "e2c0b5e5e6f6d7c7a8b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9",
+        "recordCount": 1
+      }
+    }
+  ],
+  "merged": {
+    "id": "test-business-duplicate-001",
+    "kind": "business",
+    "source": "Annuaire des Entreprises",
+    "sourceId": "12345678901234",
+    "geometry": {
+      "type": "Point",
+      "coordinates": [0.590500, 43.648500]
+    },
+    "properties": {
+      "name": "Café Auch",
+      "amenity": "cafe",
+      "siren": "123456789",
+      "nic": "01234",
+      "addr:street": "Place de Verdun",
+      "addr:housenumber": "3",
+      "addr:postcode": "32000",
+      "addr:city": "Auch"
+    },
+    "confidence": "high",
+    "status": "active"
+  },
+  "provenance": [
+    {
+      "featureId": "test-business-duplicate-001",
+      "property": "name",
+      "winner": "OSM",
+      "contenders": ["OSM", "Annuaire des Entreprises"],
+      "priority": 3,
+      "timestamp": "2026-08-26T08:30:00Z"
+    },
+    {
+      "featureId": "test-business-duplicate-001",
+      "property": "geometry",
+      "winner": "OSM",
+      "contenders": ["OSM", "Annuaire des Entreprises"],
+      "priority": 3,
+      "timestamp": "2026-08-26T08:30:00Z",
+      "note": "OSM geometry used; Annuaire coordinates differ by ~0.00005° (~5m)"
+    },
+    {
+      "featureId": "test-business-duplicate-001",
+      "property": "siren",
+      "winner": "Annuaire des Entreprises",
+      "contenders": ["Annuaire des Entreprises"],
+      "priority": 5,
+      "timestamp": "2026-08-26T08:30:00Z"
+    },
+    {
+      "featureId": "test-business-duplicate-001",
+      "property": "address",
+      "winner": "OSM",
+      "contenders": ["OSM", "Annuaire des Entreprises"],
+      "priority": 3,
+      "timestamp": "2026-08-26T08:30:00Z"
+    }
+  ],
+  "_acquisition": {
+    "source": "merged",
+    "timestamp": "2026-08-26T08:30:00Z",
+    "recordCount": 2,
+    "note": "Duplicate detection: same name and address from OSM and Annuaire des Entreprises. Coordinates differ by ~5m."
+  }
+}

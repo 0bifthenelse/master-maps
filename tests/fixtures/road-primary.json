@@ -1,0 +1,51 @@
+{
+  "id": "test-road-primary-001",
+  "kind": "road",
+  "source": "OSM",
+  "sourceId": "way/111222333",
+  "geometry": {
+    "type": "LineString",
+    "coordinates": [
+      [0.590000, 43.647000],
+      [0.591000, 43.647000],
+      [0.592000, 43.647100],
+      [0.593000, 43.647200]
+    ]
+  },
+  "properties": {
+    "name": "Avenue d'Alsace",
+    "highway": "primary",
+    "width": 9.0,
+    "surface": "asphalt",
+    "oneway": "yes",
+    "maxspeed": 50
+  },
+  "confidence": "high",
+  "status": "active",
+  "provenance": [
+    {
+      "featureId": "test-road-primary-001",
+      "property": "geometry",
+      "winner": "OSM",
+      "contenders": ["OSM"],
+      "priority": 3,
+      "timestamp": "2026-08-25T10:15:00Z"
+    },
+    {
+      "featureId": "test-road-primary-001",
+      "property": "width",
+      "winner": "OSM",
+      "contenders": ["OSM"],
+      "priority": 3,
+      "timestamp": "2026-08-25T10:15:00Z"
+    }
+  ],
+  "_acquisition": {
+    "source": "OSM",
+    "url": "https://www.openstreetmap.org/api/0.6/way/111222333",
+    "timestamp": "2026-08-25T10:15:00Z",
+    "license": "ODbL-1.0",
+    "sha256": "d4735e3a265e16eee03f59718b9b5d03019c07d8b6c51f90da3a666eec13ab35",
+    "recordCount": 1
+  }
+}

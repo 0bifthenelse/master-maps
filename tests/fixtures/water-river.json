@@ -1,0 +1,51 @@
+{
+  "id": "test-water-river-001",
+  "kind": "water",
+  "source": "OSM",
+  "sourceId": "way/333444555",
+  "geometry": {
+    "type": "LineString",
+    "coordinates": [
+      [0.595000, 43.640000],
+      [0.594000, 43.641000],
+      [0.593500, 43.642000],
+      [0.593000, 43.643000],
+      [0.592500, 43.644000],
+      [0.592000, 43.645000]
+    ]
+  },
+  "properties": {
+    "name": "Gers",
+    "waterway": "river",
+    "width": 15.0,
+    "intermittent": "no"
+  },
+  "confidence": "high",
+  "status": "active",
+  "provenance": [
+    {
+      "featureId": "test-water-river-001",
+      "property": "geometry",
+      "winner": "OSM",
+      "contenders": ["OSM"],
+      "priority": 3,
+      "timestamp": "2026-08-25T10:25:00Z"
+    },
+    {
+      "featureId": "test-water-river-001",
+      "property": "waterway",
+      "winner": "OSM",
+      "contenders": ["OSM"],
+      "priority": 3,
+      "timestamp": "2026-08-25T10:25:00Z"
+    }
+  ],
+  "_acquisition": {
+    "source": "OSM",
+    "url": "https://www.openstreetmap.org/api/0.6/way/333444555",
+    "timestamp": "2026-08-25T10:25:00Z",
+    "license": "ODbL-1.0",
+    "sha256": "4b227777d4dd1fc61c6f884f48641d02b4d121d3fd328cb08b5531fcacd22f7a",
+    "recordCount": 1
+  }
+}

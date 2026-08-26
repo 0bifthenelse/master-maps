@@ -1,0 +1,52 @@
+{
+  "id": "test-road-bridge-001",
+  "kind": "road",
+  "source": "OSM",
+  "sourceId": "way/222333444",
+  "geometry": {
+    "type": "LineString",
+    "coordinates": [
+      [0.588000, 43.648000],
+      [0.589000, 43.647800],
+      [0.590000, 43.647600],
+      [0.591000, 43.647400]
+    ]
+  },
+  "properties": {
+    "name": "Route de la Gare",
+    "highway": "secondary",
+    "bridge": "yes",
+    "width": 7.0,
+    "surface": "asphalt",
+    "layer": 1,
+    "maxspeed": 50
+  },
+  "confidence": "high",
+  "status": "active",
+  "provenance": [
+    {
+      "featureId": "test-road-bridge-001",
+      "property": "geometry",
+      "winner": "OSM",
+      "contenders": ["OSM"],
+      "priority": 3,
+      "timestamp": "2026-08-25T10:20:00Z"
+    },
+    {
+      "featureId": "test-road-bridge-001",
+      "property": "bridge",
+      "winner": "OSM",
+      "contenders": ["OSM"],
+      "priority": 3,
+      "timestamp": "2026-08-25T10:20:00Z"
+    }
+  ],
+  "_acquisition": {
+    "source": "OSM",
+    "url": "https://www.openstreetmap.org/api/0.6/way/222333444",
+    "timestamp": "2026-08-25T10:20:00Z",
+    "license": "ODbL-1.0",
+    "sha256": "4e07408562bedb8b60ce05c1decfe3ad16b72230967de01f640b7e4729b49a91",
+    "recordCount": 1
+  }
+}
