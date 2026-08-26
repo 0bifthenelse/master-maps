@@ -1,0 +1,29 @@
+# City data — never commit raw or generated data
+/data/*
+!/data/.gitkeep
+
+# Test artifacts
+/tests/artifacts/
+
+# Moli profiles and logs
+moli-profiles/
+moli.log
+
+# Local environment
+.env
+.env.local
+.env.production
+
+# Next.js build artifacts
+.next/
+
+# Node
+node_modules/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
