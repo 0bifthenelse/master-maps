@@ -16,9 +16,13 @@ moli.log
 
 # Next.js build artifacts
 .next/
+next-env.d.ts
 
 # Build artifacts
 tsconfig.tsbuildinfo
+
+# Dependencies
+node_modules/
 
 # IDE
 .vscode/
