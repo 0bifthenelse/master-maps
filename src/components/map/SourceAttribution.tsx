@@ -28,7 +28,8 @@ export interface SourceAttributionProps {
 /* ------------------------------------------------------------------ */
 
 export function SourceAttribution({ data }: SourceAttributionProps) {
-  const { sources, datasetVersion, acquisitionTime, osmAttribution } = data;
+  if (!data) return null;
+  const { sources = [], datasetVersion, acquisitionTime, osmAttribution } = data;
 
   // Collect unique license strings
   const licenses = new Set(

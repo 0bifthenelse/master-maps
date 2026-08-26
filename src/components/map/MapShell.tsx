@@ -179,6 +179,8 @@ interface TileManifestEntry {
 interface ManifestData {
   datasetVersion: string;
   acquisitionTime: string;
+  version?: string;
+  pipeline?: string[];
   boundary: {
     west: number;
     east: number;
@@ -545,6 +547,45 @@ export default function MapShell() {
     return selectedFeature;
   }, [selectedFeature, manifest]);
 
+  /** Derive attribution data from the dataset manifest pipeline. */
+  const attributionData = useMemo(() => {
+    if (!manifest) return null;
+
+    const pipelineSources: Record<string, { source: string; url: string }> = {
+      "fetch-osm": {
+        source: "OpenStreetMap",
+        url: "https://www.openstreetmap.org",
+      },
+      "fetch-addresses": {
+        source: "Base Adresse Nationale",
+        url: "https://adresse.data.gouv.fr",
+      },
+      "fetch-businesses": {
+        source: "Annuaire des Entreprises",
+        url: "https://annuaire-entreprises.data.gouv.fr",
+      },
+      "fetch-ign": {
+        source: "IGN",
+        url: "https://geoservices.ign.fr",
+      },
+    };
+
+    const sources: SourceReference[] = (manifest.pipeline ?? [])
+      .filter((step) => step in pipelineSources)
+      .map((step) => ({
+        source: pipelineSources[step].source,
+        url: pipelineSources[step].url,
+        timestamp: manifest.acquisitionTime,
+      }));
+
+    return {
+      datasetVersion: manifest.version ?? manifest.datasetVersion ?? "unknown",
+      acquisitionTime: manifest.acquisitionTime,
+      sources,
+      osmAttribution: "Contributeurs d\u2019OpenStreetMap",
+    };
+  }, [manifest]);
+
   // ---- Render ----
   return (
     <div
@@ -691,7 +732,7 @@ export default function MapShell() {
 
       {/* Source attribution */}
       {!hasCriticalError && !loading && (
-        <SourceAttribution manifest={manifest} />
+        <SourceAttribution data={attributionData} />
       )}
 
       {/* Scene diagnostics element */}
