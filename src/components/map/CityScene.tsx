@@ -1,81 +1,184 @@
-// @ts-nocheck
 "use client";
 
-import { useRef, useMemo } from "react";
-import type { ReactNode } from "react";
-import { useFrame } from "@react-three/fiber";
-
+import { useEffect, useMemo } from "react";
 import {
   roadMat,
   waterMat,
   buildingMat,
   landuseMat,
-  poiMat,
+  getPaperColor,
 } from "@/lib/scene/materials";
-import { sceneMetrics } from "@/lib/scene/sceneMetrics";
+import { sceneMetrics, publishSceneDiagnostics } from "@/lib/scene/sceneMetrics";
 import { buildBuildings } from "@/lib/scene/buildBuildings";
 import { buildRoads } from "@/lib/scene/buildRoads";
 import buildWater from "@/lib/scene/buildWater";
 import { buildLanduse } from "@/lib/scene/buildLanduse";
 import buildPois from "@/lib/scene/buildPois";
-import type { MapFeature } from "@/lib/data/schema";
 
-export interface CitySceneProps {
-  features: MapFeature[];
-  selectedFeatureId?: string | null;
-  children?: ReactNode;
+type Coordinate = [number, number];
+type Geometry =
+  | { type: "Point"; coordinates: Coordinate }
+  | { type: "LineString"; coordinates: Coordinate[] }
+  | { type: "Polygon"; coordinates: Coordinate[][] }
+  | { type: "MultiPolygon"; coordinates: Coordinate[][][] };
+
+type FeatureKind = "building" | "road" | "water" | "landuse" | "poi" | "business";
+
+export interface SceneFeature {
+  kind: FeatureKind;
+  stableId: string;
+  geometry: Geometry;
+  name?: string;
+  x?: number;
+  z?: number;
+  height?: number;
+  levels?: number;
+  highway?: string;
+  roadClass?: string;
+  width?: number;
+  waterType?: string;
+  landuseType?: string;
+  category?: string;
+  size?: number;
+  color?: string;
+  bridge?: boolean;
+  tunnel?: boolean;
 }
 
-function separateByKind(features: MapFeature[]) {
-  if (!features) return { building: [], road: [], water: [], landuse: [], poi: [] };
-  const building = features.filter((f): f is MapFeature => f.kind === "building");
-  const road = features.filter((f): f is MapFeature => f.kind === "road");
-  const water = features.filter((f): f is MapFeature => f.kind === "water");
-  const landuse = features.filter((f): f is MapFeature => f.kind === "landuse");
-  const poi = features.filter((f): f is MapFeature => f.kind === "poi" || f.kind === "business");
-  return { building, road, water, landuse, poi };
+export interface CitySceneProps {
+  features: SceneFeature[];
+  layers: Record<string, boolean>;
+  selectedFeature?: unknown;
+  onFeatureSelect?: (feature: unknown | null) => void;
+  cameraFocus?: { x: number; z: number } | null;
+  onCameraMoveComplete?: () => void;
+  bounds?: [number, number, number, number];
+}
+
+function visible(feature: SceneFeature, layers: Record<string, boolean>): boolean {
+  if (feature.kind === "building") return layers.buildings !== false;
+  if (feature.kind === "road") return layers.roads !== false;
+  if (feature.kind === "water") return layers.water !== false;
+  if (feature.kind === "landuse") return layers.landuse !== false;
+  return layers.pois !== false;
+}
+
+function isPolygon(geometry: Geometry): geometry is Extract<Geometry, { type: "Polygon" | "MultiPolygon" }> {
+  return geometry.type === "Polygon" || geometry.type === "MultiPolygon";
+}
+
+type BuildingScene = SceneFeature & { kind: "building"; geometry: Extract<Geometry, { type: "Polygon" | "MultiPolygon" }> };
+type RoadScene = SceneFeature & { kind: "road"; geometry: Extract<Geometry, { type: "LineString" }> };
+type WaterScene = SceneFeature & { kind: "water"; geometry: Extract<Geometry, { type: "Polygon" | "MultiPolygon" }> };
+type LanduseScene = SceneFeature & { kind: "landuse"; geometry: Extract<Geometry, { type: "Polygon" | "MultiPolygon" }> };
+type PoiScene = SceneFeature & { kind: "poi" | "business"; geometry: Extract<Geometry, { type: "Point" }> };
+
+function isBuildingFeature(feature: SceneFeature): feature is BuildingScene {
+  return feature.kind === "building" && isPolygon(feature.geometry);
+}
+function isRoadFeature(feature: SceneFeature): feature is RoadScene {
+  return feature.kind === "road" && feature.geometry.type === "LineString";
+}
+function isWaterFeature(feature: SceneFeature): feature is WaterScene {
+  return feature.kind === "water" && isPolygon(feature.geometry);
+}
+function isLanduseFeature(feature: SceneFeature): feature is LanduseScene {
+  return feature.kind === "landuse" && isPolygon(feature.geometry);
+}
+function isPoiFeature(feature: SceneFeature): feature is PoiScene {
+  return (feature.kind === "poi" || feature.kind === "business") && feature.geometry.type === "Point";
 }
 
 export default function CityScene({
   features,
-  selectedFeatureId,
-  children,
+  layers,
+  cameraFocus,
+  bounds,
 }: CitySceneProps) {
-  const groupRef = useRef<THREE.Group>(null);
+  const activeFeatures = useMemo(
+    () => features.filter((feature) => visible(feature, layers)),
+    [features, layers],
+  );
+  const groups = useMemo(() => ({
+    building: activeFeatures.filter(isBuildingFeature),
+    road: activeFeatures.filter(isRoadFeature),
+    water: activeFeatures.filter(isWaterFeature),
+    landuse: activeFeatures.filter(isLanduseFeature),
+    poi: activeFeatures.filter(isPoiFeature),
+  }), [activeFeatures]);
+  const buildingResult = useMemo(
+    () => buildBuildings(groups.building.map((feature) => ({ ...feature, kind: "building" as const }))),
+    [groups.building],
+  );
+  const roadResult = useMemo(
+    () =>
+      buildRoads(
+        groups.road.map((feature) => ({
+          ...feature,
+          kind: "road" as const,
+          highway: feature.highway ?? feature.roadClass,
+        })),
+      ),
+    [groups.road],
+  );
+  const waterResult = useMemo(
+    () => buildWater(groups.water.map((feature) => ({ ...feature, kind: "water" as const }))),
+    [groups.water],
+  );
+  const landuseResult = useMemo(
+    () => buildLanduse(groups.landuse.map((feature) => ({ ...feature, kind: "landuse" as const }))),
+    [groups.landuse],
+  );
+  const poiResult = useMemo(
+    () => buildPois(groups.poi.map((feature) => ({ ...feature, kind: "poi" as const }))),
+    [groups.poi],
+  );
 
-  const separated = useMemo(() => separateByKind(features), [features]);
-  const buildingResult = useMemo(() => separated.building.length > 0 ? buildBuildings(separated.building) : null, [separated.building]);
-  const roadResult = useMemo(() => separated.road.length > 0 ? buildRoads(separated.road) : null, [separated.road]);
-  const waterResult = useMemo(() => separated.water.length > 0 ? buildWater(separated.water) : null, [separated.water]);
-  const landuseResult = useMemo(() => separated.landuse.length > 0 ? buildLanduse(separated.landuse) : null, [separated.landuse]);
-  const poiResult = useMemo(() => separated.poi.length > 0 ? buildPois(separated.poi) : null, [separated.poi]);
-
-  useFrame(() => {
+  useEffect(() => {
     sceneMetrics.loadedFeatureCount = features.length;
-    sceneMetrics.buildingCount = separated.building.length;
-    sceneMetrics.roadCount = separated.road.length;
-    sceneMetrics.poiCount = separated.poi.length;
-    sceneMetrics.drawCalls = 5;
-  });
+    sceneMetrics.buildingCount = groups.building.length;
+    sceneMetrics.roadCount = groups.road.length;
+    sceneMetrics.waterCount = groups.water.length;
+    sceneMetrics.landuseCount = groups.landuse.length;
+    sceneMetrics.poiCount = groups.poi.length;
+    const geometryCount = [
+      buildingResult.geometry,
+      roadResult.geometry,
+      waterResult.geometry,
+      landuseResult.geometry,
+    ].filter((geometry) => (geometry.getAttribute("position")?.count ?? 0) > 0).length;
+    sceneMetrics.drawCalls = geometryCount + (poiResult.mesh.count > 0 ? 1 : 0);
+    sceneMetrics.cameraState = cameraFocus
+      ? `focus:(${cameraFocus.x.toFixed(1)},${cameraFocus.z.toFixed(1)})`
+      : bounds
+        ? `bounds:(${bounds[0].toFixed(1)},${bounds[1].toFixed(1)})-(${bounds[2].toFixed(1)},${bounds[3].toFixed(1)})`
+        : "idle";
+    // React commits this effect synchronously after the scene graph
+    // reflects the current feature set — publish immediately instead of
+    // waiting for the next requestAnimationFrame tick, which otherwise
+    // leaves a window where renderer-status reads "initialized" while
+    // building/road/poi/draw counts still read their stale defaults.
+    publishSceneDiagnostics(true);
+  }, [features, groups, buildingResult, roadResult, waterResult, landuseResult, poiResult, cameraFocus, bounds]);
 
   return (
-    <group ref={groupRef}>
-      {landuseResult && landuseResult.geometry && (
-        <mesh geometry={landuseResult.geometry} material={landuseMat} renderOrder={0} />
-      )}
-      {waterResult && waterResult.geometry && (
-        <mesh geometry={waterResult.geometry} material={waterMat} renderOrder={1} />
-      )}
-      {roadResult && roadResult.geometry && (
-        <mesh geometry={roadResult.geometry} material={roadMat} renderOrder={2} />
-      )}
-      {buildingResult && buildingResult.geometry && (
-        <mesh geometry={buildingResult.geometry} material={buildingMat} renderOrder={3} />
-      )}
-      {poiResult && (
-        <primitive object={poiResult.mesh} />
-      )}
-      {children}
-    </group>
+    <>
+      <color attach="background" args={[getPaperColor()]} />
+      <group>
+        {landuseResult.geometry.getAttribute("position")?.count ? (
+          <mesh geometry={landuseResult.geometry} material={landuseMat} renderOrder={0} />
+        ) : null}
+        {waterResult.geometry.getAttribute("position")?.count ? (
+          <mesh geometry={waterResult.geometry} material={waterMat} renderOrder={1} />
+        ) : null}
+        {roadResult.geometry.getAttribute("position")?.count ? (
+          <mesh geometry={roadResult.geometry} material={roadMat} renderOrder={2} />
+        ) : null}
+        {buildingResult.geometry.getAttribute("position")?.count ? (
+          <mesh geometry={buildingResult.geometry} material={buildingMat} renderOrder={3} />
+        ) : null}
+        {poiResult.mesh ? <primitive object={poiResult.mesh} renderOrder={4} /> : null}
+      </group>
+    </>
   );
 }

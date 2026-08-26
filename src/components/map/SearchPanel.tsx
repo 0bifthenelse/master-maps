@@ -136,7 +136,7 @@ export function SearchPanel({ onSelect, onClose, open = true }: SearchPanelProps
   if (!open) return null;
 
   return (
-    <div className="search-panel" role="combobox" aria-expanded={results.length > 0} aria-haspopup="listbox">
+    <div className="search-panel" role="combobox" aria-expanded={results.length > 0} aria-haspopup="listbox" aria-controls="search-results">
       <div className="search-input-wrapper">
         <svg
           className="search-icon"

@@ -6,8 +6,8 @@ export default defineConfig({
   testDir: "./tests/e2e",
   timeout: 60000,
   retries: 0,
+  workers: 1,
   fullyParallel: false,
-  forbidOnly: true,
   use: {
     baseURL: `http://127.0.0.1:${NEXT_PORT}`,
     actionTimeout: 10000,

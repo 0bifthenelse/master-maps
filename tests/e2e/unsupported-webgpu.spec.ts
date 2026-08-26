@@ -14,7 +14,7 @@ test.describe("WebGPU unsupported state", () => {
     await page.waitForLoadState("networkidle");
 
     // Should show the WebGPU unsupported component
-    const unsupportedMsg = page.locator("text=WebGPU");
+    const unsupportedMsg = page.getByRole("heading", { name: "WebGPU non disponible" });
     await expect(unsupportedMsg).toBeVisible({ timeout: 10000 });
   });
 

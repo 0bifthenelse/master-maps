@@ -1,280 +1,172 @@
-'use client'
+"use client";
 
-import {
-  useState,
-  useEffect,
-  useCallback,
-  useRef,
-  type ReactNode,
-} from 'react'
-import { Canvas } from '@react-three/fiber'
-import { WebGPURenderer } from 'three/webgpu'
-import WebGPUUnsupported from './WebGPUUnsupported'
-import LoadingState from './LoadingState'
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import { Canvas } from "@react-three/fiber";
+import { WebGPURenderer } from "three/webgpu";
+import WebGPUUnsupported from "./WebGPUUnsupported";
+import LoadingState from "./LoadingState";
+import { sceneMetrics, publishSceneDiagnostics } from "@/lib/scene/sceneMetrics";
 
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
-
-export interface WebGPUCityCanvasProps {
-  children: ReactNode
-}
-
-/** Augment Navigator so strict DOM libs accept the WebGPU property. */
 declare global {
   interface Navigator {
-    gpu?: { readonly [key: string]: unknown }
+    gpu?: { requestAdapter?: () => Promise<unknown> };
   }
 }
 
-/** Runtime tracker for WebGPU support in this browser session. */
-type GpuStatus = 'checking' | 'supported' | 'unsupported'
-
-/** Minimal shape r3f requires from a renderer: it must expose `render`. */
-interface GlRendererContract {
-  render: (...args: unknown[]) => unknown
+interface RendererContract {
+  render: (...args: unknown[]) => unknown;
 }
 
-// ---------------------------------------------------------------------------
-// Diagnostics helpers
-// ---------------------------------------------------------------------------
-
-function setDiagnostic(key: string, value: string | number | null): void {
-  if (typeof document === 'undefined') return
-  const el = document.getElementById('scene-diagnostics')
-  if (!el) return
-  const attr = `data-${key}`
-  if (value === null || value === '') {
-    el.removeAttribute(attr)
-  } else {
-    el.setAttribute(attr, String(value))
-  }
+export interface WebGPUCityCanvasProps {
+  children: ReactNode;
+  bounds?: [number, number, number, number];
 }
 
-function showDiagnostics(): boolean {
-  return (
-    process.env.NEXT_PUBLIC_MAP_DIAGNOSTICS === '1' ||
-    process.env.NODE_ENV !== 'production'
-  )
+const DEFAULT_BOUNDS: [number, number, number, number] = [0, -3000, 3000, 0];
+const CAMERA_HEIGHT = 10000;
+const CAMERA_FAR = 50000;
+
+function diagnosticError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
-// ---------------------------------------------------------------------------
-// Default orthographic frustum (world units, centred on commune)
-// Auch spans roughly 10 km east-west × 5 km north-south; add padding.
-// ---------------------------------------------------------------------------
-
-const FRUSTUM_SIZE = 6000 // half-extent in metres
-const CAMERA_HEIGHT = 10000
-const CAMERA_FAR = 50000
-
-// ---------------------------------------------------------------------------
-// Component
-// ---------------------------------------------------------------------------
-
-export default function WebGPUCityCanvas({ children }: WebGPUCityCanvasProps) {
-  const [gpuStatus, setGpuStatus] = useState<GpuStatus>('checking')
-  const [deviceLost, setDeviceLost] = useState(false)
-  const [initError, setInitError] = useState<string | null>(null)
-  const mountedRef = useRef(true)
-  const initAttempted = useRef(false)
-
-  // ---------- Cleanup flag ----------
+export default function WebGPUCityCanvas({ children, bounds }: WebGPUCityCanvasProps) {
+  const [gpuStatus, setGpuStatus] = useState<"checking" | "supported" | "unsupported">("checking");
+  const [initError, setInitError] = useState<string | null>(null);
+  const mountedRef = useRef(true);
+  const sceneBounds = bounds ?? DEFAULT_BOUNDS;
+  const centerX = (sceneBounds[0] + sceneBounds[2]) / 2;
+  const centerZ = (sceneBounds[1] + sceneBounds[3]) / 2;
+  const width = Math.max(1, sceneBounds[2] - sceneBounds[0]);
+  const height = Math.max(1, sceneBounds[3] - sceneBounds[1]);
 
   useEffect(() => {
     return () => {
-      mountedRef.current = false
-
-      if (showDiagnostics()) {
-        setDiagnostic('renderer-status', null)
-        setDiagnostic('backend', null)
-        setDiagnostic('renderer-error', null)
-      }
-    }
-  }, [])
-
-  // ---------- WebGPU availability check ----------
+      mountedRef.current = false;
+    };
+  }, []);
 
   useEffect(() => {
-    const available =
-      typeof navigator !== 'undefined' &&
-      typeof navigator.gpu !== 'undefined'
+    let cancelled = false;
+    const checkAdapter = async (): Promise<void> => {
+      if (!navigator.gpu?.requestAdapter) {
+        const error = "navigator.gpu est indisponible dans ce navigateur.";
+        if (!cancelled) {
+          setInitError(error);
+          sceneMetrics.rendererStatus = "unsupported";
+          sceneMetrics.backend = "unknown";
+          sceneMetrics.rendererError = error;
+          publishSceneDiagnostics(true);
+          setGpuStatus("unsupported");
+        }
+        return;
+      }
+      const adapter = await navigator.gpu.requestAdapter();
+      if (!adapter) {
+        const error = "Aucun adaptateur WebGPU n’est disponible.";
+        if (!cancelled) {
+          setInitError(error);
+          sceneMetrics.rendererStatus = "unsupported";
+          sceneMetrics.backend = "webgpu";
+          sceneMetrics.rendererError = error;
+          publishSceneDiagnostics(true);
+          setGpuStatus("unsupported");
+        }
+        return;
+      }
+      if (!cancelled) {
+        sceneMetrics.rendererStatus = "loading";
+        sceneMetrics.backend = "webgpu";
+        sceneMetrics.rendererError = "none";
+        publishSceneDiagnostics(true);
+        setGpuStatus("supported");
+      }
+    };
+    void checkAdapter().catch((error: unknown) => {
+      if (!cancelled) {
+        const message = diagnosticError(error);
+        setInitError(message);
+        sceneMetrics.rendererStatus = "errored";
+        sceneMetrics.backend = "webgpu";
+        sceneMetrics.rendererError = message;
+        publishSceneDiagnostics(true);
+        setGpuStatus("unsupported");
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
-    if (!mountedRef.current) return
+  const handleDeviceLost = useCallback((info: { message: string; reason: string | null }) => {
+    if (!mountedRef.current) return;
+    const error = info.reason ? `${info.message} (${info.reason})` : info.message;
+    sceneMetrics.rendererStatus = "lost";
+    sceneMetrics.rendererError = error;
+    publishSceneDiagnostics(true);
+    setInitError(error);
+    setGpuStatus("unsupported");
+  }, []);
 
-    if (!available) {
-      setGpuStatus('unsupported')
-      setInitError(
-        'navigator.gpu est indéfini. WebGPU nécessite un navigateur compatible (Chrome 113+, Edge 113+).',
-      )
-    } else {
-      setGpuStatus('supported')
+  const glFactory = useCallback(async (props: { canvas: HTMLCanvasElement; stencil?: boolean }): Promise<RendererContract> => {
+    if (!navigator.gpu) throw new Error("WebGPU non pris en charge");
+    try {
+      const renderer = new WebGPURenderer({
+        canvas: props.canvas,
+        antialias: true,
+        alpha: false,
+        depth: true,
+        stencil: props.stencil ?? true,
+      });
+      renderer.onDeviceLost = handleDeviceLost;
+      await renderer.init();
+      if (mountedRef.current) {
+        sceneMetrics.rendererStatus = "initialized";
+        sceneMetrics.backend = "webgpu";
+        sceneMetrics.rendererError = "none";
+        publishSceneDiagnostics(true);
+      }
+      return renderer as unknown as RendererContract;
+    } catch (error: unknown) {
+      const message = diagnosticError(error);
+      if (mountedRef.current) {
+        sceneMetrics.rendererStatus = "errored";
+        sceneMetrics.backend = "webgpu";
+        sceneMetrics.rendererError = message;
+        publishSceneDiagnostics(true);
+        setInitError(message);
+        setGpuStatus("unsupported");
+      }
+      throw error;
     }
-  }, [])
+  }, [handleDeviceLost]);
 
-  // ---------- Device lost handler ----------
-
-  const handleDeviceLost = useCallback(
-    (info: { message: string; reason: string | null; api?: string }) => {
-      if (!mountedRef.current) return
-      setDeviceLost(true)
-      setInitError(
-        info.reason
-          ? `Device lost: ${info.message} (${info.reason})`
-          : `Device lost: ${info.message}`,
-      )
-      setDiagnostic('renderer-status', 'lost')
-      setDiagnostic('renderer-error', info.message)
-    },
-    [],
-  )
-
-  // ---------- Async WebGPU renderer factory ----------
-
-  const glFactory = useCallback(
-    async (defaultProps: {
-      canvas: HTMLCanvasElement
-      stencil?: boolean
-    }): Promise<GlRendererContract> => {
-      if (
-        typeof navigator === 'undefined' ||
-        typeof navigator.gpu === 'undefined'
-      ) {
-        throw new Error('WebGPU non pris en charge')
-      }
-
-      initAttempted.current = true
-
-      let renderer: WebGPURenderer
-      try {
-        renderer = new WebGPURenderer({
-          canvas: defaultProps.canvas,
-          antialias: true,
-          alpha: false,
-          depth: true,
-          stencil: defaultProps.stencil ?? true,
-        } as ConstructorParameters<typeof WebGPURenderer>[0])
-      } catch (constructErr) {
-        const msg =
-          constructErr instanceof Error
-            ? constructErr.message
-            : 'Échec de la construction du renderer WebGPU'
-        if (mountedRef.current) {
-          setInitError(msg)
-          setGpuStatus('unsupported')
-        }
-        throw constructErr
-      }
-
-      // ---------- Wire up device lost ----------
-
-      renderer.onDeviceLost = handleDeviceLost
-
-      // ---------- Initialise ----------
-
-      try {
-        await renderer.init()
-      } catch (initErr) {
-        const msg =
-          initErr instanceof Error
-            ? initErr.message
-            : "Échec de l'initialisation du renderer WebGPU"
-        if (mountedRef.current) {
-          setInitError(msg)
-          setGpuStatus('unsupported')
-        }
-        throw initErr
-      }
-
-      // Update diagnostics once initialised
-      if (showDiagnostics()) {
-        setDiagnostic('renderer-status', 'initialized')
-        setDiagnostic('backend', 'webgpu')
-      }
-
-      return renderer as unknown as GlRendererContract
-    },
-    [handleDeviceLost],
-  )
-
-  // ---------- Render branches ----------
-
-  if (gpuStatus === 'checking') {
-    return <LoadingState />
-  }
-
-  if (gpuStatus === 'unsupported' || deviceLost) {
-    return (
-      <WebGPUUnsupported
-        deviceLost={deviceLost && gpuStatus === 'supported'}
-        error={initError}
-      />
-    )
-  }
-
-  // ---------- Canvas with async WebGPU renderer ----------
+  if (gpuStatus === "checking") return <LoadingState />;
+  if (gpuStatus === "unsupported") return <WebGPUUnsupported error={initError} />;
 
   return (
-    <div
-      style={{
-        width: '100%',
-        height: '100%',
-        position: 'relative',
-        overflow: 'hidden',
-      }}
-    >
+    <div style={{ width: "100%", height: "100%", position: "relative", overflow: "hidden" }}>
       <Canvas
         orthographic
         camera={{
-          position: [0, CAMERA_HEIGHT, 0],
-          up: [0, 0, 1],
-          near: 0.1,
+          position: [centerX, CAMERA_HEIGHT, centerZ],
+          rotation: [-Math.PI / 2, 0, 0],
+          up: [0, 0, -1],
+          near: 1,
           far: CAMERA_FAR,
-          left: -FRUSTUM_SIZE,
-          right: FRUSTUM_SIZE,
-          top: FRUSTUM_SIZE,
-          bottom: -FRUSTUM_SIZE,
-          zoom: 1,
+          left: -Math.max(width / 2, 1),
+          right: Math.max(width / 2, 1),
+          top: Math.max(height / 2, 1),
+          bottom: -Math.max(height / 2, 1),
+          zoom: 0.9,
         }}
-        // The async factory matches r3f's GLProps contract structurally.
-        // The concrete return type differs from THREE.WebGLRenderer but
-        // satisfies the { render } interface r3f actually consumes.
-        gl={glFactory as unknown as Parameters<typeof Canvas>[0]['gl']}
+        gl={glFactory as Parameters<typeof Canvas>[0]["gl"]}
         dpr={[1, 2]}
         frameloop="always"
-        style={{
-          display: 'block',
-          width: '100%',
-          height: '100%',
-        }}
-        onCreated={() => {
-          if (showDiagnostics()) {
-            setDiagnostic('renderer-status', 'initialized')
-            setDiagnostic('backend', 'webgpu')
-          }
-        }}
+        style={{ display: "block", width: "100%", height: "100%" }}
       >
         {children}
       </Canvas>
-
-      {/* Diagnostics element — machine-readable test hook */}
-      {showDiagnostics() && (
-        <div
-          id="scene-diagnostics"
-          aria-hidden="true"
-          data-renderer-status={
-            initAttempted.current ? 'initializing' : 'pending'
-          }
-          data-backend="webgpu"
-          data-loaded-tile-count="0"
-          data-loaded-feature-count="0"
-          data-building-count="0"
-          data-road-count="0"
-          data-poi-count="0"
-          data-draw-calls="0"
-          data-camera-state="unknown"
-          data-renderer-error=""
-        />
-      )}
     </div>
-  )
+  );
 }

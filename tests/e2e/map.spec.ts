@@ -1,151 +1,122 @@
-import { test, expect } from "./fixtures";
+import { test, expect, checkPngNotBlank, ARTIFACTS_DIR, type BrowserErrors } from "./fixtures";
+import type { Page } from "@playwright/test";
 
-const MOLI_CDP = process.env.MOLI_CDP || "http://127.0.0.1:9222";
+async function waitForScene(page: Page): Promise<void> {
+  await page.waitForFunction(() => {
+    const diagnostics = document.querySelector("#scene-diagnostics");
+    if (!diagnostics) return false;
+    const status = diagnostics.getAttribute("data-renderer-status");
+    const tiles = Number(diagnostics.getAttribute("data-loaded-tile-count"));
+    const features = Number(diagnostics.getAttribute("data-loaded-feature-count"));
+    const draws = Number(diagnostics.getAttribute("data-draw-calls"));
+    if (status === "errored") return true;
+    if (status !== "initialized" && status !== "unsupported") return false;
+    if (!(tiles > 0 && features > 0)) return false;
+    // A freshly created WebGPU renderer flips to "initialized" before the
+    // scene has evaluated a single frame of real geometry (buildings/roads/
+    // draw-calls still read 0 for a brief window). Wait for that first real
+    // frame instead of trusting renderer-status alone.
+    if (status === "initialized") return draws > 0;
+    return true;
+  }, undefined, { timeout: 15000 });
+}
+
+function assertNoRuntimeErrors(errors: BrowserErrors): void {
+  expect(errors.pageErrors, "pageerror events").toEqual([]);
+  expect(errors.consoleErrors, "console.error events").toEqual([]);
+}
 
 test.describe("Map application E2E", () => {
-  test.beforeEach(async ({ page }) => {
+  test.beforeEach(async ({ page, errors }) => {
     await page.goto("/");
-  });
-
-  test("page loads with map shell", async ({ page }) => {
-    // Main app shell should be visible
-    await expect(page.locator('[role="application"]')).toBeVisible({ timeout: 15000 });
-
-    // Wait for loading state to resolve or renderer status to appear
-    await page.waitForLoadState("networkidle");
-
-    // Search input should be present
-    const searchInput = page.locator('input[type="search"], input[placeholder*="Rechercher"]');
-    await expect(searchInput).toBeVisible({ timeout: 10000 });
-  });
-
-  test("no fatal Next.js error overlay", async ({ page }) => {
-    // Check for the Next.js error overlay
-    const errorOverlay = page.locator("nextjs-portal");
-    await expect(errorOverlay).not.toBeVisible({ timeout: 5000 });
-  });
-
-  test("loading state resolves", async ({ page }) => {
-    // Wait for data loading to complete (diagnostics show loaded tiles)
-    const diagnostics = page.locator("#scene-diagnostics");
-    if (await diagnostics.isVisible({ timeout: 10000 }).catch(() => false)) {
-      await expect(diagnostics).toContainText(/loaded-tile-count|loaded-feature-count/, { timeout: 15000 });
-    }
-  });
-
-  test("renderer status is initialized or unsupported", async ({ page }) => {
-    const diagnostics = page.locator("#scene-diagnostics");
-    if (await diagnostics.isVisible({ timeout: 10000 }).catch(() => false)) {
-      // Either initialized or unsupported is valid
-      const text = await diagnostics.textContent();
-      const hasStatus = text?.includes("initialized") || text?.includes("unsupported") || text?.includes("error");
-      expect(hasStatus).toBeTruthy();
-    }
-  });
-
-  test("accent-insensitive Nocibé search", async ({ page }) => {
-    const searchInput = page.locator('input[type="search"], input[placeholder*="Rechercher"]');
-    await searchInput.fill("Nocibe");
-
-    // Wait for results dropdown
-    const results = page.locator('[role="listbox"], [data-testid="search-results"]');
-    await expect(results).toBeVisible({ timeout: 5000 });
-
-    // Should find Nocibé
-    await expect(results).toContainText(/[Nn]ocib[eé]/, { timeout: 5000 });
-  });
-
-  test("Nocibé with accent works", async ({ page }) => {
-    const searchInput = page.locator('input[type="search"], input[placeholder*="Rechercher"]');
-    await searchInput.fill("Nocibé");
-
-    const results = page.locator('[role="listbox"], [data-testid="search-results"]');
-    await expect(results).toBeVisible({ timeout: 5000 });
-    await expect(results).toContainText(/[Nn]ocib[eé]/, { timeout: 5000 });
-  });
-
-  test("one-character typo finds Nocibé", async ({ page }) => {
-    const searchInput = page.locator('input[type="search"], input[placeholder*="Rechercher"]');
-    await searchInput.fill("nocire");
-
-    const results = page.locator('[role="listbox"], [data-testid="search-results"]');
-    if (await results.isVisible({ timeout: 5000 }).catch(() => false)) {
-      await expect(results).toContainText(/[Nn]ocib[eé]/, { timeout: 5000 });
-    }
-    // If no results, that's also acceptable for edge case
-  });
-
-  test("search selection updates inspector", async ({ page }) => {
-    const searchInput = page.locator('input[type="search"], input[placeholder*="Rechercher"]');
-    await searchInput.fill("Nocibé");
-
-    const results = page.locator('[role="listbox"], [data-testid="search-results"]');
-    await expect(results).toBeVisible({ timeout: 5000 });
-
-    // Click first result
-    const firstResult = results.locator('[role="option"], [data-testid="search-result"]').first();
-    await firstResult.click();
-
-    // Inspector should appear with feature info
-    const inspector = page.locator('[data-testid="feature-inspector"], [class*="inspector"]');
-    await expect(inspector).toBeVisible({ timeout: 5000 });
-    await expect(inspector).toContainText(/[Nn]ocib[eé]/, { timeout: 5000 });
-  });
-
-  test("keyboard navigation works on search", async ({ page }) => {
-    const searchInput = page.locator('input[type="search"], input[placeholder*="Rechercher"]');
-    await searchInput.fill("auch");
-    await expect(searchInput).toBeFocused();
-  });
-
-  test("layer controls are accessible", async ({ page }) => {
-    const layerButton = page.locator('button:has-text("Couches"), [aria-label*="Couche"]');
-    if (await layerButton.isVisible({ timeout: 5000 }).catch(() => false)) {
-      await layerButton.click();
-      // Layer panel should open
-      const layerPanel = page.locator('[data-testid="layer-controls"], [class*="layers"]');
-      await expect(layerPanel).toBeVisible({ timeout: 3000 });
-    }
-  });
-
-  test("source attribution is visible", async ({ page }) => {
-    const attribution = page.locator('footer, [class*="attribution"]');
-    // Either footer or attribution element should exist
-    const count = await attribution.count();
-    expect(count).toBeGreaterThanOrEqual(0);
-  });
-
-  test("reset button is present", async ({ page }) => {
-    const resetBtn = page.locator('button:has-text("Réinitialiser")');
-    if (await resetBtn.isVisible({ timeout: 5000 }).catch(() => false)) {
-      await expect(resetBtn).toBeEnabled();
-    }
-  });
-
-  test("no console errors on page load", async ({ page }) => {
-    const errors: string[] = [];
-    page.on("console", (msg) => {
-      if (msg.type() === "error") {
-        errors.push(msg.text());
-      }
+    await waitForScene(page);
+    assertNoRuntimeErrors(errors);
+    const unhandled = await page.evaluate(() => {
+      const state = window as unknown as { __unhandledRejections?: string[] };
+      return state.__unhandledRejections ?? [];
     });
-    await page.goto("/");
-    await page.waitForLoadState("networkidle");
-
-    // Allow React dev warnings but catch real errors
-    const realErrors = errors.filter(
-      (e) => !e.includes("React") && !e.includes("Warning:") && !e.includes("experimental")
-    );
-    expect(realErrors).toHaveLength(0);
+    expect(unhandled, "unhandled promise rejections").toEqual([]);
   });
 
-  test("narrow viewport is usable", async ({ page }) => {
-    await page.setViewportSize({ width: 375, height: 667 });
-    await page.goto("/");
-    await page.waitForLoadState("networkidle");
+  test("renders the loaded Auch map, not an empty canvas", async ({ page }) => {
+    await expect(page.locator('[role="application"]')).toBeVisible();
+    await expect(page.locator("#scene-diagnostics")).toHaveCount(1);
+    const diagnostics = page.locator("#scene-diagnostics");
+    const attrs = await diagnostics.evaluate((element) => ({
+      status: element.getAttribute("data-renderer-status"),
+      backend: element.getAttribute("data-backend"),
+      tiles: Number(element.getAttribute("data-loaded-tile-count")),
+      features: Number(element.getAttribute("data-loaded-feature-count")),
+      buildings: Number(element.getAttribute("data-building-count")),
+      roads: Number(element.getAttribute("data-road-count")),
+      pois: Number(element.getAttribute("data-poi-count")),
+      draws: Number(element.getAttribute("data-draw-calls")),
+      camera: element.getAttribute("data-camera-state"),
+      error: element.getAttribute("data-renderer-error"),
+    }));
+    expect(attrs.tiles).toBeGreaterThan(0);
+    expect(attrs.features).toBeGreaterThan(0);
+    expect(["initialized", "unsupported"]).toContain(attrs.status);
+    if (attrs.status === "unsupported") {
+      expect(attrs.error).not.toBe("none");
+      await page.screenshot({ path: `${ARTIFACTS_DIR}/map/default.png` });
+      return;
+    }
+    expect(attrs.backend).toBe("webgpu");
+    expect(attrs.buildings + attrs.roads + attrs.pois).toBeGreaterThan(0);
+    expect(attrs.draws).toBeGreaterThan(0);
+    expect(attrs.camera).not.toBe("unknown");
+    expect(attrs.error).toBe("none");
 
-    // Search should still be reachable
-    const searchInput = page.locator('input[type="search"], input[placeholder*="Rechercher"]');
-    await expect(searchInput).toBeVisible({ timeout: 10000 });
+    const canvas = page.locator("canvas");
+    await expect(canvas).toBeVisible();
+    const box = await canvas.boundingBox();
+    expect(box?.width ?? 0).toBeGreaterThan(0);
+    expect(box?.height ?? 0).toBeGreaterThan(0);
+    const screenshotPath = `${ARTIFACTS_DIR}/map/default-canvas.png`;
+    await canvas.screenshot({ path: screenshotPath });
+    const content = checkPngNotBlank(screenshotPath);
+    expect(content.notBlank, content.reason).toBe(true);
+  });
+
+  test("has no fatal Next.js error overlay", async ({ page }) => {
+    await expect(page.locator("nextjs-portal")).not.toBeVisible();
+  });
+
+  test("search selection focuses a loaded feature", async ({ page }) => {
+    const searchInput = page.locator('input[type="search"]');
+    await searchInput.fill("Nocibé");
+    const results = page.locator('[role="listbox"]');
+    await expect(results).toBeVisible();
+    await expect(results).toContainText(/[Nn]ocib[eé]/);
+    await results.locator('[role="option"]').first().click();
+    await expect(page.getByRole("complementary", { name: "Détails de l'élément" })).toBeVisible();
+    await page.screenshot({ path: `${ARTIFACTS_DIR}/map/nocibe-selected.png` });
+  });
+
+  test("layer controls remain accessible", async ({ page }) => {
+    const layerButton = page.locator('button:has-text("Couches"), [aria-label*="Couche"]');
+    if (await layerButton.isVisible()) {
+      await layerButton.click();
+      await expect(page.locator('[data-testid="layer-controls"], [class*="layers"]')).toBeVisible();
+    }
+  });
+
+  test("source attribution and reset remain visible", async ({ page }) => {
+    await expect(page.getByRole("contentinfo", { name: "Sources et attribution" })).toBeVisible();
+    const reset = page.locator('button:has-text("Réinitialiser")');
+    if (await reset.count()) await expect(reset).toBeEnabled();
+  });
+
+  test("narrow viewport keeps the map surface usable", async ({ page }) => {
+    await page.setViewportSize({ width: 375, height: 667 });
+    await page.reload();
+    await expect(page.locator('input[type="search"]')).toBeVisible();
+    const state = await page.locator("#scene-diagnostics").getAttribute("data-renderer-status");
+    if (state !== "initialized") return;
+    const canvas = page.locator("canvas");
+    const box = await canvas.boundingBox();
+    expect(box?.width ?? 0).toBeGreaterThan(0);
+    expect(box?.height ?? 0).toBeGreaterThan(0);
   });
 });

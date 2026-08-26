@@ -346,7 +346,6 @@ export function normalizeBuilding(
   // Height resolution
   const rawHeight = tags['height'];
   const rawLevels = tags['building:levels'];
-  const rawLevelsUnderground = tags['building:levels:underground'];
 
   const parsedHeight = rawHeight ? parseFloat(rawHeight) : NaN;
   const parsedLevels = rawLevels ? parseFloat(rawLevels) : NaN;
@@ -354,8 +353,6 @@ export function normalizeBuilding(
   let height: number;
   let heightSource: HeightMetadata['heightSource'];
   let levels: number | undefined;
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  const _undergroundLevels = rawLevelsUnderground ? parseFloat(rawLevelsUnderground) : undefined;
 
   if (!isNaN(parsedHeight) && parsedHeight >= 0) {
     // Explicit finite height >= 0 — source-backed

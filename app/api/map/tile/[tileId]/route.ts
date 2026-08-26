@@ -11,9 +11,35 @@ const TILE_ID_RE = /^[a-zA-Z0-9_-]+$/;
 export const dynamic = "force-static";
 
 /**
+ * Inline type for the tile-manifest entry embedded in the tile response.
+ * Matches TileManifestFallback in src/lib/data/loadTile.ts.
+ */
+interface TileManifestEntry {
+  tileId: string;
+  bounds: [number, number, number, number];
+  featureCount: number;
+  byteSize: number;
+  features: string[];
+}
+
+/**
+ * Inline type for the tile response envelope.
+ * Matches TileResponseFallback in src/lib/data/loadTile.ts.
+ */
+interface TileResponse {
+  manifest: TileManifestEntry;
+  features: unknown[];
+  metadata?: Record<string, unknown>;
+}
+
+/**
  * GET /api/map/tile/[tileId]
  *
- * Returns a single generated tile from data/generated/tiles/{tileId}.json.
+ * Returns a tile envelope { manifest, features, metadata? } matching the
+ * contract expected by src/lib/data/loadTile.ts.
+ *
+ * The tile-manifest entry is sourced from data/generated/tile-manifest.json,
+ * and features are the raw feature array from data/generated/tiles/{tileId}.json.
  *
  * Security:
  *  - Rejects slashes, path-traversal patterns, and unexpected characters in tileId.
@@ -48,6 +74,7 @@ export async function GET(
   }
 
   const tilePath = join(dataRoot, "generated", "tiles", `${tileId}.json`);
+  const tileManifestPath = join(dataRoot, "generated", "tile-manifest.json");
 
   try {
     // Check file size before reading
@@ -59,14 +86,51 @@ export async function GET(
       );
     }
 
-    const content = await readFile(tilePath, "utf-8");
+    // Read and parse tile-manifest to get the manifest entry for this tile
+    const manifestContent = await readFile(tileManifestPath, "utf-8");
+    const allManifests = JSON.parse(manifestContent) as TileManifestEntry[];
+    const manifest = allManifests.find((m) => m.tileId === tileId);
 
-    return new NextResponse(content, {
+    if (!manifest) {
+      return NextResponse.json(
+        { error: "DATASET_UNAVAILABLE", code: "DATASET_UNAVAILABLE" },
+        { status: 503 },
+      );
+    }
+
+    // Read raw features array from the tile file
+    const tileContent = await readFile(tilePath, "utf-8");
+    const features = JSON.parse(tileContent);
+
+    if (!Array.isArray(features)) {
+      // Tile content is not a feature array — unexpected but serve
+      return NextResponse.json(
+        {
+          manifest,
+          features: [],
+          metadata: { raw: features },
+        } satisfies TileResponse,
+        {
+          status: 200,
+          headers: {
+            "Content-Type": "application/json",
+            "Cache-Control": "public, max-age=3600, must-revalidate",
+          },
+        },
+      );
+    }
+
+    // Build the response envelope matching loadTile.ts contract
+    const response: TileResponse = {
+      manifest,
+      features,
+    };
+
+    return NextResponse.json(response, {
       status: 200,
       headers: {
         "Content-Type": "application/json",
         "Cache-Control": "public, max-age=3600, must-revalidate",
-        "Content-Length": String(stats.size),
       },
     });
   } catch {

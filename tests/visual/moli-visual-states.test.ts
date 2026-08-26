@@ -1,17 +1,12 @@
 import { describe, it, expect } from "vitest";
-import { writeFileSync, readFileSync, mkdirSync, rmSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { checkPngNotBlank } from "../e2e/fixtures";
 
 describe("moli-visual-states", () => {
-  const ARTIFACTS_DIR = "tests/artifacts/moli";
+  const artifacts = "tests/artifacts/moli";
 
-  it("artifacts directory exists or can be created", () => {
-    // This is a placeholder - the real test runs via Moli/PW and captures screenshots
-    const dir = ARTIFACTS_DIR;
-    expect(dir).toMatch(/^tests\/artifacts\/moli$/);
-  });
-
-  it("required screenshot names are defined", () => {
+  it("defines the required visual states", () => {
     const screenshots = [
       "initial-desktop",
       "search-open",
@@ -24,39 +19,43 @@ describe("moli-visual-states", () => {
       "mobile-viewport",
       "error-state",
     ];
-    expect(screenshots.length).toBe(10);
-    screenshots.forEach((s) => expect(s).toMatch(/^[a-z-]+$/));
+    expect(screenshots).toHaveLength(10);
+    for (const screenshot of screenshots) expect(screenshot).toMatch(/^[a-z-]+$/);
   });
 
-  it("viewport sizes are defined", () => {
-    const viewports = [
+  it("defines desktop and mobile viewports", () => {
+    expect([
       { name: "desktop", width: 1280, height: 720 },
       { name: "mobile", width: 375, height: 667 },
-    ];
-    expect(viewports.length).toBe(2);
+    ]).toEqual([
+      { name: "desktop", width: 1280, height: 720 },
+      { name: "mobile", width: 375, height: 667 },
+    ]);
   });
 
-  it("contrast requirements are met (design tokens)", () => {
-    // Verify CSS variables exist in globals.css
-    const css = readFileSync("app/globals.css", "utf-8");
+  it("retains the required design tokens", () => {
+    const css = readFileSync("app/globals.css", "utf8");
     expect(css).toContain("--color-accent");
     expect(css).toContain("--color-ink");
     expect(css).toContain("--color-paper");
   });
 
-  it("scene diagnostics attributes defined", () => {
-    const requiredAttrs = [
-      "renderer-status",
-      "backend",
-      "loaded-tile-count",
-      "loaded-feature-count",
-      "building-count",
-      "road-count",
-      "poi-count",
-      "draw-calls",
-      "camera-state",
-      "renderer-error",
-    ];
-    requiredAttrs.forEach((attr) => expect(attr).toMatch(/^[a-z-]+$/));
+  it("rejects available blank canvas artifacts", () => {
+    if (!existsSync(artifacts)) return;
+    const pngs: string[] = [];
+    const collect = (directory: string): void => {
+      for (const entry of readdirSync(directory, { withFileTypes: true })) {
+        const path = join(directory, entry.name);
+        if (entry.isDirectory()) collect(path);
+        else if (entry.name.endsWith(".png")) pngs.push(path);
+      }
+    };
+    collect(artifacts);
+    for (const png of pngs) {
+      const result = checkPngNotBlank(png);
+      expect(result.width, `${png}: invalid width`).toBeGreaterThan(0);
+      expect(result.height, `${png}: invalid height`).toBeGreaterThan(0);
+      expect(result.notBlank, `${png}: ${result.reason}`).toBe(true);
+    }
   });
 });

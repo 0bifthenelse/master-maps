@@ -1,5 +1,5 @@
 // @ts-nocheck
-"use client";
+ "use client";
 
 import {
   useCallback,
@@ -7,6 +7,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type ReactNode,
 } from "react";
 import dynamic from "next/dynamic";
 
@@ -27,12 +28,13 @@ const CityScene = dynamic(
 // Direct imports for UI overlay components (lightweight, server-compatible)
 // ---------------------------------------------------------------------------
 import MapHud from "@/components/map/MapHud";
-import SearchPanel from "@/components/map/SearchPanel";
 import FeatureInspector from "@/components/map/FeatureInspector";
 import LayerControls from "@/components/map/LayerControls";
 import SourceAttribution from "@/components/map/SourceAttribution";
 import LoadingState from "@/components/map/LoadingState";
 import WebGPUUnsupported from "@/components/map/WebGPUUnsupported";
+import { publishSceneDiagnostics, sceneMetrics } from "@/lib/scene/sceneMetrics";
+import { searchIndex as runSearchIndex, type SearchRecord as SearchIndexRecord } from "@/lib/data/search";
 
 // ---------------------------------------------------------------------------
 // Local type definitions — match the schema contracts expected from
@@ -191,12 +193,13 @@ interface ManifestData {
     lng: number;
     lat: number;
   };
-  tileSize: number;
-  tileCount: number;
+  tileSize?: number;
+  tileCount?: number;
   tileIds?: string[];
   tiles?: TileManifestEntry[];
   featureCounts: Record<string, number>;
   layerAvailability: Record<string, boolean>;
+  bounds?: [number, number, number, number];
   nocibeFocus?: NocibeFocusData;
 }
 
@@ -211,24 +214,58 @@ interface NocibeFocusData {
   status: string;
   anchors: { name: string; coord: [number, number] }[];
 }
+type LocalCoordinate = [number, number];
+type LocalGeometry =
+  | { type: "Point"; coordinates: LocalCoordinate }
+  | { type: "LineString"; coordinates: LocalCoordinate[] }
+  | { type: "Polygon"; coordinates: LocalCoordinate[][] }
+  | { type: "MultiPolygon"; coordinates: LocalCoordinate[][][] };
+
+interface RawMapFeature {
+  kind: FeatureKind;
+  stableId: string;
+  localGeometry?: LocalGeometry;
+  x?: number;
+  z?: number;
+  lon?: number;
+  lat?: number;
+  name?: string;
+  displayName?: string;
+  [key: string]: unknown;
+}
+
+interface TileEnvelope {
+  manifest: TileManifestEntry;
+  features: RawMapFeature[];
+  metadata?: Record<string, unknown>;
+}
 
 interface TileData {
   tileId: string;
-  features: MapFeature[];
+  features: RawMapFeature[];
   bounds: [number, number, number, number];
 }
+const renderableKinds: Record<FeatureKind, boolean> = {
+  building: true,
+  road: true,
+  water: true,
+  landuse: true,
+  poi: true,
+  business: true,
+  address: false,
+  transport: false,
+  boundary: false,
+};
 
 interface SearchRecord {
-  id: string;
-  name: string;
-  normalizedName: string;
-  aliases?: string[];
-  kind: FeatureKind;
-  category?: string;
-  tileId: string;
   featureId: string;
-  coord: [number, number];
-  searchKey?: string;
+  canonicalName: string;
+  normalizedName: string;
+  aliases: string[];
+  kind: FeatureKind;
+  tileId: string;
+  focusLon: number;
+  focusLat: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -288,7 +325,11 @@ function focusFromFeature(feature: MapFeature): { x: number; z: number } | null 
 
 export default function MapShell() {
   // ---- State ----
-  const [theme, setTheme] = useState<"light" | "dark">("light");
+  const [theme, setTheme] = useState<"light" | "dark">(() => {
+    const stored = localStorage.getItem(LS_THEME_KEY);
+    if (stored === "dark" || stored === "light") return stored;
+    return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+  });
   const [selectedFeature, setSelectedFeature] = useState<MapFeature | null>(
     null,
   );
@@ -301,6 +342,7 @@ export default function MapShell() {
   const [manifest, setManifest] = useState<ManifestData | null>(null);
   const [tiles, setTiles] = useState<Map<string, TileData>>(new Map());
   const [searchIndex, setSearchIndex] = useState<SearchRecord[]>([]);
+  const [searchQuery, setSearchQuery] = useState("");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [webGpuStatus, setWebGpuStatus] = useState<
@@ -312,20 +354,17 @@ export default function MapShell() {
   const shellRef = useRef<HTMLDivElement>(null);
   const diagnosticsRef = useRef<HTMLDivElement>(null);
 
-  // ---- Theme initialisation ----
+  // ---- Theme: track OS preference changes when no explicit choice is stored ----
   useEffect(() => {
-    const stored = localStorage.getItem(LS_THEME_KEY);
-    if (stored === "dark" || stored === "light") {
-      setTheme(stored);
-    } else {
-      const mq = window.matchMedia("(prefers-color-scheme: dark)");
-      setTheme(mq.matches ? "dark" : "light");
-      const handler = (e: MediaQueryListEvent): void => {
-        setTheme(e.matches ? "dark" : "light");
-      };
-      mq.addEventListener("change", handler);
-      return () => mq.removeEventListener("change", handler);
+    if (localStorage.getItem(LS_THEME_KEY) === "dark" || localStorage.getItem(LS_THEME_KEY) === "light") {
+      return undefined;
     }
+    const mq = window.matchMedia("(prefers-color-scheme: dark)");
+    const handler = (e: MediaQueryListEvent): void => {
+      setTheme(e.matches ? "dark" : "light");
+    };
+    mq.addEventListener("change", handler);
+    return () => mq.removeEventListener("change", handler);
   }, []);
 
   // Apply theme
@@ -381,12 +420,12 @@ export default function MapShell() {
         });
         if (searchRes.ok) {
           const searchBody = await searchRes.json();
-          const records: SearchRecord[] = searchBody.records ?? searchBody ?? [];
+          const records: SearchRecord[] = Array.isArray(searchBody)
+            ? searchBody
+            : (searchBody.records ?? []);
           if (!cancelled) setSearchIndex(records);
         } else {
-          console.warn(
-            `Search index load failed: ${searchRes.status}`,
-          );
+          throw new Error(`Search index load failed: ${searchRes.status}`);
         }
 
         // Resolve tile IDs
@@ -401,7 +440,6 @@ export default function MapShell() {
         for (let i = 0; i < tileIds.length; i += TILE_LOAD_CONCURRENCY) {
           if (cancelled) return;
           const batch = tileIds.slice(i, i + TILE_LOAD_CONCURRENCY);
-          // eslint-disable-next-line @typescript-eslint/no-loop-func
           const results = await Promise.all(
             batch.map(async (tileId) => {
               try {
@@ -413,8 +451,18 @@ export default function MapShell() {
                   console.warn(`Tile ${tileId} load failed: ${res.status}`);
                   return null;
                 }
-                const data: TileData = await res.json();
-                return { tileId, data };
+                const envelope: TileEnvelope = await res.json();
+                if (!Array.isArray(envelope.features)) {
+                  throw new Error(`Tile ${tileId} has no feature array`);
+                }
+                return {
+                  tileId,
+                  data: {
+                    tileId,
+                    features: envelope.features,
+                    bounds: envelope.manifest.bounds,
+                  },
+                };
               } catch (err) {
                 console.warn(`Tile ${tileId} fetch error:`, err);
                 return null;
@@ -448,32 +496,18 @@ export default function MapShell() {
 
   // ---- Scene diagnostics ----
   useEffect(() => {
-    const el = diagnosticsRef.current;
-    if (!el) return;
-
-    const diag: Record<string, string> = {
-      "renderer-status":
-        webGpuStatus === "supported" ? "initialized" : "unsupported",
-      backend: "webgpu",
-      "loaded-tile-count": String(tiles.size),
-      "loaded-feature-count": String(countFeatures(tiles)),
-      "building-count": "unknown",
-      "road-count": "unknown",
-      "poi-count": "unknown",
-      "draw-calls": "unknown",
-      "camera-state": cameraFocus
-        ? `focus:(${cameraFocus.x.toFixed(1)},${cameraFocus.z.toFixed(1)})`
-        : "idle",
-      "renderer-error": error ?? "none",
-    };
-
-    for (const [key, value] of Object.entries(diag)) {
-      el.setAttribute(`data-${key}`, value);
+    sceneMetrics.loadedTileCount = tiles.size;
+    sceneMetrics.loadedFeatureCount = countFeatures(tiles);
+    if (error) {
+      sceneMetrics.rendererStatus = "errored";
+      sceneMetrics.backend = "unknown";
+      sceneMetrics.rendererError = error;
+    } else if (webGpuStatus === "unsupported" && sceneMetrics.rendererError === "none") {
+      sceneMetrics.rendererStatus = "unsupported";
+      sceneMetrics.backend = "unknown";
+      sceneMetrics.rendererError = "WebGPU unavailable in this browser";
     }
-
-    el.textContent = Object.entries(diag)
-      .map(([k, v]) => `${k}=${v}`)
-      .join(" │ ");
+    publishSceneDiagnostics(true);
   }, [webGpuStatus, tiles, cameraFocus, error]);
 
   // ---- Event handlers ----
@@ -490,6 +524,29 @@ export default function MapShell() {
       setLayers((prev) => ({ ...prev, "nocibe-commercial-audit": true }));
     }
   }, []);
+  const handleSearchQueryChange = useCallback((query: string): void => {
+    setSearchQuery(query);
+  }, []);
+
+  const handleSearchResultSelect = useCallback(
+    (featureId: string): void => {
+      const raw = Array.from(tiles.values())
+        .flatMap((tile) => tile.features)
+        .find((feature) => feature.stableId === featureId);
+      if (!raw) return;
+      const selected = {
+        ...raw,
+        id: raw.stableId,
+        name: raw.name ?? raw.displayName,
+        localCoord:
+          raw.x !== undefined && raw.z !== undefined ? [raw.x, raw.z] : undefined,
+      } as unknown as MapFeature;
+      handleSearchSelect(selected);
+      setSearchQuery("");
+    },
+    [tiles, handleSearchSelect],
+  );
+
 
   const handleLayerToggle = useCallback(
     (layerId: string, visible: boolean): void => {
@@ -497,10 +554,6 @@ export default function MapShell() {
     },
     [],
   );
-
-  const handleThemeToggle = useCallback((): void => {
-    setTheme((prev) => (prev === "light" ? "dark" : "light"));
-  }, []);
 
   const handleResetView = useCallback((): void => {
     setCameraFocus(null);
@@ -528,6 +581,23 @@ export default function MapShell() {
 
   // ---- Derived data ----
   const tileDataArray = useMemo(() => Array.from(tiles.values()), [tiles]);
+  const sceneFeatures = useMemo(
+    () =>
+      tileDataArray.flatMap((tile) =>
+        tile.features
+          .filter((feature) => renderableKinds[feature.kind] && feature.localGeometry)
+          .map((feature) => ({
+            ...feature,
+            geometry: feature.localGeometry,
+            name: feature.name ?? feature.displayName,
+          })),
+      ),
+    [tileDataArray],
+  );
+  const searchResults = useMemo(
+    () => (searchQuery.trim() ? runSearchIndex(searchQuery, searchIndex as SearchIndexRecord[]) : []),
+    [searchQuery, searchIndex],
+  );
   const hasCriticalError = !!error && !manifest;
 
   // ---- Nocibé focus enrichment ----
@@ -561,6 +631,7 @@ export default function MapShell() {
         url: "https://adresse.data.gouv.fr",
       },
       "fetch-businesses": {
+
         source: "Annuaire des Entreprises",
         url: "https://annuaire-entreprises.data.gouv.fr",
       },
@@ -585,6 +656,33 @@ export default function MapShell() {
       osmAttribution: "Contributeurs d\u2019OpenStreetMap",
     };
   }, [manifest]);
+  const searchResultsNode: ReactNode =
+    searchResults.length > 0 ? (
+      <div role="listbox" aria-label="Résultats de recherche">
+        {searchResults.map(({ record }, index) => (
+          <button
+            key={record.featureId}
+            type="button"
+            role="option"
+            aria-selected={index === 0}
+            onClick={() => handleSearchResultSelect(record.featureId)}
+            style={{
+              display: "flex",
+              justifyContent: "space-between",
+              width: "100%",
+              padding: "0.65rem 0.8rem",
+              border: 0,
+              background: "transparent",
+              color: "var(--color-ink)",
+              cursor: "pointer",
+            }}
+          >
+            <span>{record.canonicalName}</span>
+            <span>{record.kind}</span>
+          </button>
+        ))}
+      </div>
+    ) : null;
 
   // ---- Render ----
   return (
@@ -682,19 +780,19 @@ export default function MapShell() {
         {!hasCriticalError && (
           <>
             {webGpuStatus === "supported" && manifest ? (
-              <WebGPUCityCanvas>
+              <WebGPUCityCanvas bounds={manifest.bounds}>
                 <CityScene
-                  manifest={manifest}
-                  tiles={tileDataArray}
+                  features={sceneFeatures}
                   layers={layers}
                   selectedFeature={selectedFeature}
                   onFeatureSelect={handleFeatureSelect}
                   cameraFocus={cameraFocus}
                   onCameraMoveComplete={handleCameraMoveComplete}
+                  bounds={manifest.bounds}
                 />
               </WebGPUCityCanvas>
             ) : webGpuStatus === "unsupported" ? (
-              <WebGPUUnsupported />
+              <WebGPUUnsupported error={sceneMetrics.rendererError} />
             ) : null}
           </>
         )}
@@ -702,13 +800,13 @@ export default function MapShell() {
 
       {/* HUD overlay */}
       {!hasCriticalError && !loading && (
-        <MapHud onThemeToggle={handleThemeToggle} theme={theme}>
-          <SearchPanel
-            searchIndex={searchIndex}
-            onSelect={handleSearchSelect}
-            placeholder="Rechercher dans Auch"
-          />
-        </MapHud>
+        <MapHud
+          query={searchQuery}
+          onQueryChange={handleSearchQueryChange}
+          onSearch={handleSearchQueryChange}
+          onResetView={handleResetView}
+          results={searchResultsNode}
+        />
       )}
 
       {/* Layer controls */}

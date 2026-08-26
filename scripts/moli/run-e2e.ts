@@ -10,10 +10,11 @@
  */
 
 import { spawn, type ChildProcess } from "node:child_process";
-import { resolve } from "node:path";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { setTimeout as sleep } from "node:timers/promises";
 
-const ROOT = resolve(import.meta.dirname, "../..");
+const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const NEXT_PORT = 3100;
 const MOLI_PORT = 9222;
 

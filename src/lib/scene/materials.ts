@@ -1,4 +1,3 @@
-// @ts-nocheck
 /**
  * @file Shared Three.js materials for the flat Auch map scene.
  *
@@ -10,10 +9,9 @@
 
 import {
   MeshBasicMaterial,
-  MeshStandardMaterial,
   LineBasicMaterial,
   PointsMaterial,
-  type ColorRepresentation,
+  type Color,
   type Material,
 } from 'three';
 
@@ -22,7 +20,12 @@ import {
 // Default = light theme.
 let _accent: string = '#ff7d27';
 let _ink: string = '#000000';
-let _paper: string = '#ffffff';
+let _paper: string = '#f7f4ed';
+
+/** Current paper (scene background) colour token. */
+export function getPaperColor(): string {
+  return _paper;
+}
 
 /** Update the global colour palette used by all exported materials. */
 export function setThemeTokens(accent: string, ink: string, paper: string): void {
@@ -39,16 +42,18 @@ export function setThemeTokens(accent: string, ink: string, paper: string): void
 function applyTokens(m: ThemeAwareMaterial): void {
   if (m.userData.tokenRole === 'road') {
     m.color.set(_ink);
-    m.opacity = 0.15;
+    m.opacity = 0.55;
   } else if (m.userData.tokenRole === 'water') {
     m.color.set('#a0c4e8');
   } else if (m.userData.tokenRole === 'building') {
     m.color.set(_ink);
-    m.opacity = 0.08;
+    m.opacity = 0.45;
   } else if (m.userData.tokenRole === 'landuse') {
-    // Per-type colours are stored in userData.fallbackColor;
-    // we only adjust opacity/visibility here.
-    m.opacity = 0.35;
+    // Per-type colours would ideally be per-feature vertex colours; until
+    // that lands, use a visible neutral green base rather than the
+    // material's default white (invisible against the paper background).
+    m.color.set('#c8dcc0');
+    m.opacity = 0.5;
   } else if (m.userData.tokenRole === 'poi') {
     m.color.set(_accent);
   } else if (m.userData.tokenRole === 'accent') {
@@ -63,6 +68,7 @@ function applyTokens(m: ThemeAwareMaterial): void {
 // ─── Theme-aware material tracking ──────────────────────────────────────────
 
 interface ThemeAwareMaterial extends Material {
+  color: Color;
   userData: { tokenRole?: string; fallbackColor?: string };
 }
 const _themeAware: ThemeAwareMaterial[] = [];
