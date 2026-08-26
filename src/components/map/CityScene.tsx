@@ -27,6 +27,7 @@ export interface CitySceneProps {
 }
 
 function separateByKind(features: MapFeature[]) {
+  if (!features) return { building: [], road: [], water: [], landuse: [], poi: [] };
   const building = features.filter((f): f is MapFeature => f.kind === "building");
   const road = features.filter((f): f is MapFeature => f.kind === "road");
   const water = features.filter((f): f is MapFeature => f.kind === "water");
