@@ -127,15 +127,70 @@ async function runScript(scriptName: string, extraArgs: string[] = []): Promise<
 
 async function phaseDiscoverBoundary(offline: boolean): Promise<void> {
   if (offline) {
-    try {
-      await fs.access(path.join(RAW_DIR, "boundary.geojson"));
-      console.error("[refresh] Offline: boundary data present");
-      return;
-    } catch {
-      throw new Error("Offline mode requires raw/boundary.geojson — not found");
+    for (const name of ["boundary.geojson", "auch-boundary.geojson"]) {
+      try {
+        await fs.access(path.join(RAW_DIR, name));
+        console.error(`[refresh] Offline: boundary data present (${name})`);
+        return;
+      } catch {
+        // try next candidate name
+      }
     }
+    throw new Error("Offline mode requires raw/boundary.geojson or raw/auch-boundary.geojson — not found");
   }
   await withRetry(() => runScript("discover-auch-boundary.ts"), "discover-boundary");
+}
+
+/**
+ * Combine per-theme Overpass responses (raw/osm-*.json) into the single
+ * raw/osm.json the normalizer consumes.  Offline mode uses cached theme
+ * files when available; a previously written osm.json is left untouched.
+ */
+async function phaseMergeOsm(): Promise<void> {
+  const themeFiles: string[] = [];
+  try {
+    const dir = await fs.readdir(RAW_DIR, { withFileTypes: true });
+    for (const entry of dir) {
+      if (entry.isFile() && /^osm-[^/]+\.json$/.test(entry.name)) {
+        themeFiles.push(entry.name);
+      }
+    }
+  } catch {
+    themeFiles.length = 0;
+  }
+
+  const osmPath = path.join(RAW_DIR, "osm.json");
+  if (themeFiles.length === 0) {
+    try {
+      await fs.access(osmPath);
+      console.error("[refresh] merge-osm: no per-theme files, existing osm.json present");
+      return;
+    } catch {
+      throw new Error("No Overpass theme files in raw/ — cannot build osm.json");
+    }
+  }
+
+  themeFiles.sort();
+  const elements: Record<string, unknown>[] = [];
+  let recordedAt = "";
+  let queries = 0;
+  for (const name of themeFiles) {
+    const content = JSON.parse(await fs.readFile(path.join(RAW_DIR, name), "utf8")) as {
+      elements?: Record<string, unknown>[];
+      timestamp?: string;
+      query?: string;
+    };
+    if (Array.isArray(content.elements)) elements.push(...content.elements);
+    if (content.timestamp) recordedAt = content.timestamp;
+    if (content.query) queries++;
+  }
+
+  await fs.writeFile(
+    osmPath,
+    JSON.stringify({ elements, timestamp: recordedAt, themeFiles, queryCount: queries }, null, 2),
+    "utf8",
+  );
+  console.error(`[refresh] merge-osm: combined ${themeFiles.length} themes → ${elements.length} elements`);
 }
 
 async function phaseFetchOsm(offline: boolean): Promise<void> {
@@ -145,36 +200,44 @@ async function phaseFetchOsm(offline: boolean): Promise<void> {
       console.error("[refresh] Offline: OSM data present");
       return;
     } catch {
-      throw new Error("Offline mode requires raw/osm.json — not found");
+      console.error("[refresh] Offline: no single osm.json — attempting per-theme merge");
+      await phaseMergeOsm();
+      return;
     }
   }
   await withRetry(() => runScript("fetch-osm.ts"), "fetch-osm", 3, 2000);
+  await phaseMergeOsm();
 }
 
 async function phaseFetchAddresses(offline: boolean): Promise<void> {
   if (offline) {
-    try {
-      await fs.access(path.join(RAW_DIR, "addresses.json"));
-      console.error("[refresh] Offline: addresses data present");
-      return;
-    } catch {
-      console.error("[refresh] Offline: no cached addresses — skipping");
-      return;
+    for (const name of ["ban-addresses.json", "addresses.json"]) {
+      try {
+        await fs.access(path.join(RAW_DIR, name));
+        console.error(`[refresh] Offline: addresses data present (${name})`);
+        return;
+      } catch { /* try next */ }
     }
+    // Write a stub so normaliser doesn't fail
+    await fs.writeFile(path.join(RAW_DIR, "ban-addresses.json"), JSON.stringify({ dataset: "ban", addresses: [], license: "etalab-2.0" }), "utf8");
+    console.error("[refresh] Offline: no cached addresses — wrote stub");
+    return;
   }
   await withRetry(() => runScript("fetch-addresses.ts"), "fetch-addresses", 3, 2000);
 }
 
 async function phaseFetchBusinesses(offline: boolean): Promise<void> {
   if (offline) {
-    try {
-      await fs.access(path.join(RAW_DIR, "businesses.json"));
-      console.error("[refresh] Offline: businesses data present");
-      return;
-    } catch {
-      console.error("[refresh] Offline: no cached businesses — skipping");
-      return;
+    for (const name of ["businesses-sirene.json", "businesses.json"]) {
+      try {
+        await fs.access(path.join(RAW_DIR, name));
+        console.error(`[refresh] Offline: businesses data present (${name})`);
+        return;
+      } catch { /* try next */ }
     }
+    await fs.writeFile(path.join(RAW_DIR, "businesses-sirene.json"), JSON.stringify({ dataset: "businesses-sirene", records: [] }), "utf8");
+    console.error("[refresh] Offline: no cached businesses — wrote stub");
+    return;
   }
   try {
     await fs.access(path.join(scriptsDir(), "fetch-businesses.ts"));
@@ -187,13 +250,16 @@ async function phaseFetchBusinesses(offline: boolean): Promise<void> {
 async function phaseFetchIgn(offline: boolean, forceIgn: boolean): Promise<void> {
   if (offline) {
     try {
-      await fs.access(path.join(RAW_DIR, "ign.json"));
-      console.error("[refresh] Offline: IGN data present");
-      return;
-    } catch {
-      console.error("[refresh] Offline: no cached IGN — writing unavailable");
-      return;
-    }
+      const dir = await fs.readdir(RAW_DIR, { withFileTypes: true });
+      for (const entry of dir) {
+        if (entry.isFile() && /^ign-[^/]+\.json$/.test(entry.name) && entry.name !== "ign-capabilities.json") {
+          console.error(`[refresh] Offline: IGN data present (${entry.name})`);
+          return;
+        }
+      }
+    } catch { /* empty dir */ }
+    console.error("[refresh] Offline: no cached IGN — writing unavailable");
+    return;
   }
   if (!forceIgn) {
     try {

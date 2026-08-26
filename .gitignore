@@ -17,8 +17,8 @@ moli.log
 # Next.js build artifacts
 .next/
 
-# Node
-node_modules/
+# Build artifacts
+tsconfig.tsbuildinfo
 
 # IDE
 .vscode/
@@ -26,4 +26,5 @@ node_modules/
 
 # OS
 .DS_Store
-Thumbs.dbtest-results/
+Thumbs.db
+test-results/

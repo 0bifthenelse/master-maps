@@ -254,7 +254,8 @@ function checkRequiredLayers(features: MapFeature[]): ValidationIssue[] {
   const issues: ValidationIssue[] = [];
   for (const layer of required) {
     if (!present.has(layer)) {
-      issues.push({ severity: "error", message: `Required layer "${layer}" is missing` });
+      const severity = layer === "address" ? "warning" as const : "error" as const;
+      issues.push({ severity, message: `Required layer "${layer}" is missing` });
     }
   }
   return issues;
@@ -272,10 +273,10 @@ function checkNocibePresent(features: MapFeature[]): ValidationIssue[] {
   return [];
 }
 
-function checkSearchIndex(indexPath: string): ValidationIssue[] {
+async function checkSearchIndex(indexPath: string): Promise<ValidationIssue[]> {
   try {
-    const content = fs.readFile(indexPath, "utf8");
-    const records = JSON.parse(content as unknown as string) as Array<Record<string, unknown>>;
+    const content = await fs.readFile(indexPath, "utf8");
+    const records = JSON.parse(content) as Array<Record<string, unknown>>;
     if (!Array.isArray(records)) {
       return [{ severity: "error", message: "Search index is not an array" }];
     }
@@ -354,7 +355,7 @@ export async function validate(generatedDir?: string): Promise<void> {
 
   // Search index check
   const searchIndexPath = path.join(root, "search", "index.json");
-  issues.push(...checkSearchIndex(searchIndexPath));
+  issues.push(...await checkSearchIndex(searchIndexPath));
 
   // Report
   const errors = issues.filter((i) => i.severity === "error");

@@ -239,11 +239,13 @@ export async function buildTilesAll(
   // Load deduplicated features from intermediate
   const dir = await fs.readdir(ind, { withFileTypes: true });
   const allFeatures: MapFeature[] = [];
+  const skipFiles = new Set(["provenance.json", "boundary-source.json", "ign-unavailable.json", "osm-manifest.json"]);
   for (const entry of dir) {
-    if (!entry.isFile() || !entry.name.endsWith(".json") || entry.name === "provenance.json") continue;
+    if (!entry.isFile() || !entry.name.endsWith(".json") || skipFiles.has(entry.name)) continue;
     const content = await fs.readFile(path.join(ind, entry.name), "utf8");
-    const parsed = JSON.parse(content) as MapFeature[];
-    allFeatures.push(...parsed);
+    const parsed = JSON.parse(content);
+    if (!Array.isArray(parsed)) continue;
+    allFeatures.push(...(parsed as MapFeature[]));
   }
 
   if (allFeatures.length === 0) {

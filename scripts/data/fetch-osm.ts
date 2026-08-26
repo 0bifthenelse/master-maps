@@ -529,6 +529,7 @@ async function main(): Promise<void> {
     path.join(INTERMEDIATE_DIR, 'boundary-source.json'),
     path.join(RAW_DIR, 'boundary.json'),
     path.join(INTERMEDIATE_DIR, 'boundary.json'),
+    path.join(RAW_DIR, 'auch-boundary.geojson'),
   ];
 
   for (const filePath of candidatePaths) {

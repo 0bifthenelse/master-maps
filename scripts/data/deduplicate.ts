@@ -148,11 +148,13 @@ function pickPriorityScalar(
 async function loadAllFeatures(inDir: string): Promise<MapFeature[]> {
   const dir = await fs.readdir(inDir, { withFileTypes: true });
   const features: MapFeature[] = [];
+  const skipFiles = new Set(["provenance.json", "boundary-source.json", "ign-unavailable.json", "osm-manifest.json"]);
   for (const entry of dir) {
-    if (!entry.isFile() || !entry.name.endsWith(".json") || entry.name === "provenance.json") continue;
+    if (!entry.isFile() || !entry.name.endsWith(".json") || skipFiles.has(entry.name)) continue;
     const content = await fs.readFile(path.join(inDir, entry.name), "utf8");
-    const parsed = JSON.parse(content) as MapFeature[];
-    features.push(...parsed);
+    const parsed = JSON.parse(content);
+    if (!Array.isArray(parsed)) continue;
+    features.push(...(parsed as MapFeature[]));
   }
   return features;
 }
