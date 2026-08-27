@@ -330,16 +330,18 @@ async function fetchOverpass(query: string): Promise<OverpassResult> {
   for (const endpoint of OVERPASS_ENDPOINTS) {
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
       try {
-        const url = `${endpoint}?data=${encodeURIComponent(query)}`;
         const controller = new AbortController();
         const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 
-        const res = await fetch(url, {
+        const res = await fetch(endpoint, {
+          method: 'POST',
           signal: controller.signal,
           headers: {
             'User-Agent': 'master-maps/1.0 (OSM acquisition for Auch, France; contact@ifthenelse.com)',
             Accept: 'application/json',
+            'Content-Type': 'application/x-www-form-urlencoded',
           },
+          body: `data=${encodeURIComponent(query)}`,
         });
         clearTimeout(timeoutId);
 

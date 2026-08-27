@@ -261,6 +261,42 @@ function checkRequiredLayers(features: MapFeature[]): ValidationIssue[] {
   return issues;
 }
 
+/** Minimum feature counts a full-commune acquisition must produce. */
+const MIN_ROAD_COUNT = 50;
+const MIN_BUILDING_COUNT = 50;
+const MIN_TOTAL_FEATURE_COUNT = 500;
+
+/**
+ * Guard against a degraded data pipeline silently shipping a near-empty
+ * dataset (e.g. a boundary-polygon or Overpass query regression): a full
+ * commune acquisition must clear these floors, not just be nonempty.
+ */
+function checkMinimumVolume(features: MapFeature[]): ValidationIssue[] {
+  const issues: ValidationIssue[] = [];
+  const roadCount = features.filter((f) => f.kind === "road").length;
+  const buildingCount = features.filter((f) => f.kind === "building").length;
+
+  if (roadCount < MIN_ROAD_COUNT) {
+    issues.push({
+      severity: "error",
+      message: `Road count ${roadCount} is below the minimum ${MIN_ROAD_COUNT} for a full commune`,
+    });
+  }
+  if (buildingCount < MIN_BUILDING_COUNT) {
+    issues.push({
+      severity: "error",
+      message: `Building count ${buildingCount} is below the minimum ${MIN_BUILDING_COUNT} for a full commune`,
+    });
+  }
+  if (features.length < MIN_TOTAL_FEATURE_COUNT) {
+    issues.push({
+      severity: "error",
+      message: `Total feature count ${features.length} is below the minimum ${MIN_TOTAL_FEATURE_COUNT} for a full commune`,
+    });
+  }
+  return issues;
+}
+
 function checkNocibePresent(features: MapFeature[]): ValidationIssue[] {
   // Look for a business or POI whose name contains "nocibé|nocibe"
   const nocibe = features.find((f) => {
@@ -342,6 +378,7 @@ export async function validate(generatedDir?: string): Promise<void> {
   issues.push(...checkStableIdUniqueness(features));
   issues.push(...checkRequiredLayers(features));
   issues.push(...checkNocibePresent(features));
+  issues.push(...checkMinimumVolume(features));
 
   // Tile manifest integrity
   const manifestPath = path.join(gd, "tile-manifest.json");

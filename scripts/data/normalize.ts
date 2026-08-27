@@ -503,22 +503,33 @@ function normalizeOsm(
     } else if (elType === "way") {
       coords = resolveWayNodes(el);
       if (!coords) continue;
-      if (kind === "building" || kind === "landuse" || kind === "water") {
-        let sx = 0, sy = 0;
-        for (const [x, y] of coords) { sx += x; sy += y; }
-        lon = sx / coords.length;
-        lat = sy / coords.length;
-      } else {
-        lon = coords[0][0];
-        lat = coords[0][1];
-      }
+      // Anchor is always the vertex-average centroid, never the first vertex:
+      // a LineString whose first vertex sits just outside the commune
+      // boundary (a road entering Auch from a neighbouring commune) must not
+      // be rejected while most of its length lies inside.
+      let sx = 0, sy = 0;
+      for (const [x, y] of coords) { sx += x; sy += y; }
+      lon = sx / coords.length;
+      lat = sy / coords.length;
     } else {
       continue;
     }
 
     if (!isFinite(lon) || !isFinite(lat)) continue;
-    if (!likelyInsideBoundary(lon, lat)) continue;
-    if (!pointInPolygon(lon, lat, boundaryRings)) continue;
+
+    const isLine = kind === "road" || kind === "transport";
+    if (isLine) {
+      // Membership for a line is "any vertex inside the polygon", not
+      // "centroid inside the polygon" — a long road only partially inside
+      // Auch must still render the inside portion.
+      const anyVertexInside = coords.some(
+        ([x, y]) => likelyInsideBoundary(x, y) && pointInPolygon(x, y, boundaryRings),
+      );
+      if (!anyVertexInside) continue;
+    } else {
+      if (!likelyInsideBoundary(lon, lat)) continue;
+      if (!pointInPolygon(lon, lat, boundaryRings)) continue;
+    }
 
     const [lx, lz] = forward(lon, lat);
     const sourceRefs: SourceReference[] = [{ source: "osm", timestamp: raw.timestamp || now }];
