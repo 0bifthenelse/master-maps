@@ -14,6 +14,8 @@ moli.log
 .env.local
 .env.production
 
+# Chrome visual verification profile
+/.chrome-verify-profile/
 # Next.js build artifacts
 .next/
 next-env.d.ts
