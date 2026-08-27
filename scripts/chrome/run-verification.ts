@@ -152,21 +152,26 @@ async function main() {
     });
     console.log("navigator.gpu probe:", JSON.stringify(gpuInfo));
 
-    await page.waitForFunction(
-      () => {
-        const diagnostics = document.querySelector("#scene-diagnostics");
-        if (!diagnostics) return false;
-        const status = diagnostics.getAttribute("data-renderer-status");
-        const draws = Number(diagnostics.getAttribute("data-draw-calls"));
-        if (status === "errored" || status === "unsupported") return true;
-        // A freshly created WebGPU renderer flips to "initialized" before
-        // the scene has evaluated a single frame of real geometry. Wait
-        // for that first real frame instead of trusting renderer-status alone.
-        return status === "initialized" && draws > 0;
-      },
-      undefined,
-      { timeout: 20000 },
-    );
+    try {
+      await page.waitForFunction(
+        () => {
+          const diagnostics = document.querySelector("#scene-diagnostics");
+          if (!diagnostics) return false;
+          const status = diagnostics.getAttribute("data-renderer-status");
+          const draws = Number(diagnostics.getAttribute("data-draw-calls"));
+          if (status === "errored" || status === "unsupported") return true;
+          return status === "initialized" && draws > 0;
+        },
+        undefined,
+        { timeout: 20000 },
+      );
+    } catch (error) {
+      const diagnostics = await page.locator("#scene-diagnostics").textContent().catch(() => null);
+      console.error("Scene diagnostics before wait failure:", diagnostics);
+      console.error("Console errors before wait failure:", JSON.stringify(consoleErrors));
+      console.error("Page errors before wait failure:", JSON.stringify(pageErrors));
+      throw error;
+    }
 
     const diagAttrs = await page.locator("#scene-diagnostics").evaluate((el) => ({
       status: el.getAttribute("data-renderer-status"),
@@ -175,18 +180,275 @@ async function main() {
       features: el.getAttribute("data-loaded-feature-count"),
       buildings: el.getAttribute("data-building-count"),
       roads: el.getAttribute("data-road-count"),
+      water: el.getAttribute("data-water-count"),
+      landuse: el.getAttribute("data-landuse-count"),
       pois: el.getAttribute("data-poi-count"),
+      businesses: el.getAttribute("data-business-count"),
       draws: el.getAttribute("data-draw-calls"),
       camera: el.getAttribute("data-camera-state"),
       error: el.getAttribute("data-renderer-error"),
     }));
     console.log("Scene diagnostics:", JSON.stringify(diagAttrs, null, 2));
 
-    await sleep(1500); // allow a couple of frames to settle after diagnostics report initialized
+    if (diagAttrs.status === "initialized") {
+      const camera = JSON.parse(diagAttrs.camera ?? "null") as {
+        position?: [number, number, number];
+        azimuthalAngle?: number;
+      } | null;
+      if (
+        !camera
+        || !camera.position
+        || camera.position[1] <= 0
+        || Math.abs(camera.azimuthalAngle ?? Number.NaN) > 1e-6
+      ) {
+        throw new Error(`Expected north-up camera, got ${diagAttrs.camera}`);
+      }
+      if (Number(diagAttrs.water) <= 0 || Number(diagAttrs.businesses) <= 0) {
+        throw new Error(`Expected source-backed water and business counts, got ${JSON.stringify(diagAttrs)}`);
+      }
+    }
 
-    const screenshotPath = resolve(ARTIFACTS_DIR, "webgpu-map.png");
+    await sleep(1500);
+
+    const screenshotPath = resolve(ARTIFACTS_DIR, "after-overview.png");
     await page.screenshot({ path: screenshotPath });
     console.log(`Screenshot saved: ${screenshotPath}`);
+    if (diagAttrs.status === "initialized") {
+      const manifest = await page.evaluate(async () => {
+        const response = await fetch("/api/map/manifest");
+        return await response.json() as {
+          bounds: [number, number, number, number];
+          projectionOrigin: [number, number];
+        };
+      });
+      const canvas = page.locator("canvas");
+      const canvasBox = await canvas.boundingBox();
+      if (!canvasBox) throw new Error("canvas has no bounding box");
+
+      const readCamera = async (): Promise<{
+        position: [number, number, number];
+        target: [number, number, number];
+        zoom: number;
+        azimuthalAngle: number;
+      }> => {
+        const serialized = await page.locator("#scene-diagnostics").getAttribute("data-camera-state");
+        if (!serialized) throw new Error("camera-state diagnostic is missing");
+        return JSON.parse(serialized) as {
+          position: [number, number, number];
+          target: [number, number, number];
+          zoom: number;
+          azimuthalAngle: number;
+        };
+      };
+
+      const capture = async (name: string): Promise<void> => {
+        const path = resolve(ARTIFACTS_DIR, `${name}.png`);
+        await page.screenshot({ path });
+        console.log(`Screenshot saved: ${path}`);
+      };
+
+      const northUpTarget = (await readCamera()).target;
+      const resetView = async (): Promise<void> => {
+        await page.locator('button[aria-label="Réinitialiser la vue"]').click();
+        await page.waitForFunction(
+          (targetX) => Math.abs(Number(document.getElementById("scene-diagnostics")?.getAttribute("data-camera-target-x")) - targetX) < 0.5,
+          northUpTarget[0],
+          { timeout: 5000 },
+        );
+        await sleep(350);
+      };
+
+      const selectSearch = async (query: string, kind?: string): Promise<void> => {
+        const input = page.locator('[data-testid="search-input"]');
+        await input.fill(query);
+        const selector = kind
+          ? `[role="option"][data-feature-kind="${kind}"]`
+          : '[role="option"]';
+        const option = page.locator(selector).first();
+        await option.waitFor({ state: "visible", timeout: 5000 });
+        await option.click();
+        await sleep(700);
+      };
+
+      const moveToSourceCoordinate = async (coordinate: [number, number]): Promise<[number, number]> => {
+        const camera = await readCamera();
+        const [originLon, originLat] = manifest.projectionOrigin;
+        const metersPerDegree = 111_319.9;
+        const originCosine = Math.cos(originLat * Math.PI / 180);
+        const localX = (coordinate[0] - originLon) * metersPerDegree * originCosine;
+        const localZ = (coordinate[1] - originLat) * metersPerDegree;
+        const worldWidth = manifest.bounds[2] - manifest.bounds[0];
+        const worldHeight = manifest.bounds[3] - manifest.bounds[1];
+        const aspect = canvasBox.width / canvasBox.height;
+        const frustumWidth = worldWidth / worldHeight > aspect
+          ? worldWidth * 1.15
+          : worldHeight * aspect * 1.15;
+        const frustumHeight = worldWidth / worldHeight > aspect
+          ? worldWidth / aspect * 1.15
+          : worldHeight * 1.15;
+        const screenX =
+          canvasBox.x + canvasBox.width / 2
+          + (localX - camera.target[0]) * camera.zoom / frustumWidth * canvasBox.width;
+        const screenY =
+          canvasBox.y + canvasBox.height / 2
+          - (localZ - camera.target[2]) * camera.zoom / frustumHeight * canvasBox.height;
+        console.log("Source coordinate screen position:", JSON.stringify({
+          coordinate,
+          local: [localX, localZ],
+          camera,
+          canvas: canvasBox,
+          screen: [screenX, screenY],
+        }));
+        await page.mouse.move(screenX, screenY);
+        return [screenX, screenY];
+      };
+
+      await capture("after-overview");
+      await selectSearch("Gare d'Auch");
+      await capture("gare-area");
+      await resetView();
+      await selectSearch("Cathédrale Sainte-Marie");
+      await page.mouse.move(canvasBox.x + canvasBox.width / 2, canvasBox.y + canvasBox.height / 2);
+      await page.mouse.wheel(0, -800);
+      await sleep(500);
+      await capture("historic-centre");
+      await resetView();
+      await selectSearch("Musée des Amériques", "poi");
+      await capture("museum-area");
+      await resetView();
+      await selectSearch("Le Gers", "water");
+      await capture("gers-area");
+      await resetView();
+
+      const businessRecords = await page.evaluate(async () => {
+        const response = await fetch("/api/map/search?q=NOCIBE");
+        return await response.json() as Array<{
+          featureId: string;
+          canonicalName: string;
+          kind: string;
+          focusLon: number;
+          focusLat: number;
+        }>;
+      });
+      const business = businessRecords.find((record) =>
+        record.kind === "business" && /nocibe/i.test(record.canonicalName));
+      if (!business) throw new Error("No NOCIBE business search record available");
+      await selectSearch("NOCIBE", "business");
+      await page.mouse.move(canvasBox.x + canvasBox.width / 2, canvasBox.y + canvasBox.height / 2);
+      for (let attempt = 0; attempt < 240; attempt += 1) {
+        if ((await readCamera()).zoom >= 100) break;
+        await page.mouse.wheel(0, -1200);
+        await sleep(10);
+      }
+      if ((await readCamera()).zoom < 100) {
+        throw new Error("Hardware zoom did not reach a business-picking scale");
+      }
+      await sleep(500);
+      await page.mouse.move(canvasBox.x + 10, canvasBox.y + 10);
+      await sleep(100);
+      const businessScreen = await moveToSourceCoordinate([business.focusLon, business.focusLat]);
+      const r3fObjects = await page.evaluate(() => {
+        const found: Array<{ tag: string; keys: string[]; rootKeys: string[] }> = [];
+        for (const element of document.querySelectorAll("*")) {
+          const value = (element as HTMLElement & { __r3f?: { root?: unknown } }).__r3f;
+          if (!value) continue;
+          const root = value.root;
+          found.push({
+            tag: element.tagName,
+            keys: Object.keys(value),
+            rootKeys: typeof root === "object" && root !== null ? Object.keys(root) : [],
+          });
+        }
+        return found.slice(0, 8);
+      });
+      console.log("R3F DOM diagnostics:", JSON.stringify(r3fObjects));
+      const hitElements = await page.evaluate(([screenX, screenY]) =>
+        document.elementsFromPoint(screenX, screenY).map((element) => ({
+          tag: element.tagName,
+          id: element.id,
+          className: typeof element.className === "string" ? element.className : "",
+          pointerEvents: getComputedStyle(element).pointerEvents,
+        })),
+      businessScreen);
+      console.log("Business DOM hit elements:", JSON.stringify(hitElements));
+      const raycast = await page.evaluate(([screenX, screenY]) => {
+        interface RaycastState {
+          pointer: { set: (x: number, y: number) => void };
+          raycaster: {
+            setFromCamera: (pointer: unknown, camera: unknown) => void;
+            intersectObjects: (objects: unknown[], recursive: boolean) => Array<{
+              object: { type: string; userData: Record<string, unknown> };
+              instanceId?: number;
+            }>;
+          };
+          camera: unknown;
+          scene: { children: unknown[] };
+        }
+        const canvas = document.querySelector("canvas");
+        if (!canvas) return { error: "canvas missing" };
+        const root = (canvas as HTMLCanvasElement & {
+          __r3f?: { root?: { getState: () => RaycastState } };
+        }).__r3f?.root;
+        if (!root) return { error: "R3F root missing" };
+        const state = root.getState();
+        const rect = canvas.getBoundingClientRect();
+        const pointerX = (screenX - rect.left) / rect.width * 2 - 1;
+        const pointerY = -((screenY - rect.top) / rect.height * 2 - 1);
+        state.pointer.set(pointerX, pointerY);
+        state.raycaster.setFromCamera(state.pointer, state.camera);
+        return state.raycaster.intersectObjects(state.scene.children, true).slice(0, 12).map((hit) => ({
+          type: hit.object.type,
+          instanceId: hit.instanceId,
+          userDataKeys: Object.keys(hit.object.userData),
+        }));
+      }, businessScreen);
+      console.log("Business raycast diagnostics:", JSON.stringify(raycast));
+      const popup = page.locator('[data-testid="business-hover-popup"]');
+      await page.mouse.move(canvasBox.x + 10, canvasBox.y + 10);
+      await sleep(100);
+      await page.mouse.move(businessScreen[0], businessScreen[1]);
+      console.log("Business pointer moved to exact projected coordinate");
+      try {
+        await popup.waitFor({ state: "visible", timeout: 5000 });
+      } catch (error) {
+        console.error("Business popup did not appear:", error);
+        console.error("Business search record:", JSON.stringify(business));
+        console.error("Camera state:", await readCamera());
+        await capture("business-hover-failed");
+        throw error;
+      }
+      if (await popup.getAttribute("data-business-id") !== business.featureId) {
+        throw new Error("Business popup resolved to the wrong stable ID");
+      }
+      await capture("business-hover");
+      await page.mouse.move(canvasBox.x + 4, canvasBox.y + 4);
+      await popup.waitFor({ state: "detached", timeout: 5000 });
+
+      await resetView();
+      await canvas.click();
+      const hklInitial = await readCamera();
+      await page.keyboard.press("KeyL");
+      await sleep(150);
+      await page.keyboard.press("KeyK");
+      await sleep(150);
+      await page.keyboard.press("KeyH");
+      await sleep(150);
+      await page.keyboard.press("KeyJ");
+      await sleep(350);
+      const hklFinal = await readCamera();
+      console.log("HJKL camera transition:", JSON.stringify({ initial: hklInitial, final: hklFinal }));
+      if (
+        Math.abs(hklFinal.target[0] - hklInitial.target[0]) > 1e-6
+        || Math.abs(hklFinal.target[2] - hklInitial.target[2]) > 1e-6
+        || Math.abs(hklFinal.azimuthalAngle) > 1e-6
+      ) {
+        throw new Error("HJKL did not return the camera to the same north-up world state");
+      }
+      await capture("h-j-k-l");
+
+      await selectSearch("Avenue d'Alsace", "road");
+      await capture("avenue-d-alsace");
+    }
 
     console.log("Console errors:", JSON.stringify(consoleErrors, null, 2));
     console.log("Page errors:", JSON.stringify(pageErrors, null, 2));

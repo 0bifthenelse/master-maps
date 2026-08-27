@@ -43,6 +43,7 @@ export interface MapCameraProps {
 }
 
 const DAMPING = 0.08;
+const NORTH_UP_ROTATION: [number, number, number] = [-Math.PI / 2, 0, Math.PI];
 
 export const MapCamera = forwardRef<CameraHandle, MapCameraProps>(
   (
@@ -107,6 +108,29 @@ export const MapCamera = forwardRef<CameraHandle, MapCameraProps>(
     ));
     const animating = useRef(false);
     const desiredZoom = useRef(initialZoom);
+    const initialised = useRef(false);
+
+    const applyNorthUp = useCallback(
+      (targetX: number, targetZ: number): void => {
+        const camera = cameraRef.current;
+        if (!camera) return;
+
+        camera.up.set(0, 1, 0);
+        camera.position.set(targetX, cameraHeight, targetZ);
+        camera.rotation.set(...NORTH_UP_ROTATION);
+        camera.updateMatrixWorld();
+
+        const controls = get().controls as MapControlsImpl | null;
+        if (controls) {
+          controls.target.set(targetX, 0, targetZ);
+          controls.update();
+          camera.position.set(targetX, cameraHeight, targetZ);
+          camera.rotation.set(...NORTH_UP_ROTATION);
+          camera.updateMatrixWorld();
+        }
+      },
+      [cameraHeight, get],
+    );
 
     /* Re-fit the frustum whenever the Canvas is resized (mobile rotation,
        window resize) so the commune stays fully visible. */
@@ -169,19 +193,29 @@ export const MapCamera = forwardRef<CameraHandle, MapCameraProps>(
       if (!camera) return;
 
       desiredTarget.current.set(centreX, 0, centreZ);
+      applyNorthUp(centreX, centreZ);
+      initialised.current = true;
       initFrustum(initialZoom);
       desiredZoom.current = initialZoom;
       animating.current = true;
-    }, [centreX, centreZ, initFrustum, initialZoom]);
+    }, [applyNorthUp, centreX, centreZ, initFrustum, initialZoom]);
 
     /* --- Animation loop --- */
 
     useFrame(() => {
-      if (!animating.current) return;
+      if (!initialised.current) {
+        applyNorthUp(desiredTarget.current.x, desiredTarget.current.z);
+        if (get().controls) initialised.current = true;
+      }
       const camera = cameraRef.current;
       if (!camera) return;
+      if (!animating.current) {
+        camera.rotation.set(...NORTH_UP_ROTATION);
+        camera.updateMatrixWorld();
+        return;
+      }
 
-      /* Animate target via the controls when available */
+      /* Animate target via the controls when available. */
       const controls = get().controls as MapControlsImpl | null;
       if (controls) {
         const t = controls.target;
@@ -196,7 +230,7 @@ export const MapCamera = forwardRef<CameraHandle, MapCameraProps>(
           t.z += dz * DAMPING;
         }
       } else {
-        /* Fallback: move camera position directly */
+        /* Fallback: move camera position directly. */
         const cp = camera.position;
         const dx = desiredTarget.current.x - cp.x;
         const dz = desiredTarget.current.z - cp.z;
@@ -210,12 +244,14 @@ export const MapCamera = forwardRef<CameraHandle, MapCameraProps>(
         }
       }
 
-      /* Animate zoom when desired */
+      /* Animate zoom when desired. */
       const zDelta = desiredZoom.current - camera.zoom;
       if (Math.abs(zDelta) > 0.01) {
         camera.zoom += zDelta * DAMPING;
         camera.updateProjectionMatrix();
       }
+      camera.rotation.set(...NORTH_UP_ROTATION);
+      camera.updateMatrixWorld();
     });
 
     /* --- Ref API exposed to parent --- */
@@ -233,19 +269,24 @@ export const MapCamera = forwardRef<CameraHandle, MapCameraProps>(
             azimuthalAngle: 0,
           };
         }
-        const euler = new THREE.Euler().setFromQuaternion(camera.quaternion);
         const controls = get().controls as MapControlsImpl | null;
+        const target: [number, number, number] = controls
+          ? [controls.target.x, controls.target.y, controls.target.z]
+          : [0, 0, 0];
+        const horizontalOffset = controls
+          ? Math.hypot(camera.position.x - controls.target.x, camera.position.z - controls.target.z)
+          : 0;
         return {
           position: [
             camera.position.x,
             camera.position.y,
             camera.position.z,
           ],
-          target: controls
-            ? [controls.target.x, controls.target.y, controls.target.z]
-            : [0, 0, 0],
+          target,
           zoom: camera.zoom,
-          azimuthalAngle: euler.y,
+          azimuthalAngle: horizontalOffset < 1
+            ? 0
+            : controls?.getAzimuthalAngle() ?? 0,
         };
       },
     }));
@@ -254,7 +295,8 @@ export const MapCamera = forwardRef<CameraHandle, MapCameraProps>(
       <orthographicCamera
         ref={cameraRef}
         position={[centreX, cameraHeight, centreZ] as [number, number, number]}
-        rotation={[-Math.PI / 2, 0, 0] as [number, number, number]}
+        up={[0, 1, 0]}
+        rotation={NORTH_UP_ROTATION}
         zoom={initialZoom}
         near={1}
         far={cameraHeight * 4}

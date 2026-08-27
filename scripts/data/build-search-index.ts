@@ -181,19 +181,25 @@ async function loadData(
   return { features, tileMap };
 }
 
-/** Generate known aliases for a feature. */
 function generateAliases(feature: MapFeature): string[] {
   const aliases: string[] = [];
   if (feature.address) {
-    const addrKey = normalizedKey(feature.address);
-    if (addrKey) aliases.push(addrKey);
+    const addressKey = normalizedKey(feature.address);
+    if (addressKey) aliases.push(addressKey);
   }
-  // Extract street number from address
-  const addr = feature.address ?? "";
-  const numMatch = addr.match(/^(\d+)/);
-  if (numMatch && feature.name) {
-    aliases.push(`${numMatch[1]} ${normalizedKey(feature.name)}`);
+  const names = [
+    feature.businessName,
+    feature.brand,
+    feature.legalName,
+  ].filter((value): value is string => typeof value === "string" && value.length > 0);
+  for (const alias of names) {
+    const key = normalizedKey(alias);
+    if (key && !aliases.includes(key)) aliases.push(key);
   }
+  const address = feature.address ?? "";
+  const number = address.match(/^(\d+)/);
+  const name = feature.name ?? feature.businessName;
+  if (number && name) aliases.push(`${number[1]} ${normalizedKey(name)}`);
   return aliases.filter(Boolean);
 }
 
@@ -208,7 +214,7 @@ export function buildSearchIndex(
   const records: SearchRecord[] = [];
 
   for (const f of features) {
-    const name = f.name ?? f.stableId;
+    const name = f.name ?? f.businessName ?? f.displayName ?? f.stableId;
     const normalized = normalizedKey(name);
     const aliases = generateAliases(f);
 
@@ -227,7 +233,11 @@ export function buildSearchIndex(
       normalizedName: normalized,
       aliases,
       kind,
-      category: (f as Record<string, string>).category ?? (f as Record<string, string>).poiType ?? undefined,
+      category: (f as Record<string, string>).category
+        ?? (f as Record<string, string>).nafLabel
+        ?? (f as Record<string, string>).poiType
+        ?? (f as Record<string, string>).nafCode
+        ?? undefined,
       tileId,
       focusLon: f.lon,
       focusLat: f.lat,

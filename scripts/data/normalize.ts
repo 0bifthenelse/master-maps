@@ -13,6 +13,20 @@
 
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import {
+  clipLineStringToPolygon,
+  clipPolygonToPolygon,
+  type PolygonGeometry,
+} from "../../src/lib/geo/polygon";
+import {
+  deduplicateOsmElements,
+  isOsmElement,
+  reconstructMultipolygonRelation,
+  type OsmElement,
+  type OsmRelationElement,
+  type OsmWayElement,
+  type RelationIssue,
+} from "./osmRelations";
 
 // ---------------------------------------------------------------------------
 // Type stubs — matches schema contracts from the plan §4
@@ -93,6 +107,8 @@ interface RoadFeature extends MapFeatureBase {
 interface WaterFeature extends MapFeatureBase {
   kind: "water";
   waterType: string;
+  width?: number;
+  widthInferred?: boolean;
 }
 
 interface LanduseFeature extends MapFeatureBase {
@@ -104,6 +120,11 @@ interface PoiFeature extends MapFeatureBase {
   kind: "poi";
   poiType: string;
   category?: string;
+  website?: string;
+  phone?: string;
+  openingHours?: string;
+  operator?: string;
+  wheelchair?: string;
 }
 
 interface BusinessFeature extends MapFeatureBase {
@@ -112,7 +133,18 @@ interface BusinessFeature extends MapFeatureBase {
   siren?: string;
   siret?: string;
   brand?: string;
+  businessName: string;
+  legalName?: string;
   category?: string;
+  nafCode?: string;
+  nafLabel?: string;
+  website?: string;
+  phone?: string;
+  openingHours?: string;
+  operator?: string;
+  wheelchair?: string;
+  administrativeStatus?: string;
+  creationDate?: string;
 }
 
 interface AddressFeature extends MapFeatureBase {
@@ -176,10 +208,6 @@ function pointInPolygon(px: number, py: number, rings: number[][][]): boolean {
   return true;
 }
 
-/** Simple bbox check for fast rejection. */
-function likelyInsideBoundary(lon: number, lat: number): boolean {
-  return lon >= 0.47 && lon <= 0.66 && lat >= 43.60 && lat <= 43.72;
-}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -329,6 +357,19 @@ async function loadRawSources(rawDir: string) {
   } catch {
     bizSireneRaw = '{"records":[]}';
   }
+  let bizOsmRaw: string;
+  try {
+    bizOsmRaw = await fs.readFile(path.join(rawDir, "businesses-osm.json"), readOpt);
+  } catch {
+    bizOsmRaw = '{"status":"missing","body":null}';
+  }
+
+  let bizWebRaw: string;
+  try {
+    bizWebRaw = await fs.readFile(path.join(rawDir, "businesses-web.json"), readOpt);
+  } catch {
+    bizWebRaw = '{"results":[]}';
+  }
 
   let ignFeatures: Record<string, unknown>[] = [];
   let ignUnavailable = true;
@@ -367,6 +408,8 @@ async function loadRawSources(rawDir: string) {
     osm: JSON.parse(osmRaw) as { elements: Record<string, unknown>[]; timestamp: string; query: string },
     addresses: JSON.parse(addrRaw) as { addresses?: Record<string, unknown>[]; license?: string },
     businesses: JSON.parse(bizSireneRaw) as { records?: Record<string, unknown>[] },
+    businessesOsm: JSON.parse(bizOsmRaw) as { status?: string; body?: unknown },
+    businessesWeb: JSON.parse(bizWebRaw) as { results?: Record<string, unknown>[] },
     ign: { features: ignFeatures, unavailable: ignUnavailable },
   };
 }
@@ -411,219 +454,430 @@ function normalizeBoundary(raw: Record<string, unknown>): BoundaryFeature {
     centroidZ: lz,
     geometry: { type: "Polygon", coordinates: rings },
     localGeometry: { type: "Polygon", coordinates: rings.map(r => r.map(p => forward(p[0], p[1]))) },
-    provenance: [],
+    provenance: [{
+      featureId: "boundary:auch-32013",
+      property: "geometry",
+      winner: "geo.api.gouv.fr",
+      contenders: ["geo.api.gouv.fr"],
+      priority: 90,
+      timestamp: now,
+    }],
     confidence: 1.0,
     status: "active",
     sourceRefs,
   };
 }
 
-function normalizeOsm(
+export interface OsmNormalizationResult {
+  features: MapFeature[];
+  relationIssues: RelationIssue[];
+}
+
+type OsmNormalizedGeometry =
+  | { type: "Point"; coordinates: [number, number] }
+  | { type: "LineString"; coordinates: [number, number][] }
+  | { type: "MultiLineString"; coordinates: [number, number][][] }
+  | { type: "Polygon"; coordinates: [number, number][][] }
+  | { type: "MultiPolygon"; coordinates: [number, number][][][] };
+
+interface OsmTagClassification {
+  kind: FeatureKind;
+  poiType?: string;
+  roadClass?: string;
+  waterType?: string;
+  landuseType?: string;
+  transportType?: string;
+}
+
+export function normalizeOsmWithReport(
   raw: { elements: Record<string, unknown>[]; timestamp: string; query: string },
   boundary: BoundaryFeature,
-): MapFeature[] {
-  const boundaryRings = boundary.rings;
+): OsmNormalizationResult {
+  const boundaryRings = boundary.rings as [number, number][][];
+  const boundaryPolygon: PolygonGeometry = {
+    type: "Polygon",
+    coordinates: boundaryRings,
+  };
   const now = new Date().toISOString();
+  const elements = deduplicateOsmElements(raw.elements.filter(isOsmElement));
   const features: MapFeature[] = [];
-  if (!raw.elements?.length) return features;
-
+  const relationIssues: RelationIssue[] = [];
   const nodeCoords = new Map<number, [number, number]>();
-  for (const el of raw.elements) {
-    if (el.type === "node" && typeof el.id === "number") {
-      const lon = el.lon as number;
-      const lat = el.lat as number;
-      if (isFinite(lon) && isFinite(lat)) {
-        nodeCoords.set(el.id, [lon, lat]);
-      }
-    }
-  }
+  const ways = new Map<number, OsmWayElement>();
+  const relations: OsmRelationElement[] = [];
 
-  function resolveWayNodes(el: Record<string, unknown>): [number, number][] | null {
-    const nodes = el.nodes as number[] | undefined;
-    if (!nodes?.length) return null;
-    const coords: [number, number][] = [];
-    for (const id of nodes) {
-      const c = nodeCoords.get(id);
-      if (c) coords.push(c);
-      else return null;
-    }
-    return coords.length >= 2 ? coords : null;
-  }
-
-  for (const el of raw.elements) {
-    const tags = (el.tags ?? {}) as Record<string, string>;
-    const elType = el.type as string;
-    const elId = el.id as number;
-    const sourceId = `osm:${elType}/${elId}`;
-
-    const hasMeaningfulTag = Object.keys(tags).length > 0 && (
-      tags.building || tags.highway || tags.waterway ||
-      tags.landuse || tags.shop || tags.amenity ||
-      tags.tourism || tags.historic || tags.office ||
-      tags.craft || tags.railway || tags.public_transport ||
-      tags["addr:housenumber"] || tags.natural === "water" ||
-      tags.natural === "wetland" || tags.leisure
-    );
-    if (!hasMeaningfulTag) continue;
-
-    let kind: FeatureKind | null = null;
-    let poiType: string | undefined;
-    let roadClass: string | undefined;
-    let waterType: string | undefined;
-    let landuseType: string | undefined;
-    let transportType: string | undefined;
-
-    const poiKey = tags.shop || tags.amenity || tags.tourism || tags.historic || tags.office || tags.craft;
-    if (tags.name && poiKey) {
-      kind = "poi";
-      poiType = tags.shop ?? tags.amenity ?? tags.tourism ?? tags.historic ?? tags.office ?? tags.craft ?? "other";
-    }
-    if (!kind && tags.building) kind = "building";
-    if (!kind && tags.highway) { kind = "road"; roadClass = tags.highway; }
-    if (!kind && (tags.waterway || tags.natural === "water" || tags.natural === "wetland")) {
-      kind = "water";
-      waterType = tags.waterway ?? (tags.natural === "water" ? "water" : "wetland");
-    }
-    if (!kind && tags.landuse) { kind = "landuse"; landuseType = tags.landuse; }
-    if (!kind && (tags.railway || tags.public_transport)) {
-      kind = "transport";
-      transportType = tags.railway ?? tags.public_transport ?? "other";
-    }
-    if (!kind && tags["addr:housenumber"]) kind = "address";
-    if (!kind && tags.leisure) { kind = "landuse"; landuseType = tags.leisure; }
-    if (!kind) continue;
-
-    let coords: [number, number][] | null = null;
-    let lon = 0, lat = 0;
-
-    if (elType === "node") {
-      lon = el.lon as number;
-      lat = el.lat as number;
-      coords = [[lon, lat]];
-    } else if (elType === "way") {
-      coords = resolveWayNodes(el);
-      if (!coords) continue;
-      // Anchor is always the vertex-average centroid, never the first vertex:
-      // a LineString whose first vertex sits just outside the commune
-      // boundary (a road entering Auch from a neighbouring commune) must not
-      // be rejected while most of its length lies inside.
-      let sx = 0, sy = 0;
-      for (const [x, y] of coords) { sx += x; sy += y; }
-      lon = sx / coords.length;
-      lat = sy / coords.length;
+  for (const element of elements) {
+    if (element.type === "node") {
+      nodeCoords.set(element.id, [element.lon, element.lat]);
+    } else if (element.type === "way") {
+      ways.set(element.id, element);
     } else {
-      continue;
+      relations.push(element);
     }
+  }
 
-    if (!isFinite(lon) || !isFinite(lat)) continue;
+  const classifyTags = (tags: Record<string, string>): OsmTagClassification | null => {
+    if (tags.building) return { kind: "building" };
+    if (
+      tags.waterway
+      || tags.natural === "water"
+      || tags.natural === "wetland"
+      || tags.landuse === "reservoir"
+    ) {
+      return {
+        kind: "water",
+        waterType: tags.waterway ?? (tags.natural === "water" ? "water" : tags.natural ?? "reservoir"),
+      };
+    }
+    if (tags.landuse) return { kind: "landuse", landuseType: tags.landuse };
+    if (tags.leisure) return { kind: "landuse", landuseType: tags.leisure };
+    if (tags.highway) return { kind: "road", roadClass: tags.highway };
+    if (tags.railway || tags.public_transport) {
+      return {
+        kind: "transport",
+        transportType: tags.railway ?? tags.public_transport ?? "other",
+      };
+    }
+    const poiType =
+      tags.shop
+      ?? tags.amenity
+      ?? tags.tourism
+      ?? tags.historic
+      ?? tags.office
+      ?? tags.craft;
+    if (tags.name && poiType) {
+      return { kind: "poi", poiType };
+    }
+    if (tags["addr:housenumber"]) return { kind: "address" };
+    return null;
+  };
 
-    const isLine = kind === "road" || kind === "transport";
-    if (isLine) {
-      // Membership for a line is "any vertex inside the polygon", not
-      // "centroid inside the polygon" — a long road only partially inside
-      // Auch must still render the inside portion.
-      const anyVertexInside = coords.some(
-        ([x, y]) => likelyInsideBoundary(x, y) && pointInPolygon(x, y, boundaryRings),
+  const localizeGeometry = (geometry: OsmNormalizedGeometry): Record<string, unknown> => {
+    switch (geometry.type) {
+      case "Point":
+        return { type: "Point", coordinates: forward(geometry.coordinates[0], geometry.coordinates[1]) };
+      case "LineString":
+        return {
+          type: "LineString",
+          coordinates: geometry.coordinates.map(([lon, lat]) => forward(lon, lat)),
+        };
+      case "MultiLineString":
+        return {
+          type: "MultiLineString",
+          coordinates: geometry.coordinates.map((line) => line.map(([lon, lat]) => forward(lon, lat))),
+        };
+      case "Polygon":
+        return {
+          type: "Polygon",
+          coordinates: geometry.coordinates.map((ring) => ring.map(([lon, lat]) => forward(lon, lat))),
+        };
+      case "MultiPolygon":
+        return {
+          type: "MultiPolygon",
+          coordinates: geometry.coordinates.map((polygon) =>
+            polygon.map((ring) => ring.map(([lon, lat]) => forward(lon, lat)))),
+        };
+    }
+  };
+
+  const geometryAnchor = (geometry: OsmNormalizedGeometry): [number, number] => {
+    if (geometry.type === "Point") return geometry.coordinates;
+    const points: [number, number][] = [];
+    const collect = (value: unknown): void => {
+      if (!Array.isArray(value)) return;
+      if (
+        value.length >= 2
+        && typeof value[0] === "number"
+        && typeof value[1] === "number"
+      ) {
+        points.push([value[0], value[1]]);
+        return;
+      }
+      for (const child of value) collect(child);
+    };
+    collect(geometry.coordinates);
+    if (points.length === 0) return [0, 0];
+    let lon = 0;
+    let lat = 0;
+    for (const point of points) {
+      lon += point[0];
+      lat += point[1];
+    }
+    return [lon / points.length, lat / points.length];
+  };
+
+  const clipAreaGeometry = (
+    geometry: Extract<OsmNormalizedGeometry, { type: "Polygon" | "MultiPolygon" }>,
+  ): Extract<OsmNormalizedGeometry, { type: "Polygon" | "MultiPolygon" }> | null => {
+    const polygons: [number, number][][][] = [];
+    const sourcePolygons = geometry.type === "Polygon"
+      ? [geometry.coordinates]
+      : geometry.coordinates;
+    for (const sourcePolygon of sourcePolygons) {
+      const clipped = clipPolygonToPolygon(
+        { type: "Polygon", coordinates: sourcePolygon },
+        boundaryPolygon,
       );
-      if (!anyVertexInside) continue;
-    } else {
-      if (!likelyInsideBoundary(lon, lat)) continue;
-      if (!pointInPolygon(lon, lat, boundaryRings)) continue;
-    }
-
-    const [lx, lz] = forward(lon, lat);
-    const sourceRefs: SourceReference[] = [{ source: "osm", timestamp: raw.timestamp || now }];
-
-    let geometry: Record<string, unknown> | undefined;
-    let localGeometry: Record<string, unknown> | undefined;
-    if (coords.length === 1) {
-      geometry = { type: "Point", coordinates: [coords[0][0], coords[0][1]] };
-      localGeometry = { type: "Point", coordinates: forward(coords[0][0], coords[0][1]) };
-    } else if (coords.length >= 2) {
-      const isClosed = coords[0][0] === coords[coords.length - 1][0] && coords[0][1] === coords[coords.length - 1][1];
-      if (isClosed && (kind === "building" || kind === "landuse" || kind === "water")) {
-        geometry = { type: "Polygon", coordinates: [coords] };
-        localGeometry = { type: "Polygon", coordinates: [coords.map(([x, y]) => forward(x, y))] };
+      if (!clipped) continue;
+      if (clipped.type === "Polygon") {
+        polygons.push(clipped.coordinates);
       } else {
-        geometry = { type: "LineString", coordinates: coords };
-        localGeometry = { type: "LineString", coordinates: coords.map(([x, y]) => forward(x, y)) };
+        polygons.push(...clipped.coordinates);
       }
     }
+    if (polygons.length === 0) return null;
+    if (polygons.length === 1) return { type: "Polygon", coordinates: polygons[0] };
+    return { type: "MultiPolygon", coordinates: polygons };
+  };
 
+  const clipLineGeometry = (
+    coordinates: [number, number][],
+  ): Extract<OsmNormalizedGeometry, { type: "LineString" | "MultiLineString" }> | null => {
+    const clippedLines = clipLineStringToPolygon(coordinates, boundaryPolygon);
+    if (clippedLines.length === 0) return null;
+    if (clippedLines.length === 1) return { type: "LineString", coordinates: clippedLines[0] };
+    return { type: "MultiLineString", coordinates: clippedLines };
+  };
+
+  const parseWidth = (tags: Record<string, string>): number | undefined => {
+    const value = Number.parseFloat(tags.width ?? tags["water:width"] ?? "");
+    return Number.isFinite(value) && value > 0 ? value : undefined;
+  };
+
+  const addNormalizedFeature = (
+    elementType: "way" | "relation",
+    elementId: number,
+    tags: Record<string, string>,
+    classification: OsmTagClassification,
+    sourceGeometry: OsmNormalizedGeometry,
+  ): void => {
+    const [lon, lat] = geometryAnchor(sourceGeometry);
+    if (!Number.isFinite(lon) || !Number.isFinite(lat)) return;
     const name = tags.name ?? "";
     const address = [
       tags["addr:housenumber"] ?? "",
       tags["addr:street"] ?? "",
       tags["addr:postcode"] ?? "",
     ].filter(Boolean).join(", ");
-    const geomHash = coordHash(coords, coords.length);
-    const stableId = buildStableId(kind, name, address, lon, lat, geomHash);
-
+    const featureGeometry: OsmNormalizedGeometry =
+      classification.kind === "poi"
+        || classification.kind === "address"
+        ? { type: "Point", coordinates: [lon, lat] }
+        : sourceGeometry;
+    const [x, z] = forward(lon, lat);
+    const sourceId = `osm:${elementType}/${elementId}`;
+    const sourceTimestamp = raw.timestamp || now;
     const base = {
-      kind,
-      stableId,
+      kind: classification.kind,
+      stableId: sourceId,
       sourceId,
       name: name || undefined,
       address: address || undefined,
       lon,
       lat,
-      x: lx,
-      z: lz,
-      geometry,
-      localGeometry,
-      provenance: [] as ProvenanceRecord[],
+      x,
+      z,
+      geometry: featureGeometry,
+      sourceGeometry: featureGeometry.type !== sourceGeometry.type ? sourceGeometry : undefined,
+      localGeometry: localizeGeometry(featureGeometry),
+      provenance: [{
+        featureId: sourceId,
+        property: "geometry",
+        winner: "osm",
+        contenders: ["osm"],
+        priority: 60,
+        timestamp: sourceTimestamp,
+      }],
       confidence: 0.9,
       status: "active" as const,
-      sourceRefs,
+      sourceRefs: [{
+        source: "osm",
+        url: `https://www.openstreetmap.org/${elementType}/${elementId}`,
+        timestamp: sourceTimestamp,
+        license: "ODbL-1.0",
+      }],
     };
 
-    switch (kind) {
-      case "building": {
-        const h = inferHeight(tags);
-        features.push({
-          ...base,
-          kind: "building",
-          height: h?.height ?? categoryDefaultHeight(tags.building ?? "house"),
-          heightInferred: h ? h.inferred : true,
-          levels: tags["building:levels"] ? parseInt(tags["building:levels"], 10) : undefined,
-          buildingType: tags.building || undefined,
-        } as BuildingFeature);
-        break;
-      }
-      case "road": {
-        const w = tags.width ? parseFloat(tags.width) : undefined;
-        features.push({
-          ...base,
-          kind: "road",
-          roadClass: roadClass ?? "unclassified",
-          width: isFinite(w ?? NaN) ? w : defaultRoadWidth(roadClass ?? "unclassified"),
-          widthInferred: !isFinite(w ?? NaN),
-          surface: tags.surface || undefined,
-          oneway: tags.oneway === "yes",
-          bridge: tags.bridge === "yes",
-          tunnel: tags.tunnel === "yes" || tags.tunnel === "yes",
-        } as RoadFeature);
-        break;
-      }
-      case "water":
-        features.push({ ...base, kind: "water", waterType: waterType ?? "water" } as WaterFeature);
-        break;
-      case "landuse":
-        features.push({ ...base, kind: "landuse", landuseType: landuseType ?? "other" } as LanduseFeature);
-        break;
-      case "poi":
-        features.push({ ...base, kind: "poi", poiType: poiType ?? "other", category: tags.shop ?? tags.amenity ?? tags.tourism ?? undefined } as PoiFeature);
-        break;
-      case "transport":
-        features.push({ ...base, kind: "transport", transportType: transportType ?? "other", route: tags.route ?? undefined, operator: tags.operator ?? undefined } as TransportFeature);
-        break;
-      case "address":
-        features.push({ ...base, kind: "address", banId: sourceId, housenumber: tags["addr:housenumber"] ?? "", street: tags["addr:street"] ?? "", postcode: tags["addr:postcode"] ?? "", city: tags["addr:city"] ?? "Auch" } as AddressFeature);
-        break;
+    if (classification.kind === "building") {
+      const height = inferHeight(tags);
+      features.push({
+        ...base,
+        kind: "building",
+        height: height?.height ?? categoryDefaultHeight(tags.building ?? "house"),
+        heightInferred: height ? height.inferred : true,
+        levels: tags["building:levels"] ? Number.parseInt(tags["building:levels"], 10) : undefined,
+        buildingType: tags.building || undefined,
+      } as BuildingFeature);
+      return;
     }
+    if (classification.kind === "road") {
+      const width = parseWidth(tags);
+      features.push({
+        ...base,
+        kind: "road",
+        roadClass: classification.roadClass ?? "unclassified",
+        highway: classification.roadClass ?? "unclassified",
+        width: width ?? defaultRoadWidth(classification.roadClass ?? "unclassified"),
+        widthInferred: width === undefined,
+        surface: tags.surface || undefined,
+        oneway: tags.oneway === "yes",
+        bridge: tags.bridge === "yes",
+        tunnel: tags.tunnel === "yes",
+      } as RoadFeature);
+      return;
+    }
+    if (classification.kind === "water") {
+      const width = parseWidth(tags);
+      features.push({
+        ...base,
+        kind: "water",
+        waterType: classification.waterType ?? "water",
+        width,
+        widthInferred: width === undefined,
+      } as WaterFeature);
+      return;
+    }
+    if (classification.kind === "landuse") {
+      features.push({
+        ...base,
+        kind: "landuse",
+        landuseType: classification.landuseType ?? "other",
+      } as LanduseFeature);
+      return;
+    }
+    if (classification.kind === "poi") {
+      features.push({
+        ...base,
+        kind: "poi",
+        poiType: classification.poiType ?? "other",
+        category: tags.shop ?? tags.amenity ?? tags.tourism ?? undefined,
+        website: tags.website ?? tags["contact:website"] ?? undefined,
+        phone: tags.phone ?? tags["contact:phone"] ?? undefined,
+        openingHours: tags.opening_hours ?? undefined,
+        operator: tags.operator ?? undefined,
+        wheelchair: tags.wheelchair ?? undefined,
+      } as PoiFeature);
+      return;
+    }
+    if (classification.kind === "transport") {
+      features.push({
+        ...base,
+        kind: "transport",
+        transportType: classification.transportType ?? "other",
+        route: tags.route ?? undefined,
+        operator: tags.operator ?? undefined,
+      } as TransportFeature);
+      return;
+    }
+    features.push({
+      ...base,
+      kind: "address",
+      banId: sourceId,
+      housenumber: tags["addr:housenumber"] ?? "",
+      street: tags["addr:street"] ?? "",
+      postcode: tags["addr:postcode"] ?? "",
+      city: tags["addr:city"] ?? "Auch",
+    } as AddressFeature);
+  };
+
+  const relationWayIds = new Set<number>();
+  for (const relation of relations) {
+    const tags = relation.tags ?? {};
+    const classification = classifyTags(tags);
+    const isAreaRelation =
+      classification?.kind === "building"
+      || classification?.kind === "water"
+      || classification?.kind === "landuse";
+    const isNamedPoiRelation =
+      classification?.kind === "poi"
+      && relation.members.some((member) => member.role === "outer" || member.role === "inner");
+    if (!classification || (!isAreaRelation && !isNamedPoiRelation)) continue;
+
+    const reconstructed = reconstructMultipolygonRelation(relation, ways, nodeCoords);
+    if ("reason" in reconstructed) {
+      relationIssues.push(reconstructed);
+      continue;
+    }
+    const clipped = clipAreaGeometry(reconstructed.geometry);
+    if (!clipped) continue;
+    addNormalizedFeature("relation", relation.id, tags, classification, clipped);
+    if (isAreaRelation) {
+      for (const wayId of reconstructed.memberWayIds) relationWayIds.add(wayId);
+    }
+
+  }
+  const resolveWayNodes = (way: OsmWayElement): [number, number][] | null => {
+    const coordinates: [number, number][] = [];
+    for (const nodeId of way.nodes) {
+      const coordinate = nodeCoords.get(nodeId);
+      if (!coordinate) return null;
+      coordinates.push(coordinate);
+    }
+    return coordinates.length >= 2 ? coordinates : null;
+  };
+
+  for (const element of elements) {
+    if (element.type === "relation") continue;
+    const tags = element.tags ?? {};
+    const classification = classifyTags(tags);
+    if (!classification) continue;
+
+    let coordinates: [number, number][];
+    if (element.type === "node") {
+      coordinates = [[element.lon, element.lat]];
+    } else {
+      if (
+        relationWayIds.has(element.id)
+        && (classification.kind === "building"
+          || classification.kind === "water"
+          || classification.kind === "landuse")
+      ) {
+        continue;
+      }
+      const resolved = resolveWayNodes(element);
+      if (!resolved) continue;
+      coordinates = resolved;
+    }
+
+    let geometry: OsmNormalizedGeometry | null = null;
+    if (coordinates.length === 1) {
+      const point = coordinates[0];
+      if (!pointInPolygon(point[0], point[1], boundary.rings)) continue;
+      geometry = { type: "Point", coordinates: point };
+    } else {
+      const first = coordinates[0];
+      const last = coordinates[coordinates.length - 1];
+      const isClosed = first[0] === last[0] && first[1] === last[1];
+      if (
+        isClosed
+        && (classification.kind === "building"
+          || classification.kind === "water"
+          || classification.kind === "landuse")
+      ) {
+        geometry = clipAreaGeometry({ type: "Polygon", coordinates: [coordinates] });
+      } else if (
+        classification.kind === "road"
+        || classification.kind === "water"
+        || classification.kind === "transport"
+      ) {
+        geometry = clipLineGeometry(coordinates);
+      } else {
+        const anchor = geometryAnchor({ type: "LineString", coordinates });
+        if (!pointInPolygon(anchor[0], anchor[1], boundary.rings)) continue;
+        geometry = { type: "Point", coordinates: anchor };
+      }
+    }
+    if (geometry) addNormalizedFeature(element.type, element.id, tags, classification, geometry);
   }
 
-  return features;
+  return { features, relationIssues };
+}
+
+export function normalizeOsm(
+  raw: { elements: Record<string, unknown>[]; timestamp: string; query: string },
+  boundary: BoundaryFeature,
+): MapFeature[] {
+  return normalizeOsmWithReport(raw, boundary).features;
 }
 
 function normalizeAddresses(
@@ -639,7 +893,6 @@ function normalizeAddresses(
     const lon = r.lon as number;
     const lat = r.lat as number;
     if (!isFinite(lon) || !isFinite(lat)) continue;
-    if (!likelyInsideBoundary(lon, lat)) continue;
     if (!pointInPolygon(lon, lat, boundaryRings)) continue;
 
     const [lx, lz] = forward(lon, lat);
@@ -667,7 +920,14 @@ function normalizeAddresses(
       z: lz,
       geometry: { type: "Point", coordinates: [lon, lat] },
       localGeometry: { type: "Point", coordinates: [lx, lz] },
-      provenance: [],
+      provenance: [{
+        featureId: stableId,
+        property: "geometry",
+        winner: "ban",
+        contenders: ["ban"],
+        priority: 70,
+        timestamp: now,
+      }],
       confidence: 0.95,
       status: "active",
       sourceRefs: [{ source: "ban", timestamp: now, license: raw.license ?? "etalab-2.0" }],
@@ -677,51 +937,313 @@ function normalizeAddresses(
   return features;
 }
 
-function normalizeBusinesses(
-  raw: { records?: Record<string, unknown>[] },
+export function normalizeBusinesses(
+  raw: {
+    records?: Record<string, unknown>[];
+    sourceUrl?: string;
+    license?: string;
+    acquiredAt?: string;
+  },
   boundary: BoundaryFeature,
+  osmRaw: { status?: string; body?: unknown },
+  webRaw: { results?: Record<string, unknown>[] },
 ): BusinessFeature[] {
-  if (!raw.records?.length) return [];
   const boundaryRings = boundary.rings;
   const now = new Date().toISOString();
   const features: BusinessFeature[] = [];
+  const propertySources = new Map<string, Map<string, string>>();
 
-  for (const r of raw.records) {
-    const coord = r.coordinate as { lon?: number; lat?: number } | undefined;
-    let lon = coord?.lon ?? 0;
-    let lat = coord?.lat ?? 0;
-    if (!isFinite(lon) || !isFinite(lat)) continue;
-    if (!likelyInsideBoundary(lon, lat)) continue;
-    if (!pointInPolygon(lon, lat, boundaryRings)) continue;
+  const cleanString = (value: unknown): string | undefined => {
+    if (typeof value !== "string") return undefined;
+    const trimmed = value.trim();
+    return trimmed.length > 0 ? trimmed : undefined;
+  };
 
-    const [lx, lz] = forward(lon, lat);
-    const legalName = String(r.legalName ?? r.tradingName ?? "");
-    const siret = String(r.siret ?? "");
-    const siren = String(r.siren ?? "");
-    const name = legalName;
-    const brand = String(r.tradingName ?? "") || undefined;
-    const geomHash = coordHash([[lon, lat]], 1);
-    const stableId = buildStableId("business", name, siret, lon, lat, geomHash);
+  const normalizedName = (value: string): string =>
+    value.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
 
-    features.push({
+  const coordinateFrom = (value: unknown): [number, number] | null => {
+    if (typeof value !== "object" || value === null) return null;
+    const record = value as Record<string, unknown>;
+    const lon = typeof record.lon === "number" ? record.lon : null;
+    const lat = typeof record.lat === "number" ? record.lat : null;
+    return lon !== null && lat !== null && Number.isFinite(lon) && Number.isFinite(lat)
+      ? [lon, lat]
+      : null;
+  };
+
+  const sourcePriority = (source: string): number => {
+    if (source === "official-website") return 90;
+    if (source === "sirene") return 80;
+    if (source === "annuaire-entreprises") return 75;
+    if (source === "osm") return 60;
+    if (source === "pagesjaunes") return 40;
+    return 50;
+  };
+
+  const sourceReference = (
+    source: string,
+    url: string | undefined,
+    timestamp: string,
+    license: string | undefined,
+  ): SourceReference => ({
+    source,
+    url,
+    timestamp,
+    license,
+  });
+
+  const addSourceReference = (feature: BusinessFeature, reference: SourceReference): void => {
+    if (
+      !feature.sourceRefs.some((existing) =>
+        existing.source === reference.source && existing.url === reference.url)
+    ) {
+      feature.sourceRefs.push(reference);
+    }
+  };
+
+  const addPropertySource = (feature: BusinessFeature, property: string, source: string): void => {
+    const sources = propertySources.get(feature.stableId) ?? new Map<string, string>();
+    sources.set(property, source);
+    propertySources.set(feature.stableId, sources);
+  };
+
+  const mergeField = (
+    feature: BusinessFeature,
+    property: keyof BusinessFeature,
+    value: string | undefined,
+    source: string,
+    timestamp: string,
+  ): void => {
+    if (!value) return;
+    const key = String(property);
+    const current = feature[property];
+    const currentSource = propertySources.get(feature.stableId)?.get(key) ?? "unknown";
+    if (current === undefined || current === null || current === "") {
+      (feature as Record<string, unknown>)[key] = value;
+      addPropertySource(feature, key, source);
+      return;
+    }
+    if (current === value) return;
+    if (sourcePriority(source) <= sourcePriority(currentSource)) return;
+    (feature as Record<string, unknown>)[key] = value;
+    addPropertySource(feature, key, source);
+    feature.provenance.push({
+      featureId: feature.stableId,
+      property: key,
+      winner: `${source}=${value}`,
+      contenders: [`${currentSource}=${String(current)}`, `${source}=${value}`],
+      priority: sourcePriority(source),
+      timestamp,
+    });
+  };
+
+  const insideBoundary = (lon: number, lat: number): boolean =>
+    pointInPolygon(lon, lat, boundaryRings);
+
+  const distanceMetres = (
+    first: [number, number],
+    second: [number, number],
+  ): number => {
+    const dx = (first[0] - second[0]) * 111_319.9 * Math.cos(43.65 * Math.PI / 180);
+    const dz = (first[1] - second[1]) * 111_319.9;
+    return Math.sqrt(dx * dx + dz * dz);
+  };
+
+  const findMatch = (candidate: BusinessFeature): BusinessFeature | undefined => {
+    const candidateName = normalizedName(candidate.businessName);
+    return features.find((feature) => {
+      if (candidate.siret && feature.siret && candidate.siret === feature.siret) return true;
+      if (candidateName && candidateName === normalizedName(feature.businessName)) {
+        return distanceMetres([candidate.lon, candidate.lat], [feature.lon, feature.lat]) <= 150;
+      }
+      return false;
+    });
+  };
+
+  const mergeCandidate = (candidate: BusinessFeature): void => {
+    const match = findMatch(candidate);
+    if (!match) {
+      features.push(candidate);
+      const sources = new Map<string, string>();
+      for (const property of [
+        "businessName", "legalName", "brand", "category", "nafCode", "nafLabel",
+        "address", "website", "phone", "openingHours", "operator", "wheelchair",
+      ]) {
+        if ((candidate as Record<string, unknown>)[property] !== undefined) {
+          sources.set(property, candidate.sourceRefs[0]?.source ?? "unknown");
+        }
+      }
+      propertySources.set(candidate.stableId, sources);
+      return;
+    }
+
+    const incomingSource = candidate.sourceRefs[0]?.source ?? "unknown";
+    addSourceReference(match, candidate.sourceRefs[0]);
+    for (const property of [
+      "address", "brand", "category", "nafCode", "nafLabel", "website",
+      "phone", "openingHours", "operator", "wheelchair",
+    ] as Array<keyof BusinessFeature>) {
+      mergeField(
+        match,
+        property,
+        candidate[property] as string | undefined,
+        incomingSource,
+        candidate.sourceRefs[0]?.timestamp ?? now,
+      );
+    }
+  };
+
+  for (const record of raw.records ?? []) {
+    const coordinate = coordinateFrom(record.coordinate);
+    const businessName = cleanString(record.tradingName) ?? cleanString(record.legalName);
+    if (!coordinate || !businessName || !insideBoundary(coordinate[0], coordinate[1])) continue;
+
+    const [lon, lat] = coordinate;
+    const siret = cleanString(record.siret);
+    const siren = cleanString(record.siren);
+    const legalName = cleanString(record.legalName);
+    const tradingName = cleanString(record.tradingName);
+    const address = cleanString(record.address);
+    const nafCode = cleanString(record.nafCode);
+    const nafLabel = cleanString(record.nafLabel);
+    const [x, z] = forward(lon, lat);
+    const stableId = siret
+      ? `business:siret/${siret}`
+      : buildStableId("business", businessName, address ?? "", lon, lat, coordHash([[lon, lat]], 1));
+    const timestamp = cleanString(record.acquiredAt) ?? raw.acquiredAt ?? now;
+    const feature: BusinessFeature = {
       kind: "business",
       stableId,
-      businessId: siret || undefined,
-      siren: siren || undefined,
-      siret: siret || undefined,
-      brand,
-      name: name || undefined,
+      businessId: siret,
+      siren,
+      siret,
+      brand: tradingName,
+      businessName,
+      legalName,
+      category: nafLabel,
+      nafCode,
+      nafLabel,
+      name: businessName,
+      address,
       lon,
       lat,
-      x: lx,
-      z: lz,
+      x,
+      z,
       geometry: { type: "Point", coordinates: [lon, lat] },
-      localGeometry: { type: "Point", coordinates: [lx, lz] },
-      provenance: [],
-      confidence: 0.9,
+      localGeometry: { type: "Point", coordinates: [x, z] },
+      provenance: [{
+        featureId: stableId,
+        property: "identity",
+        winner: "sirene",
+        contenders: ["sirene"],
+        priority: 80,
+        timestamp,
+      }],
+      confidence: 0.95,
+      status: record.administrativeStatus === "A" || !record.administrativeStatus
+        ? "active"
+        : "uncertain",
+      sourceRefs: [
+        sourceReference(
+          "sirene",
+          raw.sourceUrl ?? "https://recherche-entreprises.api.gouv.fr",
+          timestamp,
+          raw.license ?? "Licence Ouverte / Open Licence 2.0",
+        ),
+      ],
+      administrativeStatus: cleanString(record.administrativeStatus),
+      creationDate: cleanString(record.creationDate),
+    };
+    mergeCandidate(feature);
+  }
+
+  const osmBody = osmRaw.body;
+  const osmElements =
+    typeof osmBody === "object"
+    && osmBody !== null
+    && Array.isArray((osmBody as Record<string, unknown>).elements)
+      ? (osmBody as { elements: Record<string, unknown>[] }).elements
+      : [];
+  for (const element of osmElements) {
+    const tags = element.tags as Record<string, string> | undefined;
+    const businessName = cleanString(tags?.name);
+    if (!businessName) continue;
+    const coordinate =
+      element.type === "node"
+        ? coordinateFrom(element)
+        : coordinateFrom(element.center);
+    if (!coordinate || !insideBoundary(coordinate[0], coordinate[1])) continue;
+    const [lon, lat] = coordinate;
+    const [x, z] = forward(lon, lat);
+    const elementType = cleanString(element.type) ?? "element";
+    const elementId = typeof element.id === "number" ? element.id : 0;
+    const timestamp = now;
+    const feature: BusinessFeature = {
+      kind: "business",
+      stableId: `business:${elementType}/${elementId}`,
+      businessId: undefined,
+      businessName,
+      name: businessName,
+      brand: cleanString(tags?.brand),
+      category: cleanString(tags?.shop) ?? cleanString(tags?.office) ?? cleanString(tags?.craft) ?? cleanString(tags?.amenity),
+      address: [
+        cleanString(tags?.["addr:housenumber"]),
+        cleanString(tags?.["addr:street"]),
+        cleanString(tags?.["addr:postcode"]),
+      ].filter((value): value is string => value !== undefined).join(", ") || undefined,
+      phone: cleanString(tags?.phone) ?? cleanString(tags?.["contact:phone"]),
+      website: cleanString(tags?.website) ?? cleanString(tags?.["contact:website"]),
+      openingHours: cleanString(tags?.opening_hours),
+      operator: cleanString(tags?.operator),
+      wheelchair: cleanString(tags?.wheelchair),
+      lon,
+      lat,
+      x,
+      z,
+      geometry: { type: "Point", coordinates: [lon, lat] },
+      localGeometry: { type: "Point", coordinates: [x, z] },
+      provenance: [{
+        featureId: `business:${elementType}/${elementId}`,
+        property: "identity",
+        winner: "osm",
+        contenders: ["osm"],
+        priority: 60,
+        timestamp,
+      }],
+      confidence: 0.85,
       status: "active",
-      sourceRefs: [{ source: "sirene", timestamp: now }],
-    });
+      sourceRefs: [
+        sourceReference(
+          "osm",
+          `https://www.openstreetmap.org/${elementType}/${elementId}`,
+          timestamp,
+          "ODbL-1.0",
+        ),
+      ],
+    };
+    mergeCandidate(feature);
+  }
+
+  for (const result of webRaw.results ?? []) {
+    if (result.status !== "ok") continue;
+    const sourceId = cleanString(result.sourceId) ?? "web:business";
+    const businessName = cleanString(result.name) ?? cleanString(result.title);
+    if (!businessName) continue;
+    const coordinate = coordinateFrom(result.coordinate);
+    const match = features.find((feature) =>
+      normalizedName(feature.businessName) === normalizedName(businessName)
+      && (!coordinate || distanceMetres([feature.lon, feature.lat], coordinate) <= 150));
+    if (!match) continue;
+    const source = sourceId.includes("pagesjaunes") ? "pagesjaunes" : "official-website";
+    const timestamp = cleanString(result.acquiredAt) ?? now;
+    const url = cleanString(result.url);
+    addSourceReference(match, sourceReference(source, url, timestamp, undefined));
+    mergeField(match, "address", cleanString(result.address), source, timestamp);
+    mergeField(match, "phone", cleanString(result.phone), source, timestamp);
+    if (source === "official-website" && url) {
+      mergeField(match, "website", url, source, timestamp);
+    }
   }
 
   return features;
@@ -762,7 +1284,6 @@ function normalizeIgn(
     } else continue;
 
     if (!isFinite(lon) || !isFinite(lat)) continue;
-    if (!likelyInsideBoundary(lon, lat)) continue;
     if (!pointInPolygon(lon, lat, boundaryRings)) continue;
 
     const [lx, lz] = forward(lon, lat);
@@ -783,7 +1304,14 @@ function normalizeIgn(
         type: geom.type === "Point" ? "Point" as const : "Polygon" as const,
         coordinates: geom.type === "Point" ? forward(lon, lat) : [coords.map(([x, y]) => forward(x, y))],
       } : undefined,
-      provenance: [],
+      provenance: [{
+        featureId: stableId,
+        property: "geometry",
+        winner: "ign-geoplateforme",
+        contenders: ["ign-geoplateforme"],
+        priority: 100,
+        timestamp: now,
+      }],
       confidence: 0.85,
       status: "active",
       sourceRefs: [{ source: "ign-geoplateforme", timestamp: now }],
@@ -824,12 +1352,22 @@ export async function normalizeAll(rawDir?: string, outDir?: string): Promise<vo
 
   const sources = await loadRawSources(rd);
   const boundary = normalizeBoundary(sources.boundary);
-  const osmFeatures = normalizeOsm(sources.osm, boundary);
+  const osmResult = normalizeOsmWithReport(sources.osm, boundary);
   const addrFeatures = normalizeAddresses(sources.addresses, boundary);
-  const bizFeatures = normalizeBusinesses(sources.businesses, boundary);
+  const bizFeatures = normalizeBusinesses(
+    sources.businesses,
+    boundary,
+    sources.businessesOsm,
+    sources.businessesWeb,
+  );
   const ignFeatures = normalizeIgn(sources.ign, boundary);
 
-  const all: MapFeature[] = [boundary, ...osmFeatures, ...addrFeatures, ...bizFeatures, ...ignFeatures];
+  await fs.writeFile(
+    path.join(od, "relation-issues.json"),
+    JSON.stringify(osmResult.relationIssues, null, 2),
+    "utf8",
+  );
+  const all: MapFeature[] = [boundary, ...osmResult.features, ...addrFeatures, ...bizFeatures, ...ignFeatures];
   await writeNormalizedFeatures(all, od);
   console.error(`[normalize] Wrote ${all.length} features to ${od}`);
   const kindCounts = new Map<string, number>();

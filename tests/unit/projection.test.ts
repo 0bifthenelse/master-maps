@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { LocalProjection } from "@/lib/geo/projection";
+import { LocalProjection, computeCenter } from "@/lib/geo/projection";
 
 describe("LocalProjection", () => {
   const origin: [number, number] = [0.586, 43.65]; // approximate Auch center
@@ -58,8 +58,26 @@ describe("LocalProjection", () => {
 });
 
 describe("computeCenter", () => {
-  // Will import computeCenter when available
-  it("placeholder - computeCenter from boundary centroid", () => {
-    expect(true).toBe(true);
+  it("computes a source boundary centroid without changing axis semantics", () => {
+    const center = computeCenter({
+      type: "Polygon",
+      coordinates: [[
+        [0, 0],
+        [10, 0],
+        [10, 10],
+        [0, 10],
+        [0, 0],
+      ]],
+    });
+    expect(center[0]).toBeCloseTo(5, 6);
+    expect(center[1]).toBeCloseTo(5, 6);
+
+    const local = new LocalProjection([0, 0]);
+    expect(local.forward(0, 1)[1]).toBeGreaterThan(0);
+    expect(local.forward(1, 0)[0]).toBeGreaterThan(0);
+    expect(local.reverse(...local.forward(3, 4))).toEqual([
+      expect.closeTo(3, 6),
+      expect.closeTo(4, 6),
+    ]);
   });
 });

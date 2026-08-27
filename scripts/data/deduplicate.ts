@@ -64,6 +64,7 @@ interface MapFeature {
   confidence: number;
   status: "active" | "uncertain" | "inferred" | "unresolved";
   sourceRefs: SourceReference[];
+  [key: string]: unknown;
   // per-kind extras
   height?: number;
   heightInferred?: boolean;
@@ -127,16 +128,19 @@ function sourcePriority(sourceName: string): number {
   return tiers[sourceName] ?? 50;
 }
 
-/** Pick the higher-priority value for a scalar property. */
 function pickPriorityScalar(
   contenders: Array<{ source: string; value: unknown }>,
-): { winner: unknown; contenders: string[] } {
-  if (contenders.length === 0) return { winner: undefined, contenders: [] };
-  if (contenders.length === 1) return { winner: contenders[0]!.value, contenders: [] };
+): { winner: unknown; winnerSource: string; contenders: string[] } {
+  if (contenders.length === 0) {
+    return { winner: undefined, winnerSource: "unknown", contenders: [] };
+  }
   const sorted = [...contenders].sort((a, b) => sourcePriority(b.source) - sourcePriority(a.source));
   return {
     winner: sorted[0]!.value,
-    contenders: contenders.map((c) => `${c.source}=${JSON.stringify(c.value)}`),
+    winnerSource: sorted[0]!.source,
+    contenders: contenders.length > 1
+      ? contenders.map((c) => `${c.source}=${JSON.stringify(c.value)}`)
+      : [],
   };
 }
 
@@ -148,7 +152,7 @@ function pickPriorityScalar(
 async function loadAllFeatures(inDir: string): Promise<MapFeature[]> {
   const dir = await fs.readdir(inDir, { withFileTypes: true });
   const features: MapFeature[] = [];
-  const skipFiles = new Set(["provenance.json", "boundary-source.json", "ign-unavailable.json", "osm-manifest.json"]);
+  const skipFiles = new Set(["provenance.json", "boundary-source.json", "ign-unavailable.json", "osm-manifest.json", "relation-issues.json"]);
   for (const entry of dir) {
     if (!entry.isFile() || !entry.name.endsWith(".json") || skipFiles.has(entry.name)) continue;
     const content = await fs.readFile(path.join(inDir, entry.name), "utf8");
@@ -169,47 +173,49 @@ function deduplicateGroup(group: MapFeature[]): MapFeature | null {
 
   const base = { ...group[0]! };
   const provenance: ProvenanceRecord[] = [...(base.provenance ?? [])];
-  const sourceRefs: SourceReference[] = [...(base.sourceRefs ?? [])];
-  const seenSources = new Set(sourceRefs.map((s) => s.source));
+  const sourceRefs: SourceReference[] = [];
+  const seenReferences = new Set<string>();
 
-  // Accumulate source refs
-  for (let i = 1; i < group.length; i++) {
-    const f = group[i]!;
-    for (const sr of f.sourceRefs ?? []) {
-      if (!seenSources.has(sr.source)) {
-        seenSources.add(sr.source);
-        sourceRefs.push(sr);
-      }
+  for (const feature of group) {
+    for (const reference of feature.sourceRefs ?? []) {
+      const key = `${reference.source}|${reference.url ?? ""}|${reference.sha256 ?? ""}`;
+      if (seenReferences.has(key)) continue;
+      seenReferences.add(key);
+      sourceRefs.push(reference);
     }
   }
 
-  // Merge conflicting scalar properties
   const propertyConflicts = [
     "name", "address", "lon", "lat", "height", "roadClass", "width",
-    "poiType", "banId", "siren", "siret", "buildingType",
+    "poiType", "banId", "siren", "siret", "buildingType", "businessId",
+    "businessName", "legalName", "brand", "category", "nafCode", "nafLabel",
+    "website", "phone", "openingHours", "operator", "wheelchair",
+    "administrativeStatus", "creationDate",
   ] as const;
 
   for (const prop of propertyConflicts) {
     const contenders: Array<{ source: string; value: unknown }> = [];
-    for (const f of group) {
-      const val = (f as Record<string, unknown>)[prop];
-      if (val !== undefined && val !== null) {
-        const src = f.sourceRefs?.[0]?.source ?? "unknown";
-        contenders.push({ source: src, value: val });
+    for (const feature of group) {
+      const value = feature[prop];
+      if (value !== undefined && value !== null && value !== "") {
+        const source = feature.sourceRefs?.[0]?.source ?? "unknown";
+        contenders.push({ source, value });
       }
     }
+    if (contenders.length === 0) continue;
+
     const deduped = pickPriorityScalar(contenders);
-    if (deduped.contenders.length > 0) {
-      (base as Record<string, unknown>)[prop] = deduped.winner;
-      provenance.push({
-        featureId: base.stableId,
-        property: prop,
-        winner: `${contenders[0]?.source ?? "unknown"}=${JSON.stringify(deduped.winner)}`,
-        contenders: deduped.contenders,
-        priority: sourcePriority(contenders[0]?.source ?? "unknown"),
-        timestamp: new Date().toISOString(),
-      });
-    }
+    (base as Record<string, unknown>)[prop] = deduped.winner;
+    if (deduped.contenders.length === 0) continue;
+
+    provenance.push({
+      featureId: base.stableId,
+      property: prop,
+      winner: `${deduped.winnerSource}=${JSON.stringify(deduped.winner)}`,
+      contenders: deduped.contenders,
+      priority: sourcePriority(deduped.winnerSource),
+      timestamp: new Date().toISOString(),
+    });
   }
 
   // Geometry disagreement → mark uncertain
@@ -233,11 +239,11 @@ function deduplicateGroup(group: MapFeature[]): MapFeature | null {
  */
 export function deduplicateFeatures(features: MapFeature[]): MapFeature[] {
   const groups = new Map<string, MapFeature[]>();
-  for (const f of features) {
-    const list = groups.get(f.stableId) ?? [];
-    list.push(f);
-    // Assign a stableId if missing (should not happen after normalise)
-    groups.set(f.stableId ?? `gen:${f.lon},${f.lat}`, list);
+  for (const feature of features) {
+    const key = feature.stableId || `gen:${feature.lon},${feature.lat}`;
+    const list = groups.get(key) ?? [];
+    list.push(feature);
+    groups.set(key, list);
   }
 
   const result: MapFeature[] = [];

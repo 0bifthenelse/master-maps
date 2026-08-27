@@ -75,8 +75,8 @@ type FeatureKind =
   | "boundary";
 
 interface MapFeatureGeometry {
-  type: "Point" | "LineString" | "Polygon" | "MultiPolygon";
-  coordinates: number[];
+  type: "Point" | "LineString" | "MultiLineString" | "Polygon" | "MultiPolygon";
+  coordinates: unknown;
 }
 
 interface MapFeatureBase {
@@ -128,7 +128,9 @@ interface RoadFeature extends MapFeatureBase {
 
 interface WaterFeature extends MapFeatureBase {
   kind: "water";
-  waterType?: "river" | "lake" | "pond" | "stream" | "ditch" | "reservoir";
+  waterType?: string;
+  width?: number;
+  widthInferred?: boolean;
 }
 
 interface LanduseFeature extends MapFeatureBase {
@@ -143,9 +145,19 @@ interface PoiFeature extends MapFeatureBase {
 
 interface BusinessFeature extends MapFeatureBase {
   kind: "business";
+  businessName?: string;
+  legalName?: string;
+  brand?: string;
   category?: string;
+  nafCode?: string;
+  nafLabel?: string;
+  siret?: string;
+  siren?: string;
   phone?: string;
   website?: string;
+  openingHours?: string;
+  operator?: string;
+  wheelchair?: string;
 }
 
 interface AddressFeature extends MapFeatureBase {
@@ -215,10 +227,10 @@ interface NocibeFocusData {
   status: string;
   anchors: { name: string; coord: [number, number] }[];
 }
-type LocalCoordinate = [number, number];
 type LocalGeometry =
   | { type: "Point"; coordinates: LocalCoordinate }
   | { type: "LineString"; coordinates: LocalCoordinate[] }
+  | { type: "MultiLineString"; coordinates: LocalCoordinate[][] }
   | { type: "Polygon"; coordinates: LocalCoordinate[][] }
   | { type: "MultiPolygon"; coordinates: LocalCoordinate[][][] };
 
@@ -673,6 +685,8 @@ export default function MapShell() {
             key={record.featureId}
             type="button"
             role="option"
+            data-testid={`search-result-${record.featureId}`}
+            data-feature-kind={record.kind}
             aria-selected={index === 0}
             onClick={() => handleSearchResultSelect(record.featureId)}
             style={{

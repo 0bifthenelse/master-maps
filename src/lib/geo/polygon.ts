@@ -485,6 +485,409 @@ export function clipGeometryToBounds(
   if (geometry.type === "Polygon") return clipPolygonToBounds(geometry, bounds);
   return clipMultiPolygonToBounds(geometry, bounds);
 }
+// ---------------------------------------------------------------------------
+// Clipping against an arbitrary simple polygon
+// ---------------------------------------------------------------------------
+
+const CLIP_EPSILON = 1e-10;
+
+interface ClipNode {
+  point: Position2D;
+  intersection: boolean;
+  alpha: number;
+  entry: boolean;
+  visited: boolean;
+  next: ClipNode;
+  prev: ClipNode;
+  neighbor: ClipNode | null;
+}
+
+interface IntersectionRecord {
+  subjectEdge: number;
+  clipEdge: number;
+  subjectAlpha: number;
+  clipAlpha: number;
+  point: Position2D;
+  subjectNode: ClipNode | null;
+  clipNode: ClipNode | null;
+}
+
+interface RingCycle {
+  vertices: ClipNode[];
+}
+
+function positionEqual(a: Position2D, b: Position2D): boolean {
+  return Math.abs(a[0] - b[0]) <= CLIP_EPSILON
+    && Math.abs(a[1] - b[1]) <= CLIP_EPSILON;
+}
+
+function closeRingForIntersection(ring: Position2D[]): Position2D[] {
+  const points = ring.slice();
+  if (points.length > 1 && positionEqual(points[0], points[points.length - 1])) {
+    points.pop();
+  }
+  return points;
+}
+
+function createNode(
+  point: Position2D,
+  intersection: boolean,
+  alpha = 0,
+): ClipNode {
+  const node = {
+    point,
+    intersection,
+    alpha,
+    entry: false,
+    visited: false,
+    next: null as unknown as ClipNode,
+    prev: null as unknown as ClipNode,
+    neighbor: null,
+  };
+  node.next = node;
+  node.prev = node;
+  return node;
+}
+
+function createRingCycle(ring: Position2D[]): RingCycle {
+  const points = closeRingForIntersection(ring);
+  const vertices = points.map((point) => createNode(point, false));
+  for (let i = 0; i < vertices.length; i += 1) {
+    const previous = vertices[(i + vertices.length - 1) % vertices.length];
+    const next = vertices[(i + 1) % vertices.length];
+    vertices[i].prev = previous;
+    vertices[i].next = next;
+  }
+  return { vertices };
+}
+
+function cross2d(a: Position2D, b: Position2D): number {
+  return a[0] * b[1] - a[1] * b[0];
+}
+
+function intersectionParameter(
+  a: Position2D,
+  b: Position2D,
+  c: Position2D,
+  d: Position2D,
+): { first: number; second: number; point: Position2D } | null {
+  const r: Position2D = [b[0] - a[0], b[1] - a[1]];
+  const s: Position2D = [d[0] - c[0], d[1] - c[1]];
+  const denominator = cross2d(r, s);
+  if (Math.abs(denominator) <= CLIP_EPSILON) return null;
+
+  const cMinusA: Position2D = [c[0] - a[0], c[1] - a[1]];
+  const first = cross2d(cMinusA, s) / denominator;
+  const second = cross2d(cMinusA, r) / denominator;
+  if (
+    first <= CLIP_EPSILON
+    || first >= 1 - CLIP_EPSILON
+    || second <= CLIP_EPSILON
+    || second >= 1 - CLIP_EPSILON
+  ) {
+    return null;
+  }
+
+  return {
+    first,
+    second,
+    point: [a[0] + first * r[0], a[1] + first * r[1]],
+  };
+}
+
+function collectIntersections(
+  subject: Position2D[],
+  clip: Position2D[],
+): IntersectionRecord[] {
+  const records: IntersectionRecord[] = [];
+  for (let subjectEdge = 0; subjectEdge < subject.length; subjectEdge += 1) {
+    const subjectStart = subject[subjectEdge];
+    const subjectEnd = subject[(subjectEdge + 1) % subject.length];
+    for (let clipEdge = 0; clipEdge < clip.length; clipEdge += 1) {
+      const clipStart = clip[clipEdge];
+      const clipEnd = clip[(clipEdge + 1) % clip.length];
+      const intersection = intersectionParameter(
+        subjectStart,
+        subjectEnd,
+        clipStart,
+        clipEnd,
+      );
+      if (!intersection) continue;
+      records.push({
+        subjectEdge,
+        clipEdge,
+        subjectAlpha: intersection.first,
+        clipAlpha: intersection.second,
+        point: intersection.point,
+        subjectNode: null,
+        clipNode: null,
+      });
+    }
+  }
+  return records;
+}
+
+function insertIntersections(
+  cycle: RingCycle,
+  records: IntersectionRecord[],
+  side: "subject" | "clip",
+): void {
+  for (let edge = 0; edge < cycle.vertices.length; edge += 1) {
+    const edgeRecords = records
+      .filter((record) => (side === "subject" ? record.subjectEdge : record.clipEdge) === edge)
+      .sort((a, b) => {
+        const aAlpha = side === "subject" ? a.subjectAlpha : a.clipAlpha;
+        const bAlpha = side === "subject" ? b.subjectAlpha : b.clipAlpha;
+        return aAlpha - bAlpha;
+      });
+    let cursor = cycle.vertices[edge];
+    for (const record of edgeRecords) {
+      const alpha = side === "subject" ? record.subjectAlpha : record.clipAlpha;
+      const node = createNode(record.point, true, alpha);
+      node.prev = cursor;
+      node.next = cursor.next;
+      cursor.next.prev = node;
+      cursor.next = node;
+      cursor = node;
+      if (side === "subject") record.subjectNode = node;
+      else record.clipNode = node;
+    }
+  }
+}
+
+function midpoint(a: Position2D, b: Position2D): Position2D {
+  return [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2];
+}
+
+function markEntries(
+  records: IntersectionRecord[],
+  subjectPolygon: PolygonGeometry,
+  clipPolygon: PolygonGeometry,
+): void {
+  for (const record of records) {
+    const subjectNode = record.subjectNode;
+    const clipNode = record.clipNode;
+    if (!subjectNode || !clipNode) continue;
+
+    const subjectBefore = midpoint(subjectNode.prev.point, subjectNode.point);
+    const subjectAfter = midpoint(subjectNode.point, subjectNode.next.point);
+    subjectNode.entry =
+      !pointInPolygon(subjectBefore, clipPolygon)
+      && pointInPolygon(subjectAfter, clipPolygon);
+
+    const clipBefore = midpoint(clipNode.prev.point, clipNode.point);
+    const clipAfter = midpoint(clipNode.point, clipNode.next.point);
+    clipNode.entry =
+      !pointInPolygon(clipBefore, subjectPolygon)
+      && pointInPolygon(clipAfter, subjectPolygon);
+
+    subjectNode.neighbor = clipNode;
+    clipNode.neighbor = subjectNode;
+  }
+}
+
+function traceIntersection(start: ClipNode): Position2D[] {
+  const points: Position2D[] = [];
+  let node = start;
+  let onSubject = true;
+  const maxSteps = 100000;
+
+  for (let step = 0; step < maxSteps; step += 1) {
+    if (node.intersection) {
+      if (node.visited) {
+        if (node === start && onSubject) break;
+        return points;
+      }
+      node.visited = true;
+
+      if (!node.entry && node.neighbor) {
+        const neighbor = node.neighbor;
+        onSubject = !onSubject;
+        if (points.length === 0 || !positionEqual(points[points.length - 1], neighbor.point)) {
+          points.push(neighbor.point);
+        }
+        if (neighbor === start && onSubject) break;
+        node = neighbor.next;
+        continue;
+      }
+    }
+
+    if (points.length === 0 || !positionEqual(points[points.length - 1], node.point)) {
+      points.push(node.point);
+    }
+    node = node.next;
+    if (node === start && onSubject) break;
+  }
+
+  if (points.length > 1 && positionEqual(points[0], points[points.length - 1])) {
+    points.pop();
+  }
+  return points;
+}
+
+function simpleRingIntersection(
+  subjectRing: Position2D[],
+  clipRing: Position2D[],
+): Position2D[][] {
+  const subject = closeRingForIntersection(subjectRing);
+  const clip = closeRingForIntersection(clipRing);
+  if (subject.length < 3 || clip.length < 3) return [];
+
+  const records = collectIntersections(subject, clip);
+  if (records.length === 0) {
+    if (pointInRing(subject[0], clip)) return [subject];
+    if (pointInRing(clip[0], subject)) return [clip];
+    return [];
+  }
+
+  const subjectCycle = createRingCycle(subject);
+  const clipCycle = createRingCycle(clip);
+  insertIntersections(subjectCycle, records, "subject");
+  insertIntersections(clipCycle, records, "clip");
+  markEntries(
+    records,
+    { type: "Polygon", coordinates: [subject] },
+    { type: "Polygon", coordinates: [clip] },
+  );
+
+  const output: Position2D[][] = [];
+  for (const record of records) {
+    const node = record.subjectNode;
+    if (!node || !node.entry || node.visited) continue;
+    const ring = traceIntersection(node);
+    if (ring.length >= 3 && Math.abs(ringArea(ring)) > EPSILON) {
+      output.push(ring);
+    }
+  }
+  return output;
+}
+
+/**
+ * Clip a LineString to a Polygon, retaining every inside segment.
+ * A line that enters the polygon more than once is returned as multiple
+ * LineStrings instead of retaining remote source geometry.
+ */
+export function clipLineStringToPolygon(
+  line: Position2D[],
+  polygon: PolygonGeometry,
+): Position2D[][] {
+  if (line.length < 2 || polygon.coordinates[0]?.length < 3) return [];
+
+  const boundaries = polygon.coordinates;
+  const clippedLines: Position2D[][] = [];
+  let current: Position2D[] = [];
+
+  const flush = (): void => {
+    if (current.length >= 2) clippedLines.push(current);
+    current = [];
+  };
+
+  for (let segmentIndex = 0; segmentIndex < line.length - 1; segmentIndex += 1) {
+    const start = line[segmentIndex];
+    const end = line[segmentIndex + 1];
+    const dx = end[0] - start[0];
+    const dy = end[1] - start[1];
+    const parameters = [0, 1];
+
+    for (const boundary of boundaries) {
+      const closed = closeRingForIntersection(boundary);
+      for (let edgeIndex = 0; edgeIndex < closed.length; edgeIndex += 1) {
+        const boundaryStart = closed[edgeIndex];
+        const boundaryEnd = closed[(edgeIndex + 1) % closed.length];
+        const intersection = intersectionParameter(start, end, boundaryStart, boundaryEnd);
+        if (intersection) parameters.push(intersection.first);
+      }
+    }
+
+    parameters.sort((a, b) => a - b);
+    const uniqueParameters: number[] = [];
+    for (const parameter of parameters) {
+      const bounded = Math.max(0, Math.min(1, parameter));
+      if (
+        uniqueParameters.length === 0
+        || Math.abs(uniqueParameters[uniqueParameters.length - 1] - bounded) > CLIP_EPSILON
+      ) {
+        uniqueParameters.push(bounded);
+      }
+    }
+
+    for (let intervalIndex = 0; intervalIndex < uniqueParameters.length - 1; intervalIndex += 1) {
+      const from = uniqueParameters[intervalIndex];
+      const to = uniqueParameters[intervalIndex + 1];
+      if (to - from <= CLIP_EPSILON) continue;
+      const midpointParameter = (from + to) / 2;
+      const middle: Position2D = [
+        start[0] + dx * midpointParameter,
+        start[1] + dy * midpointParameter,
+      ];
+      const fromPoint: Position2D = [
+        start[0] + dx * from,
+        start[1] + dy * from,
+      ];
+      const toPoint: Position2D = [
+        start[0] + dx * to,
+        start[1] + dy * to,
+      ];
+
+      if (pointInPolygon(middle, polygon)) {
+        if (
+          current.length === 0
+          || !positionEqual(current[current.length - 1], fromPoint)
+        ) {
+          current.push(fromPoint);
+        }
+        if (!positionEqual(current[current.length - 1], toPoint)) current.push(toPoint);
+      } else {
+        flush();
+      }
+    }
+  }
+  flush();
+  return clippedLines;
+}
+
+/**
+ * Intersect a source polygon with a simple polygon boundary while preserving
+ * source holes. This is used by normalization before local projection.
+ */
+export function clipPolygonToPolygon(
+  subject: PolygonGeometry,
+  boundary: PolygonGeometry,
+): PolygonGeometry | MultiPolygonGeometry | null {
+  const subjectOuter = subject.coordinates[0];
+  const boundaryOuter = boundary.coordinates[0];
+  if (!subjectOuter || !boundaryOuter) return null;
+
+  const outerParts = simpleRingIntersection(subjectOuter, boundaryOuter);
+  if (outerParts.length === 0) return null;
+
+  const polygons: PolygonGeometry[] = outerParts.map((outer) => ({
+    type: "Polygon",
+    coordinates: [ensureRingClosed(outer)],
+  }));
+
+  for (const subjectHole of subject.coordinates.slice(1)) {
+    const holeParts = simpleRingIntersection(subjectHole, boundaryOuter);
+    for (const hole of holeParts) {
+      const closedHole = ensureRingClosed(hole);
+      const owner = polygons.find((polygon) =>
+        pointInRing(closedHole[0], closeRingForIntersection(polygon.coordinates[0])),
+      );
+      if (owner) owner.coordinates.push(closedHole);
+    }
+  }
+
+  const normalized = polygons
+    .map((polygon) => normalizePolygonGeometry(polygon))
+    .filter((polygon): polygon is PolygonGeometry => polygon !== null && polygon.type === "Polygon");
+  if (normalized.length === 0) return null;
+  if (normalized.length === 1) return normalized[0];
+  return {
+    type: "MultiPolygon",
+    coordinates: normalized.map((polygon) => polygon.coordinates),
+  };
+}
+
 
 // ---------------------------------------------------------------------------
 // Normalisation

@@ -39,6 +39,13 @@ export const LineStringSchema = z
   })
   .strict();
 export type LineStringGeometry = z.infer<typeof LineStringSchema>;
+export const MultiLineStringSchema = z
+  .object({
+    type: z.literal("MultiLineString"),
+    coordinates: z.array(z.array(CoordinateSchema).min(2)).min(1),
+  })
+  .strict();
+export type MultiLineStringGeometry = z.infer<typeof MultiLineStringSchema>;
 
 export const PolygonSchema = z
   .object({
@@ -59,6 +66,7 @@ export type MultiPolygonGeometry = z.infer<typeof MultiPolygonSchema>;
 export const GeometrySchema = z.discriminatedUnion("type", [
   PointSchema,
   LineStringSchema,
+  MultiLineStringSchema,
   PolygonSchema,
   MultiPolygonSchema,
 ]);
@@ -143,6 +151,13 @@ export const FeatureBaseSchema = z.object({
   stableId: z.string().min(1),
   geometry: GeometrySchema,
   sourceId: z.string().optional(),
+  name: z.string().optional(),
+  lon: z.number().optional(),
+  lat: z.number().optional(),
+  x: z.number().optional(),
+  z: z.number().optional(),
+  localGeometry: GeometrySchema.optional(),
+  sourceGeometry: GeometrySchema.optional(),
   names: z.array(z.string()).default([]),
   displayName: z.string().optional(),
   address: z.string().optional(),
@@ -159,6 +174,7 @@ export const FeatureBaseSchema = z.object({
 export const BuildingFeatureSchema = FeatureBaseSchema.extend({
   kind: z.literal("building"),
   height: z.number().nonnegative().optional(),
+  heightInferred: z.boolean().optional(),
   levels: z.number().int().nonnegative().optional(),
   heightSource: HeightSourceEnum.optional(),
   buildingType: z.string().optional(),
@@ -175,7 +191,9 @@ export type BuildingFeature = z.infer<typeof BuildingFeatureSchema>;
 export const RoadFeatureSchema = FeatureBaseSchema.extend({
   kind: z.literal("road"),
   highway: z.string().optional(),
+  roadClass: z.string().optional(),
   width: z.number().nonnegative().optional(),
+  widthInferred: z.boolean().optional(),
   widthSource: HeightSourceEnum.optional(),
   surface: RoadSurfaceEnum.or(z.string()).optional(),
   bridge: z.boolean().optional(),
@@ -192,6 +210,8 @@ export const WaterFeatureSchema = FeatureBaseSchema.extend({
   kind: z.literal("water"),
   waterType: z.string().optional(),
   intermittent: z.boolean().optional(),
+  width: z.number().nonnegative().optional(),
+  widthInferred: z.boolean().optional(),
   tidal: z.boolean().optional(),
   salt: z.enum(["yes", "no"]).optional(),
 }).strict();
@@ -223,6 +243,7 @@ export const BusinessFeatureSchema = FeatureBaseSchema.extend({
   category: z.string().optional(),
   siret: z.string().optional(),
   siren: z.string().optional(),
+  businessId: z.string().optional(),
   brand: z.string().optional(),
   legalName: z.string().optional(),
   website: z.string().optional(),
@@ -231,6 +252,9 @@ export const BusinessFeatureSchema = FeatureBaseSchema.extend({
   operator: z.string().optional(),
   wheelchair: z.string().optional(),
   nafCode: z.string().optional(),
+  nafLabel: z.string().optional(),
+  administrativeStatus: z.string().optional(),
+  creationDate: z.string().optional(),
 }).strict();
 export type BusinessFeature = z.infer<typeof BusinessFeatureSchema>;
 

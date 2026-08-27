@@ -72,7 +72,7 @@ export const MapControls = forwardRef<ControlsHandle, MapControlsProps>(
       maxZoom = 200,
       enableDamping = true,
       dampingFactor = 0.08,
-      enableRotate = true,
+      enableRotate = false,
       rotateSpeed = 0.5,
       enablePan = true,
       panSpeed = 0.5,
@@ -104,13 +104,6 @@ export const MapControls = forwardRef<ControlsHandle, MapControlsProps>(
         const halfSpanX = ((camera.right - camera.left) / camera.zoom) * 0.25;
         const halfSpanZ = ((camera.top - camera.bottom) / camera.zoom) * 0.25;
 
-        /* Which direction does "north" point on screen?  Need to account for
-           azimuthal (in-plane) rotation.  Zero rotation → +z is up on screen.
-           Clockwise rotation → up rotates accordingly. */
-        const azimuth = controls.getAzimuthalAngle();
-        const cosA = Math.cos(azimuth);
-        const sinA = Math.sin(azimuth);
-
         let dx = 0;
         let dz = 0;
 
@@ -123,13 +116,10 @@ export const MapControls = forwardRef<ControlsHandle, MapControlsProps>(
             return;
         }
 
-        /* Rotate the move vector by the inverse of the azimuth so that
-           HJKL always move in world NSEW directions regardless of rotation */
-        const worldDx = dx * cosA + dz * sinA;
-        const worldDz = -dx * sinA + dz * cosA;
+        // HJKL is defined in world coordinates, not screen coordinates.
+        controls.target.x += dx * halfSpanX;
+        controls.target.z += dz * halfSpanZ;
 
-        controls.target.x += worldDx * halfSpanX;
-        controls.target.z += worldDz * halfSpanZ;
         controls.update();
       },
       [communeBounds, get],

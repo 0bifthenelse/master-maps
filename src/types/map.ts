@@ -311,10 +311,12 @@ export interface WaterFeature extends FeatureBase {
   readonly waterType: string;
 
   /**
-   * Local projected polygon rings in metres (x = east, z = north).
-   * First ring is exterior; subsequent rings are interior holes.
+   * Local projected water geometry in metres. Linear waterways use a
+   * LineString coordinate list; filled water bodies use polygon rings.
    */
-  readonly localCoords: readonly (readonly LocalPoint[])[];
+  readonly localCoords:
+    | readonly LocalPoint[]
+    | readonly (readonly LocalPoint[])[];
 }
 
 /**

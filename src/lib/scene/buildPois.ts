@@ -51,6 +51,26 @@ export interface PoiFeatureShape {
   /** Marker size in metres (default 4). */
   size?: number;
 }
+export interface BusinessFeatureShape {
+  kind: 'business';
+  stableId: string;
+  geometry: PointRep;
+  name?: string;
+  businessName?: string;
+  legalName?: string;
+  brand?: string;
+  category?: string;
+  nafLabel?: string;
+  nafCode?: string;
+  address?: string;
+  siret?: string;
+  phone?: string;
+  website?: string;
+  size?: number;
+  openingHours?: string;
+  operator?: string;
+  wheelchair?: string;
+}
 
 // ─── Builder result types ───────────────────────────────────────────────────
 
@@ -60,6 +80,15 @@ export interface InstancedResult {
   featureCount: number;
   /** Maps instanceId → feature array index. */
   featureIdByInstance: number[];
+}
+export interface BusinessInstancedResult {
+  kind: 'business-instanced';
+  mesh: InstancedMesh;
+  featureCount: number;
+  /** Maps instanceId → business feature array index. */
+  featureIdByInstance: number[];
+  /** Updates one instance colour without changing React state. */
+  setHighlight: (instanceId: number | null) => void;
 }
 
 export interface PointsResult {
@@ -72,6 +101,9 @@ export type PoiBuildResult = InstancedResult | PointsResult;
 
 // ─── Constants & shared state ───────────────────────────────────────────────
 
+const DEFAULT_BUSINESS_SIZE = 6;
+const BUSINESS_COLOR = '#d34f2f';
+const BUSINESS_HOVER_COLOR = '#ffb000';
 const DEFAULT_POI_SIZE = 4; // metres diameter
 
 const _matrix = new Matrix4();
@@ -113,8 +145,8 @@ export function buildPoiInstances(features: PoiFeatureShape[]): InstancedResult 
   const material = new MeshBasicMaterial({
     transparent: true,
     depthWrite: false,
+    vertexColors: true,
   });
-
   const mesh = new InstancedMesh(getCircleGeometry(), material, count);
   mesh.count = count;
 
@@ -152,6 +184,64 @@ export function buildPoiInstances(features: PoiFeatureShape[]): InstancedResult 
     mesh,
     featureCount: count,
     featureIdByInstance,
+  };
+}
+export function buildBusinessInstances(
+  features: BusinessFeatureShape[],
+): BusinessInstancedResult {
+  const count = features.length;
+  const material = new MeshBasicMaterial({
+    transparent: true,
+    depthWrite: false,
+    vertexColors: true,
+  });
+  const mesh = new InstancedMesh(getCircleGeometry(), material, count);
+  mesh.count = count;
+  mesh.frustumCulled = false;
+  const featureIdByInstance: number[] = [];
+  const baseColors = features.map(() => BUSINESS_COLOR);
+
+  for (let i = 0; i < count; i += 1) {
+    const feature = features[i];
+    const [x, z] = feature.geometry.coordinates;
+    _position.set(x, 0, z);
+    _scale.set((feature.size ?? DEFAULT_BUSINESS_SIZE) / 2, (feature.size ?? DEFAULT_BUSINESS_SIZE) / 2, 1);
+    _quat.identity();
+    _matrix.compose(_position, _quat, _scale);
+    mesh.setMatrixAt(i, _matrix);
+    _color.set(baseColors[i]);
+    mesh.setColorAt(i, _color);
+    featureIdByInstance.push(i);
+  }
+
+  let highlightedInstance = -1;
+  const setHighlight = (instanceId: number | null): void => {
+    if (!mesh.instanceColor) return;
+    if (highlightedInstance >= 0 && highlightedInstance < count) {
+      _color.set(baseColors[highlightedInstance]);
+      mesh.setColorAt(highlightedInstance, _color);
+    }
+    if (instanceId !== null && instanceId >= 0 && instanceId < count) {
+      _color.set(BUSINESS_HOVER_COLOR);
+      mesh.setColorAt(instanceId, _color);
+      highlightedInstance = instanceId;
+    } else {
+      highlightedInstance = -1;
+    }
+    mesh.instanceColor.needsUpdate = true;
+  };
+
+  mesh.instanceMatrix.needsUpdate = true;
+  if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+  mesh.userData.businessFeatureIds = featureIdByInstance;
+  mesh.userData.businessFeatures = features;
+
+  return {
+    kind: 'business-instanced',
+    mesh,
+    featureCount: count,
+    featureIdByInstance,
+    setHighlight,
   };
 }
 

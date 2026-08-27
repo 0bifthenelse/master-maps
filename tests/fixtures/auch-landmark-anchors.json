@@ -1,0 +1,46 @@
+{
+  "source": "OpenStreetMap via Overpass, with Nocibe from Annuaire des Entreprises / SIRENE",
+  "acquiredAt": "2026-08-27T06:32:25Z",
+  "anchors": {
+    "gersSouth": {
+      "coordinate": [0.5827071162790698, 43.6193213372093],
+      "sourceUrl": "https://www.openstreetmap.org/way/1315735104"
+    },
+    "gersNorth": {
+      "coordinate": [0.5938981923809524, 43.66244088095238],
+      "sourceUrl": "https://www.openstreetmap.org/way/1315735106"
+    },
+    "gareAuch": {
+      "coordinate": [0.5967168714285714, 43.64730908571429],
+      "sourceUrl": "https://www.openstreetmap.org/way/65477442"
+    },
+    "cathedral": {
+      "coordinate": [0.586107265060241, 43.64626884518072],
+      "sourceUrl": "https://www.openstreetmap.org/way/65470768"
+    },
+    "museum": {
+      "coordinate": [0.5876155, 43.6472091],
+      "sourceUrl": "https://www.openstreetmap.org/node/12162155664"
+    },
+    "avenueDeLaMarne": {
+      "coordinate": [0.5947625692307692, 43.648715284615385],
+      "sourceUrl": "https://www.openstreetmap.org/way/29451388"
+    },
+    "boulevardSadiCarnot": {
+      "coordinate": [0.588768775, 43.647426925],
+      "sourceUrl": "https://www.openstreetmap.org/way/29892033"
+    },
+    "rueDu11Novembre": {
+      "coordinate": [0.5940931461538461, 43.641542861538454],
+      "sourceUrl": "https://www.openstreetmap.org/way/556360090"
+    },
+    "avenueDAlsace": {
+      "coordinate": [0.591534, 43.64844878],
+      "sourceUrl": "https://www.openstreetmap.org/way/29891995"
+    },
+    "nocibe": {
+      "coordinate": [0.5918575226, 43.648079486],
+      "sourceUrl": "https://recherche-entreprises.api.gouv.fr/search"
+    }
+  }
+}

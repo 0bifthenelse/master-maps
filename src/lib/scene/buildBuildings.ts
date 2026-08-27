@@ -20,6 +20,7 @@ import {
   Path,
   type Vector2,
 } from 'three';
+import { mapShapeGeometryToWorld } from "./geometryCoordinates";
 
 // ─── Local type guards (matches expected schema.ts shape) ──────────────────
 
@@ -83,18 +84,15 @@ function addHolesToShape(shape: Shape, holes: CoordPair[][]): void {
     shape.holes.push(path);
   }
 }
-
 /**
- * Create a ShapeGeometry from a Shape, rotate it flat onto the xz-plane,
- * and append a feature index attribute.
+ * Create a ShapeGeometry from a Shape in the shared x=east, z=north
+ * coordinate contract and append a feature index attribute.
  */
 function shapeGeometryForFeature(
   shape: Shape,
   featureIndex: number,
 ): BufferGeometry {
-  const geom = new ShapeGeometry(shape);
-  // Rotate from XY to XZ plane (y=0 surface)
-  geom.rotateX(-Math.PI / 2);
+  const geom = mapShapeGeometryToWorld(new ShapeGeometry(shape));
 
   // Tag every vertex with the feature index for picking.
   const vertexCount = geom.getAttribute('position')?.count ?? 0;
@@ -222,6 +220,10 @@ export function buildBuildings(features: BuildingFeatureShape[]): BuildResult {
     : geoms.length === 1
       ? geoms[0]
       : new BufferGeometry();
+
+  if (geoms.length > 1) {
+    for (const geometry of geoms) geometry.dispose();
+  }
 
   return { geometry: merged, featureCount: features.length };
 }

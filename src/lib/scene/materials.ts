@@ -42,18 +42,16 @@ export function setThemeTokens(accent: string, ink: string, paper: string): void
 function applyTokens(m: ThemeAwareMaterial): void {
   if (m.userData.tokenRole === 'road') {
     m.color.set(_ink);
-    m.opacity = 0.55;
+    m.opacity = 0.88;
   } else if (m.userData.tokenRole === 'water') {
-    m.color.set('#a0c4e8');
+    m.color.set('#6da8dc');
+    m.opacity = 0.82;
   } else if (m.userData.tokenRole === 'building') {
     m.color.set(_ink);
-    m.opacity = 0.45;
+    m.opacity = 0.18;
   } else if (m.userData.tokenRole === 'landuse') {
-    // Per-type colours would ideally be per-feature vertex colours; until
-    // that lands, use a visible neutral green base rather than the
-    // material's default white (invisible against the paper background).
     m.color.set('#c8dcc0');
-    m.opacity = 0.5;
+    m.opacity = 0.24;
   } else if (m.userData.tokenRole === 'poi') {
     m.color.set(_accent);
   } else if (m.userData.tokenRole === 'accent') {

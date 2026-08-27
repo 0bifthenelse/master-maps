@@ -18,6 +18,7 @@ import {
   ShapeGeometry,
   Path,
 } from 'three';
+import { mapShapeGeometryToWorld } from "./geometryCoordinates";
 
 // ─── Local types ────────────────────────────────────────────────────────────
 
@@ -91,8 +92,7 @@ function buildGeometryForShape(
   featureIndex: number,
   landuseType: string,
 ): BufferGeometry {
-  const geom = new ShapeGeometry(shape);
-  geom.rotateX(-Math.PI / 2);
+  const geom = mapShapeGeometryToWorld(new ShapeGeometry(shape));
 
   const count = geom.getAttribute('position')?.count ?? 0;
   const indices = new Float32BufferAttribute(
@@ -241,8 +241,13 @@ export function buildLanduse(features: LanduseFeatureShape[]): BuildResult {
     }
   }
 
+  const geometry = mergeGeometries(geoms);
+  if (geoms.length > 1) {
+    for (const intermediate of geoms) intermediate.dispose();
+  }
+
   return {
-    geometry: mergeGeometries(geoms),
+    geometry,
     featureCount: features.length,
     areaMetres: totalArea,
     typesPresent,

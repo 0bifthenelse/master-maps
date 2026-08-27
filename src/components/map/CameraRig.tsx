@@ -67,6 +67,7 @@ export const CameraRig = forwardRef<CameraRigHandle, CameraRigProps>(
       sceneMetrics.cameraTargetX = cameraState.target[0];
       sceneMetrics.cameraTargetZ = cameraState.target[2];
       sceneMetrics.cameraZoom = cameraState.zoom;
+      sceneMetrics.cameraState = JSON.stringify(cameraState);
       publishSceneDiagnostics();
     });
 

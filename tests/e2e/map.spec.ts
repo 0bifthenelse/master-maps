@@ -34,6 +34,53 @@ async function readCameraState(page: Page): Promise<{ x: number; z: number; zoom
     zoom: Number(element.getAttribute("data-camera-zoom")),
   }));
 }
+type FullCameraState = {
+  position: [number, number, number];
+  target: [number, number, number];
+  zoom: number;
+  azimuthalAngle: number;
+};
+
+async function readFullCameraState(page: Page): Promise<FullCameraState> {
+  const serialized = await page.locator("#scene-diagnostics").getAttribute("data-camera-state");
+  if (!serialized) throw new Error("camera-state diagnostic is missing");
+  return JSON.parse(serialized) as FullCameraState;
+}
+
+async function moveToSourceCoordinate(
+  page: Page,
+  coordinate: [number, number],
+): Promise<void> {
+  const manifest = await page.evaluate(async () => {
+    const response = await fetch("/api/map/manifest");
+    return await response.json() as {
+      bounds: [number, number, number, number];
+      projectionOrigin: [number, number];
+    };
+  });
+  const camera = await readFullCameraState(page);
+  const canvas = page.locator("canvas");
+  const box = await canvas.boundingBox();
+  if (!box) throw new Error("canvas has no bounding box");
+  const [originLon, originLat] = manifest.projectionOrigin;
+  const metersPerDegree = 111_319.9;
+  const originCosine = Math.cos(originLat * Math.PI / 180);
+  const localX = (coordinate[0] - originLon) * metersPerDegree * originCosine;
+  const localZ = (coordinate[1] - originLat) * metersPerDegree;
+  const worldWidth = manifest.bounds[2] - manifest.bounds[0];
+  const worldHeight = manifest.bounds[3] - manifest.bounds[1];
+  const aspect = box.width / box.height;
+  const frustumWidth = worldWidth / worldHeight > aspect
+    ? worldWidth * 1.15
+    : worldHeight * aspect * 1.15;
+  const frustumHeight = worldWidth / worldHeight > aspect
+    ? worldWidth / aspect * 1.15
+    : worldHeight * 1.15;
+  await page.mouse.move(
+    box.x + box.width / 2 + (localX - camera.target[0]) * camera.zoom / frustumWidth * box.width,
+    box.y + box.height / 2 - (localZ - camera.target[2]) * camera.zoom / frustumHeight * box.height,
+  );
+}
 
 test.describe("Map application E2E", () => {
   test.beforeEach(async ({ page, errors }) => {
@@ -59,6 +106,8 @@ test.describe("Map application E2E", () => {
       buildings: Number(element.getAttribute("data-building-count")),
       roads: Number(element.getAttribute("data-road-count")),
       pois: Number(element.getAttribute("data-poi-count")),
+      water: Number(element.getAttribute("data-water-count")),
+      businesses: Number(element.getAttribute("data-business-count")),
       draws: Number(element.getAttribute("data-draw-calls")),
       cameraTargetX: Number(element.getAttribute("data-camera-target-x")),
       cameraTargetZ: Number(element.getAttribute("data-camera-target-z")),
@@ -73,6 +122,8 @@ test.describe("Map application E2E", () => {
       await page.screenshot({ path: `${ARTIFACTS_DIR}/map/default.png` });
       return;
     }
+    expect(attrs.water).toBeGreaterThan(0);
+    expect(attrs.businesses).toBeGreaterThan(0);
     expect(attrs.backend).toBe("webgpu");
     expect(attrs.buildings + attrs.roads + attrs.pois).toBeGreaterThan(0);
     expect(attrs.draws).toBeGreaterThan(0);
@@ -154,6 +205,23 @@ test.describe("Map application E2E", () => {
     );
     const afterNorth = await readCameraState(page);
     expect(afterNorth.z).toBeGreaterThan(afterEast.z);
+    await page.keyboard.press("KeyH"); // west
+    await page.waitForFunction(
+      (prevX) => Number(document.getElementById("scene-diagnostics")?.getAttribute("data-camera-target-x")) !== prevX,
+      afterNorth.x,
+      { timeout: 5000 },
+    );
+    const afterWest = await readCameraState(page);
+    expect(afterWest.x).toBeLessThan(afterNorth.x);
+
+    await page.keyboard.press("KeyJ"); // south
+    await page.waitForFunction(
+      (prevZ) => Number(document.getElementById("scene-diagnostics")?.getAttribute("data-camera-target-z")) !== prevZ,
+      afterWest.z,
+      { timeout: 5000 },
+    );
+    const afterSouth = await readCameraState(page);
+    expect(afterSouth.z).toBeLessThan(afterWest.z);
   });
 
   test("H J K L do nothing while the search input is focused", async ({ page }) => {
@@ -254,10 +322,85 @@ test.describe("Map application E2E", () => {
     const afterReset = await readCameraState(page);
     expect(afterReset.x).toBeCloseTo(initial.x, 0);
     expect(afterReset.z).toBeCloseTo(initial.z, 0);
+    const northUp = await readFullCameraState(page);
+    expect(northUp.position[1]).toBeGreaterThan(0);
+    expect(northUp.azimuthalAngle).toBeCloseTo(0, 6);
+    expect(afterReset.zoom).toBeCloseTo(initial.zoom, 6);
 
-    // Search must still work after pan/reset navigation.
     await searchInput.fill("Nocibé");
     await expect(results).toBeVisible();
+  });
+
+  test("hovers an individual business marker and clears on exit", async ({ page }) => {
+    const status = await page.locator("#scene-diagnostics").getAttribute("data-renderer-status");
+    if (status !== "initialized") return;
+
+    const records = await page.evaluate(async () => {
+      const response = await fetch("/api/map/search?q=NOCIBE");
+      return await response.json() as Array<{
+        featureId: string;
+        canonicalName: string;
+        kind: string;
+        focusLon: number;
+        focusLat: number;
+      }>;
+    });
+    const business = records.find((record) => record.kind === "business");
+    expect(business).toBeDefined();
+    if (!business) return;
+
+    const input = page.locator('[data-testid="search-input"]');
+    await input.fill("NOCIBE");
+    const option = page.locator('[role="option"][data-feature-kind="business"]').first();
+    await expect(option).toBeVisible();
+    await option.click();
+    await page.waitForTimeout(500);
+
+    const canvas = page.locator("canvas");
+    const box = await canvas.boundingBox();
+    if (!box) throw new Error("canvas has no bounding box");
+    await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+    await page.mouse.wheel(0, -1200);
+    await page.waitForFunction(
+      () => Number(document.getElementById("scene-diagnostics")?.getAttribute("data-camera-zoom")) > 1,
+      undefined,
+      { timeout: 5000 },
+    );
+    await page.mouse.move(box.x + 10, box.y + 10);
+    await page.waitForTimeout(100);
+    await moveToSourceCoordinate(page, [business.focusLon, business.focusLat]);
+
+    const popup = page.locator('[data-testid="business-hover-popup"]');
+    await expect(popup).toBeVisible({ timeout: 5000 });
+    await expect(popup).toHaveAttribute("data-business-id", business.featureId);
+    await page.screenshot({ path: `${ARTIFACTS_DIR}/map/business-hover.png` });
+
+    await page.mouse.move(box.x + 4, box.y + 4);
+    await expect(popup).toHaveCount(0);
+  });
+
+  test("generic POI hover does not show business details", async ({ page }) => {
+    const status = await page.locator("#scene-diagnostics").getAttribute("data-renderer-status");
+    if (status !== "initialized") return;
+    const records = await page.evaluate(async () => {
+      const response = await fetch("/api/map/search?q=Musée%20des%20Amériques");
+      return await response.json() as Array<{
+        kind: string;
+        focusLon: number;
+        focusLat: number;
+      }>;
+    });
+    const poi = records.find((record) => record.kind === "poi");
+    expect(poi).toBeDefined();
+    if (!poi) return;
+    const input = page.locator('[data-testid="search-input"]');
+    await input.fill("Musée des Amériques");
+    const option = page.locator('[role="option"][data-feature-kind="poi"]').first();
+    await expect(option).toBeVisible();
+    await option.click();
+    await page.waitForTimeout(500);
+    await moveToSourceCoordinate(page, [poi.focusLon, poi.focusLat]);
+    await expect(page.locator('[data-testid="business-hover-popup"]')).toHaveCount(0);
   });
 
   test("mobile viewport fits the commune without cropping", async ({ page }) => {

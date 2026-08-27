@@ -9,6 +9,11 @@
  */
 
 import type { LocalProjection } from '@/lib/geo/projection';
+import {
+  clipLineStringToPolygon,
+  clipPolygonToPolygon,
+  type PolygonGeometry,
+} from '@/lib/geo/polygon';
 
 // ---------------------------------------------------------------------------
 // Local type definitions — mirror canonical schema.ts exports
@@ -48,9 +53,14 @@ export interface GeometryLineString {
   coordinates: [number, number][];
 }
 
+export interface GeometryMultiLineString {
+  type: 'MultiLineString';
+  coordinates: [number, number][][];
+}
+
 export interface GeometryPolygon {
   type: 'Polygon';
-  coordinates: [number, number][][]; // exterior ring, then holes
+  coordinates: [number, number][][];
 }
 
 export interface GeometryMultiPolygon {
@@ -61,6 +71,7 @@ export interface GeometryMultiPolygon {
 export type Geometry =
   | GeometryPoint
   | GeometryLineString
+  | GeometryMultiLineString
   | GeometryPolygon
   | GeometryMultiPolygon;
 
@@ -125,6 +136,9 @@ export interface WaterFeature extends BaseFeature {
   waterType: 'river' | 'stream' | 'lake' | 'pond' | 'reservoir' | 'ditch' | 'drain';
   name?: string;
   intermittent?: boolean;
+  widthMetadata?: WidthMetadata;
+  operator?: string;
+  wheelchair?: string;
 }
 
 export interface LanduseFeature extends BaseFeature {
@@ -156,6 +170,12 @@ export interface BusinessFeature extends BaseFeature {
   phone?: string;
   website?: string;
   openingHours?: string;
+  nafCode?: string;
+  nafLabel?: string;
+  operator?: string;
+  wheelchair?: string;
+  administrativeStatus?: string;
+  creationDate?: string;
 }
 
 export interface AddressFeature extends BaseFeature {
@@ -323,7 +343,7 @@ const CATEGORY_DEFAULT_HEIGHTS: Record<BuildingFeature['buildingCategory'], numb
 };
 
 export interface BuildingNormalizationResult {
-  feature: BuildingFeature;
+  feature: BuildingFeature | null;
   warnings: string[];
 }
 
@@ -338,6 +358,12 @@ export function normalizeBuilding(
   const id = raw.id ?? '';
   const geometry = raw.geometry ?? { type: 'Point' as const, coordinates: raw.center ?? [0, 0] };
   const clipped = boundaryPolygon ? clipToBoundary(geometry, boundaryPolygon) : geometry;
+  if (!clipped) {
+    return {
+      feature: null,
+      warnings: [`Building ${id} lies outside the supplied boundary`],
+    };
+  }
 
   // Determine building category
   const osmBuilding = tags['building'] ?? '';
@@ -402,8 +428,8 @@ export function normalizeBuilding(
 
   const localCoords = projection
     ? {
-        x: projection.forward(centroid[0], centroid[1]).x,
-        z: projection.forward(centroid[0], centroid[1]).z,
+        x: projection.forward(centroid[0], centroid[1])[0],
+        z: projection.forward(centroid[0], centroid[1])[1],
       }
     : { x: centroid[0], z: centroid[1] };
 
@@ -486,7 +512,7 @@ const HIGHWAY_TO_ROAD_CLASS: Record<string, RoadFeature['roadClass']> = {
 };
 
 export interface RoadNormalizationResult {
-  feature: RoadFeature;
+  feature: RoadFeature | null;
   warnings: string[];
 }
 
@@ -501,6 +527,12 @@ export function normalizeRoad(
   const id = raw.id ?? '';
   const geometry = raw.geometry ?? { type: 'LineString' as const, coordinates: raw.nodes ?? [] };
   const clipped = boundaryPolygon ? clipToBoundary(geometry, boundaryPolygon) : geometry;
+  if (!clipped) {
+    return {
+      feature: null,
+      warnings: [`Road ${id} lies outside the supplied boundary`],
+    };
+  }
 
   const highway = tags['highway'] ?? 'unclassified';
   const roadClass = HIGHWAY_TO_ROAD_CLASS[highway] ?? 'unclassified';
@@ -543,8 +575,8 @@ export function normalizeRoad(
 
   const localCoords = projection
     ? {
-        x: projection.forward(centroid[0], centroid[1]).x,
-        z: projection.forward(centroid[0], centroid[1]).z,
+        x: projection.forward(centroid[0], centroid[1])[0],
+        z: projection.forward(centroid[0], centroid[1])[1],
       }
     : { x: centroid[0], z: centroid[1] };
 
@@ -600,22 +632,38 @@ const WATER_TYPE_MAP: Record<string, WaterFeature['waterType']> = {
   riverbank: 'river',
   wetland: 'reservoir',
 };
+const WATERWAY_WIDTH_DEFAULTS: Record<string, number> = {
+  river: 10,
+  stream: 2,
+  brook: 2,
+  canal: 6,
+  ditch: 1.5,
+  drain: 1.5,
+  default: 3,
+};
 
 export function normalizeWater(
   raw: OsmRawWater,
   sourceRef: SourceReference,
   boundaryPolygon?: Geometry,
   projection?: LocalProjection,
-): WaterFeature {
+): WaterFeature | null {
   const tags = raw.tags ?? {};
   const id = raw.id ?? '';
   const geometry = raw.geometry ?? { type: 'Point' as const, coordinates: raw.center ?? [0, 0] };
   const clipped = boundaryPolygon ? clipToBoundary(geometry, boundaryPolygon) : geometry;
+  if (!clipped) return null;
 
   const waterway = tags['waterway'] ?? '';
   const naturalWater = tags['natural'] === 'water' ? tags['water'] ?? '' : '';
   const rawWaterType = waterway || naturalWater;
   const waterType = WATER_TYPE_MAP[rawWaterType] ?? (waterway ? 'stream' : 'lake');
+  const parsedWidth = Number.parseFloat(tags['width'] ?? tags['water:width'] ?? '');
+  const width = Number.isFinite(parsedWidth) && parsedWidth > 0
+    ? parsedWidth
+    : WATERWAY_WIDTH_DEFAULTS[rawWaterType] ?? WATERWAY_WIDTH_DEFAULTS.default;
+  const widthSource: WidthMetadata['widthSource'] =
+    Number.isFinite(parsedWidth) && parsedWidth > 0 ? 'explicit' : 'category_default';
 
   const centroid = computeCentroid(clipped);
 
@@ -631,8 +679,8 @@ export function normalizeWater(
 
   const localCoords = projection
     ? {
-        x: projection.forward(centroid[0], centroid[1]).x,
-        z: projection.forward(centroid[0], centroid[1]).z,
+        x: projection.forward(centroid[0], centroid[1])[0],
+        z: projection.forward(centroid[0], centroid[1])[1],
       }
     : { x: centroid[0], z: centroid[1] };
 
@@ -648,6 +696,7 @@ export function normalizeWater(
     provenance: [],
     confidence: 1.0,
     status: 'active',
+    widthMetadata: { width, widthSource },
     tags,
     waterType,
     name: tags['name'] ?? undefined,
@@ -671,11 +720,12 @@ export function normalizeLanduse(
   sourceRef: SourceReference,
   boundaryPolygon?: Geometry,
   projection?: LocalProjection,
-): LanduseFeature {
+): LanduseFeature | null {
   const tags = raw.tags ?? {};
   const id = raw.id ?? '';
   const geometry = raw.geometry ?? { type: 'Point' as const, coordinates: raw.center ?? [0, 0] };
   const clipped = boundaryPolygon ? clipToBoundary(geometry, boundaryPolygon) : geometry;
+  if (!clipped) return null;
 
   const landuseType = tags['landuse']
     ?? tags['natural']
@@ -696,8 +746,8 @@ export function normalizeLanduse(
 
   const localCoords = projection
     ? {
-        x: projection.forward(centroid[0], centroid[1]).x,
-        z: projection.forward(centroid[0], centroid[1]).z,
+        x: projection.forward(centroid[0], centroid[1])[0],
+        z: projection.forward(centroid[0], centroid[1])[1],
       }
     : { x: centroid[0], z: centroid[1] };
 
@@ -746,6 +796,7 @@ export function normalizePoi(
   const id = raw.id ?? '';
   const geometry = raw.geometry ?? { type: 'Point' as const, coordinates: raw.center ?? [0, 0] };
   const clipped = boundaryPolygon ? clipToBoundary(geometry, boundaryPolygon) : geometry;
+  if (!clipped) return null;
 
   // Determine POI category from the first matching tag
   let poiCategory = '';
@@ -780,8 +831,8 @@ export function normalizePoi(
 
   const localCoords = projection
     ? {
-        x: projection.forward(centroid[0], centroid[1]).x,
-        z: projection.forward(centroid[0], centroid[1]).z,
+        x: projection.forward(centroid[0], centroid[1])[0],
+        z: projection.forward(centroid[0], centroid[1])[1],
       }
     : { x: centroid[0], z: centroid[1] };
 
@@ -838,6 +889,7 @@ interface SireneRecord {
   trancheEffectif?: string;
   dateCreation?: string;
   dateDebutActivite?: string;
+  etatAdministratif?: string;
 }
 
 interface OsmRawBusiness {
@@ -870,9 +922,10 @@ export function normalizeBusiness(
 
   if (isSirene) {
     const sirene = record as SireneRecord;
-    businessName = sirene.denomination
+    businessName = sirene.enseigne1
+      ?? sirene.enseigne2
+      ?? sirene.denomination
       ?? sirene.denominationUniteLegale
-      ?? sirene.enseigne1
       ?? `SIRET ${sirene.siret}`;
     legalName = sirene.denominationUniteLegale ?? sirene.denomination;
     siret = sirene.siret;
@@ -897,13 +950,15 @@ export function normalizeBusiness(
       .join(' ');
     address = [street, tags['addr:postcode'], tags['addr:city']]
       .filter(Boolean)
-      .join(', ') || tags['addr:full'] ?? '';
+      .join(', ') || tags['addr:full'] || '';
     const geoCenter = ('center' in record) ? record.center : undefined;
     centroid = geoCenter ?? computeCentroid(record.geometry ?? { type: 'Point' as const, coordinates: [0, 0] });
     geometry = record.geometry ?? { type: 'Point' as const, coordinates: centroid };
   }
 
   const clipped = boundaryPolygon ? clipToBoundary(geometry, boundaryPolygon) : geometry;
+  if (!clipped) return null;
+  centroid = computeCentroid(clipped);
 
   if (!businessName.trim()) {
     return null;
@@ -923,17 +978,17 @@ export function normalizeBusiness(
 
   const localCoords = projection
     ? {
-        x: projection.forward(centroid[0], centroid[1]).x,
-        z: projection.forward(centroid[0], centroid[1]).z,
+        x: projection.forward(centroid[0], centroid[1])[0],
+        z: projection.forward(centroid[0], centroid[1])[1],
       }
     : { x: centroid[0], z: centroid[1] };
 
   const phone = isSirene
     ? undefined
-    : (tags['phone'] ?? undefined);
+    : (tags['phone'] ?? tags['contact:phone'] ?? undefined);
   const website = isSirene
     ? undefined
-    : (tags['website'] ?? undefined);
+    : (tags['website'] ?? tags['contact:website'] ?? undefined);
   const openingHours = isSirene
     ? undefined
     : (tags['opening_hours'] ?? undefined);
@@ -947,7 +1002,14 @@ export function normalizeBusiness(
     localCentroid: localCoords,
     wgs84Centroid: centroid,
     sourceRefs: [sourceRef],
-    provenance: [],
+    provenance: [{
+      featureId: stableId,
+      property: 'identity',
+      winner: sourceRef.source,
+      contenders: [sourceRef.source],
+      priority: 1,
+      timestamp: sourceRef.timestamp,
+    }],
     confidence: isSirene ? 0.95 : 0.8,
     status: 'active',
     tags: isSirene ? {} : tags,
@@ -960,6 +1022,12 @@ export function normalizeBusiness(
     phone,
     website,
     openingHours,
+    nafCode: isSirene ? (record as SireneRecord).activitePrincipale : undefined,
+    nafLabel: isSirene ? (record as SireneRecord).libelleActivitePrincipale : undefined,
+    operator: isSirene ? undefined : (tags['operator'] ?? undefined),
+    wheelchair: isSirene ? undefined : (tags['wheelchair'] ?? undefined),
+    administrativeStatus: isSirene ? (record as SireneRecord).etatAdministratif : undefined,
+    creationDate: isSirene ? (record as SireneRecord).dateCreation : undefined,
   };
 }
 
@@ -997,6 +1065,7 @@ export function normalizeAddress(
   if (!isFinite(centroid[0]) || !isFinite(centroid[1])) {
     return null;
   }
+  if (!clipped) return null;
 
   const streetNumber = record.numero ?? '';
   const street = record.voie ?? record.nomVoie ?? '';
@@ -1010,8 +1079,8 @@ export function normalizeAddress(
 
   const localCoords = projection
     ? {
-        x: projection.forward(centroid[0], centroid[1]).x,
-        z: projection.forward(centroid[0], centroid[1]).z,
+        x: projection.forward(centroid[0], centroid[1])[0],
+        z: projection.forward(centroid[0], centroid[1])[1],
       }
     : { x: centroid[0], z: centroid[1] };
 
@@ -1058,6 +1127,16 @@ function computeCentroid(geometry: Geometry): [number, number] {
         [0, 0] as [number, number],
       );
       return [sum[0] / pts.length, sum[1] / pts.length];
+    }
+    case 'MultiLineString': {
+      const points = geometry.coordinates.flat();
+      const sum = points.reduce(
+        (acc, point) => [acc[0] + point[0], acc[1] + point[1]],
+        [0, 0] as [number, number],
+      );
+      return points.length > 0
+        ? [sum[0] / points.length, sum[1] / points.length]
+        : [0, 0];
     }
     case 'Polygon': {
       // Use the exterior ring
@@ -1114,111 +1193,78 @@ function geometryHash(geometry: Geometry): string {
 export function clipToBoundary(
   geometry: Geometry,
   boundaryPolygon: Geometry,
-): Geometry {
+): Geometry | null {
   if (boundaryPolygon.type !== 'Polygon' && boundaryPolygon.type !== 'MultiPolygon') {
-    return geometry; // Can only clip against polygon boundaries
+    return geometry;
   }
 
-  const boundaryCoords = boundaryPolygon.type === 'Polygon'
-    ? boundaryPolygon.coordinates[0]
-    : boundaryPolygon.coordinates[0][0];
+  const boundaries: PolygonGeometry[] = boundaryPolygon.type === 'Polygon'
+    ? [{ type: 'Polygon', coordinates: boundaryPolygon.coordinates }]
+    : boundaryPolygon.coordinates.map((coordinates) => ({ type: 'Polygon', coordinates }));
 
-  // Compute boundary bbox for quick rejection — inline the ring-to-bbox logic
-  let west = Infinity, south = Infinity, east = -Infinity, north = -Infinity;
-  for (const [lng, lat] of boundaryCoords) {
-    if (lng < west) west = lng;
-    if (lng > east) east = lng;
-    if (lat < south) south = lat;
-    if (lat > north) north = lat;
-  }
-
-  // Compute geometry bbox
-  let gw = Infinity, gs = Infinity, ge = -Infinity, gn = -Infinity;
-  const ring = geometry.type === 'Point' ? [geometry.coordinates]
-    : geometry.type === 'LineString' ? geometry.coordinates
-    : geometry.type === 'Polygon' ? geometry.coordinates[0]
-    : geometry.type === 'MultiPolygon' ? (geometry.coordinates[0]?.[0] ?? [])
-    : [];
-  for (const [lng, lat] of ring) {
-    if (lng < gw) gw = lng;
-    if (lng > ge) ge = lng;
-    if (lat < gs) gs = lat;
-    if (lat > gn) gn = lat;
-  }
-
-  // Quick rejection: geometry entirely outside boundary bbox
-  if (ge < west || gw > east || gn < south || gs > north) {
-    return geometry; // Can't clip meaningfully, return as-is
-  }
-
-  switch (geometry.type) {
-    case 'Point': {
-      const [lng, lat] = geometry.coordinates;
-      // Ray-casting point-in-polygon test
-      let inside = false;
-      const n = boundaryCoords.length;
-      for (let i = 0, j = n - 1; i < n; j = i++) {
-        const [xi, yi] = boundaryCoords[i];
-        const [xj, yj] = boundaryCoords[j];
-        if (((yi > lat) !== (yj > lat)) && (lng < ((xj - xi) * (lat - yi)) / (yj - yi) + xi)) {
-          inside = !inside;
-        }
+  const pointInRing = (point: [number, number], ring: [number, number][]): boolean => {
+    let inside = false;
+    for (let index = 0, previous = ring.length - 1; index < ring.length; previous = index++) {
+      const currentPoint = ring[index];
+      const previousPoint = ring[previous];
+      const cross =
+        (point[1] - currentPoint[1]) * (previousPoint[0] - currentPoint[0])
+        - (point[0] - currentPoint[0]) * (previousPoint[1] - currentPoint[1]);
+      if (
+        Math.abs(cross) <= 1e-12
+        && point[0] >= Math.min(currentPoint[0], previousPoint[0])
+        && point[0] <= Math.max(currentPoint[0], previousPoint[0])
+        && point[1] >= Math.min(currentPoint[1], previousPoint[1])
+        && point[1] <= Math.max(currentPoint[1], previousPoint[1])
+      ) {
+        return true;
       }
-      return inside ? geometry : geometry;
+      if (
+        (currentPoint[1] > point[1]) !== (previousPoint[1] > point[1])
+        && point[0] < ((previousPoint[0] - currentPoint[0]) * (point[1] - currentPoint[1])) / (previousPoint[1] - currentPoint[1]) + currentPoint[0]
+      ) {
+        inside = !inside;
+      }
     }
+    return inside;
+  };
 
-    case 'LineString': {
-      const anyInside = geometry.coordinates.some(
-        (p) => {
-          let inside = false;
-          const n = boundaryCoords.length;
-          for (let i = 0, j = n - 1; i < n; j = i++) {
-            const [xi, yi] = boundaryCoords[i];
-            const [xj, yj] = boundaryCoords[j];
-            if (((yi > p[1]) !== (yj > p[1])) && (p[0] < ((xj - xi) * (p[1] - yi)) / (yj - yi) + xi)) {
-              inside = !inside;
-            }
-          }
-          return inside;
-        },
+  const pointInsideBoundary = (point: [number, number]): boolean =>
+    boundaries.some((boundary) =>
+      pointInRing(point, boundary.coordinates[0])
+      && boundary.coordinates.slice(1).every((hole) => !pointInRing(point, hole)));
+
+  if (geometry.type === 'Point') {
+    return pointInsideBoundary(geometry.coordinates) ? geometry : null;
+  }
+
+  if (geometry.type === 'LineString' || geometry.type === 'MultiLineString') {
+    const lines = geometry.type === 'LineString' ? [geometry.coordinates] : geometry.coordinates;
+    const clippedLines = boundaries.flatMap((boundary) =>
+      lines.flatMap((line) => clipLineStringToPolygon(line, boundary)));
+    if (clippedLines.length === 0) return null;
+    if (clippedLines.length === 1) return { type: 'LineString', coordinates: clippedLines[0] };
+    return { type: 'MultiLineString', coordinates: clippedLines };
+  }
+
+  const sourcePolygons = geometry.type === 'Polygon'
+    ? [geometry.coordinates]
+    : geometry.coordinates;
+  const clippedPolygons: [number, number][][][] = [];
+  for (const sourcePolygon of sourcePolygons) {
+    for (const boundary of boundaries) {
+      const clipped = clipPolygonToPolygon(
+        { type: 'Polygon', coordinates: sourcePolygon },
+        boundary,
       );
-      return anyInside ? geometry : geometry;
+      if (!clipped) continue;
+      if (clipped.type === 'Polygon') clippedPolygons.push(clipped.coordinates);
+      else clippedPolygons.push(...clipped.coordinates);
     }
-
-    case 'Polygon': {
-      // Sutherland-Hodgman polygon clipping against the boundary
-      const clipped = clipPolygon(geometry.coordinates, boundaryCoords);
-      if (clipped.length < 3) {
-        return geometry;
-      }
-      return {
-        type: 'Polygon',
-        coordinates: clipped.length > 0
-          ? [clipped]
-          : geometry.coordinates,
-      };
-    }
-
-    case 'MultiPolygon': {
-      const clippedParts: [number, number][][] = [];
-      for (const polygon of geometry.coordinates) {
-        const clipped = clipPolygon(polygon, boundaryCoords);
-        if (clipped.length >= 3) {
-          clippedParts.push(clipped);
-        }
-      }
-      if (clippedParts.length === 0) {
-        return geometry;
-      }
-      return {
-        type: 'MultiPolygon',
-        coordinates: clippedParts.map((ring) => [ring]),
-      };
-    }
-
-    default:
-      return geometry;
   }
+  if (clippedPolygons.length === 0) return null;
+  if (clippedPolygons.length === 1) return { type: 'Polygon', coordinates: clippedPolygons[0] };
+  return { type: 'MultiPolygon', coordinates: clippedPolygons };
 }
 
 /**
@@ -1235,7 +1281,7 @@ function transformGeometry(geometry: Geometry, projection: LocalProjection): Geo
   switch (geometry.type) {
     case 'Point': {
       const pt = projection.forward(geometry.coordinates[0], geometry.coordinates[1]);
-      return { type: 'Point', coordinates: [pt.x, pt.z] };
+      return { type: 'Point', coordinates: [pt[0], pt[1]] };
     }
     case 'LineString': {
       return {
@@ -1243,8 +1289,21 @@ function transformGeometry(geometry: Geometry, projection: LocalProjection): Geo
         coordinates: geometry.coordinates.map(
           (p) => {
             const pt = projection.forward(p[0], p[1]);
-            return [pt.x, pt.z] as [number, number];
+            return [pt[0], pt[1]] as [number, number];
           },
+        ),
+      };
+    }
+    case 'MultiLineString': {
+      return {
+        type: 'MultiLineString',
+        coordinates: geometry.coordinates.map(
+          (line) => line.map(
+            (p) => {
+              const pt = projection.forward(p[0], p[1]);
+              return [pt[0], pt[1]] as [number, number];
+            },
+          ),
         ),
       };
     }
@@ -1255,7 +1314,7 @@ function transformGeometry(geometry: Geometry, projection: LocalProjection): Geo
           (ring) => ring.map(
             (p) => {
               const pt = projection.forward(p[0], p[1]);
-              return [pt.x, pt.z] as [number, number];
+              return [pt[0], pt[1]] as [number, number];
             },
           ),
         ),
@@ -1269,7 +1328,7 @@ function transformGeometry(geometry: Geometry, projection: LocalProjection): Geo
             (ring) => ring.map(
               (p) => {
                 const pt = projection.forward(p[0], p[1]);
-                return [pt.x, pt.z] as [number, number];
+                return [pt[0], pt[1]] as [number, number];
               },
             ),
           ),
@@ -1281,92 +1340,6 @@ function transformGeometry(geometry: Geometry, projection: LocalProjection): Geo
   }
 }
 
-// ---------------------------------------------------------------------------
-// Polygon clipping utilities (Sutherland–Hodgman)
-// ---------------------------------------------------------------------------
-
-/**
- * Sutherland–Hodgman polygon clipping against a convex boundary ring.
- * Clips one polygon (exterior ring with optional holes) against the boundary.
- * Returns the clipped exterior ring coordinates (hole handling deferred).
- */
-function clipPolygon(
-  subjectRings: [number, number][][],
-  clipEdge: [number, number][],
-): [number, number][] {
-  if (subjectRings.length === 0) return [];
-
-  // Clip only the exterior ring (index 0); holes are clipped separately
-  let output = subjectRings[0];
-  const edgeCount = clipEdge.length;
-
-  for (let edgeIdx = 0; edgeIdx < edgeCount; edgeIdx++) {
-    const input = output;
-    if (input.length === 0) break;
-    output = [];
-
-    const current = clipEdge[edgeIdx];
-    const next = clipEdge[(edgeIdx + 1) % edgeCount];
-
-    for (let i = 0; i < input.length; i++) {
-      const p1 = input[i];
-      const p2 = input[(i + 1) % input.length];
-
-      // Check if point is "inside" relative to edge using cross product
-      const inside1 = (
-        (next[0] - current[0]) * (p1[1] - current[1]) -
-        (next[1] - current[1]) * (p1[0] - current[0])
-      ) >= 0;
-      const inside2 = (
-        (next[0] - current[0]) * (p2[1] - current[1]) -
-        (next[1] - current[1]) * (p2[0] - current[0])
-      ) >= 0;
-
-      if (inside1) {
-        if (!inside2) {
-          // Leaving edge — add intersection
-          const intersect = lineIntersection(p1, p2, current, next);
-          if (intersect) output.push(intersect);
-        } else {
-          output.push(p1);
-        }
-      } else if (inside2) {
-        // Entering edge — add intersection then p2
-        const intersect = lineIntersection(p1, p2, current, next);
-        if (intersect) output.push(intersect);
-        output.push(p2);
-      }
-      // else both outside — discard
-    }
-  }
-
-  return output;
-}
-
-/**
- * Line segment intersection using parametric form.
- */
-function lineIntersection(
-  p1: [number, number],
-  p2: [number, number],
-  p3: [number, number],
-  p4: [number, number],
-): [number, number] | null {
-  const x1 = p1[0], y1 = p1[1];
-  const x2 = p2[0], y2 = p2[1];
-  const x3 = p3[0], y3 = p3[1];
-  const x4 = p4[0], y4 = p4[1];
-
-  const denom = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4);
-  if (Math.abs(denom) < 1e-14) return null;
-
-  const t = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / denom;
-
-  return [
-    x1 + t * (x2 - x1),
-    y1 + t * (y2 - y1),
-  ] as [number, number];
-}
 
 // ---------------------------------------------------------------------------
 // Convenience: normalize a raw OSM feature into the correct kind
@@ -1439,9 +1412,15 @@ export function normalizeBuildingBatch(
   for (const raw of rawBuildings) {
     try {
       const result = normalizeBuilding(raw, sourceRef, boundaryPolygon, projection);
-      features.push(result.feature);
-      for (const w of result.warnings) {
-        warnings.push({ featureId: result.feature.id, warning: w });
+      if (result.feature) {
+        features.push(result.feature);
+        for (const warning of result.warnings) {
+          warnings.push({ featureId: result.feature.id, warning });
+        }
+      } else {
+        for (const warning of result.warnings) {
+          warnings.push({ featureId: raw.id ?? 'unknown', warning });
+        }
       }
     } catch (err) {
       errors.push({
@@ -1467,9 +1446,15 @@ export function normalizeRoadBatch(
   for (const raw of rawRoads) {
     try {
       const result = normalizeRoad(raw, sourceRef, boundaryPolygon, projection);
-      features.push(result.feature);
-      for (const w of result.warnings) {
-        warnings.push({ featureId: result.feature.id, warning: w });
+      if (result.feature) {
+        features.push(result.feature);
+        for (const warning of result.warnings) {
+          warnings.push({ featureId: result.feature.id, warning });
+        }
+      } else {
+        for (const warning of result.warnings) {
+          warnings.push({ featureId: raw.id ?? 'unknown', warning });
+        }
       }
     } catch (err) {
       errors.push({

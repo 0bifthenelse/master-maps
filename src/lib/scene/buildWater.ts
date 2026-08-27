@@ -16,10 +16,20 @@ import {
   ShapeGeometry,
   Path,
 } from 'three';
+import { mapShapeGeometryToWorld } from "./geometryCoordinates";
 
 // ─── Local types ────────────────────────────────────────────────────────────
 
 type CoordPair = [number, number]; // [x, z] projected metres
+interface LineStringRep {
+  type: 'LineString';
+  coordinates: CoordPair[];
+}
+
+interface MultiLineStringRep {
+  type: 'MultiLineString';
+  coordinates: CoordPair[][];
+}
 
 interface PolygonRep {
   type: 'Polygon';
@@ -31,13 +41,19 @@ interface MultiPolygonRep {
   coordinates: CoordPair[][][];
 }
 
+type WaterGeometry = LineStringRep | MultiLineStringRep | PolygonRep | MultiPolygonRep;
+
 export interface WaterFeatureShape {
   kind: 'water';
   stableId: string;
-  geometry: PolygonRep | MultiPolygonRep;
+  geometry: WaterGeometry;
   name?: string;
   /** OSM waterway or natural tag. */
-  waterType?: 'river' | 'lake' | 'reservoir' | 'pond' | 'ditch' | 'canal' | 'basin' | string;
+  waterType?: 'river' | 'lake' | 'reservoir' | 'pond' | 'stream' | 'ditch' | 'canal' | 'basin' | string;
+  /** Explicit OSM width in metres. */
+  width?: number;
+  /** True when width uses a documented waterway-class default. */
+  widthInferred?: boolean;
 }
 
 export interface BuildResult {
@@ -45,6 +61,8 @@ export interface BuildResult {
   featureCount: number;
   /** Total water surface area in square metres (sum of all polygons). */
   areaMetres: number;
+  /** Total length of linear waterways in metres. */
+  lineLengthMetres: number;
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -74,8 +92,7 @@ function addHoles(shape: Shape, holes: CoordPair[][]): void {
 }
 
 function buildGeometryForShape(shape: Shape, featureIndex: number): BufferGeometry {
-  const geom = new ShapeGeometry(shape);
-  geom.rotateX(-Math.PI / 2);
+  const geom = mapShapeGeometryToWorld(new ShapeGeometry(shape));
 
   const count = geom.getAttribute('position')?.count ?? 0;
   const indices = new Float32BufferAttribute(
@@ -90,18 +107,93 @@ function buildGeometryForShape(shape: Shape, featureIndex: number): BufferGeomet
 // ─── Area calculation (shoelace) ───────────────────────────────────────────
 
 function polygonArea(rings: CoordPair[][]): number {
-  let total = 0;
-  for (const ring of rings) {
-    if (ring.length < 3) continue;
-    let area = 0;
-    for (let i = 0; i < ring.length; i++) {
-      const j = (i + 1) % ring.length;
-      area += ring[i][0] * ring[j][1];
-      area -= ring[j][0] * ring[i][1];
-    }
-    total += Math.abs(area) / 2;
+  if (rings.length === 0 || rings[0].length < 3) return 0;
+  let outerArea = 0;
+  for (let i = 0; i < rings[0].length; i += 1) {
+    const j = (i + 1) % rings[0].length;
+    outerArea += rings[0][i][0] * rings[0][j][1];
+    outerArea -= rings[0][j][0] * rings[0][i][1];
   }
-  return total;
+  let holeArea = 0;
+  for (const ring of rings.slice(1)) {
+    if (ring.length < 3) continue;
+    let ringArea = 0;
+    for (let i = 0; i < ring.length; i += 1) {
+      const j = (i + 1) % ring.length;
+      ringArea += ring[i][0] * ring[j][1];
+      ringArea -= ring[j][0] * ring[i][1];
+    }
+    holeArea += Math.abs(ringArea) / 2;
+  }
+  return Math.max(0, Math.abs(outerArea) / 2 - holeArea);
+}
+const WATERWAY_WIDTH_DEFAULTS: Record<string, number> = {
+  river: 10,
+  stream: 2,
+  brook: 2,
+  canal: 6,
+  ditch: 1.5,
+  drain: 1.5,
+  tidal_channel: 6,
+  default: 3,
+};
+
+function waterwayWidth(feature: WaterFeatureShape): number {
+  if (feature.width !== undefined && feature.width > 0) return feature.width;
+  return WATERWAY_WIDTH_DEFAULTS[feature.waterType ?? "default"]
+    ?? WATERWAY_WIDTH_DEFAULTS.default;
+}
+
+function lineLength(coordinates: CoordPair[]): number {
+  let length = 0;
+  for (let i = 0; i < coordinates.length - 1; i += 1) {
+    const dx = coordinates[i + 1][0] - coordinates[i][0];
+    const dz = coordinates[i + 1][1] - coordinates[i][1];
+    length += Math.sqrt(dx * dx + dz * dz);
+  }
+  return length;
+}
+
+function waterRibbon(
+  coordinates: CoordPair[],
+  halfWidth: number,
+  featureIndex: number,
+): BufferGeometry {
+  if (coordinates.length < 2) return new BufferGeometry();
+  const positions: number[] = [];
+  const indices: number[] = [];
+  const featureIndices: number[] = [];
+
+  for (let i = 0; i < coordinates.length - 1; i += 1) {
+    const [x0, z0] = coordinates[i];
+    const [x1, z1] = coordinates[i + 1];
+    const dx = x1 - x0;
+    const dz = z1 - z0;
+    const length = Math.sqrt(dx * dx + dz * dz);
+    if (length < 1e-8) continue;
+
+    const normalX = -dz / length * halfWidth;
+    const normalZ = dx / length * halfWidth;
+    const vertices: CoordPair[] = [
+      [x0 - normalX, z0 - normalZ],
+      [x0 + normalX, z0 + normalZ],
+      [x1 - normalX, z1 - normalZ],
+      [x1 + normalX, z1 + normalZ],
+    ];
+    const base = featureIndices.length;
+    for (const [x, z] of vertices) {
+      positions.push(x, 0, z);
+      featureIndices.push(featureIndex);
+    }
+    indices.push(base, base + 1, base + 2, base + 1, base + 3, base + 2);
+  }
+
+  if (positions.length === 0) return new BufferGeometry();
+  const geometry = new BufferGeometry();
+  geometry.setAttribute('position', new Float32BufferAttribute(positions, 3));
+  geometry.setIndex(indices);
+  geometry.setAttribute('featureIndex', new Float32BufferAttribute(featureIndices, 1));
+  return geometry;
 }
 
 // ─── Merge (inline, avoids BufferGeometryUtils dependency) ─────────────────
@@ -151,46 +243,72 @@ function mergeGeometries(geometries: BufferGeometry[]): BufferGeometry {
 // ─── Main builder ───────────────────────────────────────────────────────────
 
 /**
- * Build flat water-body geometry from WaterFeature records.
- *
- * @param features - Array of water features (rivers, lakes, ponds, etc.).
- * @returns Merged polygon geometry, water-body count, and total area in m².
+ * Build flat water geometry from polygonal bodies and linear waterways.
+ * Linear waterways use explicit source width or a documented class default.
  */
 export function buildWater(features: WaterFeatureShape[]): BuildResult {
   if (features.length === 0) {
-    return { geometry: new BufferGeometry(), featureCount: 0, areaMetres: 0 };
+    return {
+      geometry: new BufferGeometry(),
+      featureCount: 0,
+      areaMetres: 0,
+      lineLengthMetres: 0,
+    };
   }
 
   const geoms: BufferGeometry[] = [];
   let totalArea = 0;
+  let lineLengthMetres = 0;
+
+  const appendLine = (
+    coordinates: CoordPair[],
+    width: number,
+    featureIndex: number,
+  ): void => {
+    lineLengthMetres += lineLength(coordinates);
+    const ribbon = waterRibbon(coordinates, width / 2, featureIndex);
+    if ((ribbon.getAttribute('position')?.count ?? 0) > 0) geoms.push(ribbon);
+  };
 
   for (let fi = 0; fi < features.length; fi++) {
     const feat = features[fi];
     const geo = feat.geometry;
 
     if (geo.type === 'Polygon') {
-      totalArea += polygonArea([geo.coordinates[0]]);
+      totalArea += polygonArea(geo.coordinates);
       const [outer, ...holes] = geo.coordinates;
       if (outer.length < 3) continue;
       const shape = ringToShape(outer);
       addHoles(shape, holes);
       geoms.push(buildGeometryForShape(shape, fi));
     } else if (geo.type === 'MultiPolygon') {
-      for (const polyCoords of geo.coordinates) {
-        totalArea += polygonArea([polyCoords[0]]);
-        const [outer, ...holes] = polyCoords;
+      for (const polygon of geo.coordinates) {
+        totalArea += polygonArea(polygon);
+        const [outer, ...holes] = polygon;
         if (outer.length < 3) continue;
         const shape = ringToShape(outer);
         addHoles(shape, holes);
         geoms.push(buildGeometryForShape(shape, fi));
       }
+    } else if (geo.type === 'LineString') {
+      appendLine(geo.coordinates, waterwayWidth(feat), fi);
+    } else {
+      for (const coordinates of geo.coordinates) {
+        appendLine(coordinates, waterwayWidth(feat), fi);
+      }
     }
   }
 
+  const geometry = mergeGeometries(geoms);
+  if (geoms.length > 1) {
+    for (const intermediate of geoms) intermediate.dispose();
+  }
+
   return {
-    geometry: mergeGeometries(geoms),
+    geometry,
     featureCount: features.length,
     areaMetres: totalArea,
+    lineLengthMetres,
   };
 }
 

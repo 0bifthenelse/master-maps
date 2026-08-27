@@ -6,6 +6,7 @@ export const dynamic = "force-static";
 
 // Projection origin from scripts/data/normalize.ts
 const PROJECTION_ORIGIN: [number, number] = [0.566553, 43.66256];
+const TILE_ID_RE = /^[a-zA-Z0-9_-]+$/;
 
 // --- Inline subset of DatasetManifestSchema fields the client needs ---
 
@@ -26,6 +27,7 @@ interface AssembledManifest {
   featureCounts: Record<string, number>;
   byteSizes: Record<string, number>;
   layerAvailability: Record<string, boolean>;
+  tileFeatureCounts: Record<string, number>;
   projectionOrigin: [number, number];
   /** Local projected bounds computed from tile entries */
   bounds: [number, number, number, number];
@@ -54,49 +56,48 @@ export async function GET(_request: NextRequest) {
   const tileManifestPath = join(dataRoot, "generated", "tile-manifest.json");
 
   try {
-    // Read core manifest for version metadata
     const core = await readJson<{
-      version: string;
+      version?: string;
+      datasetVersion?: string;
       acquisitionTime: string;
-      pipeline: string[];
+      pipeline?: string[];
+      featureCounts?: Record<string, number>;
+      layerAvailability?: Record<string, boolean>;
+      projectionOrigin?: [number, number];
     }>(manifestPath);
 
     // Read tile-manifest for per-tile metadata
     const tileEntries = await readJson<TileEntry[]>(tileManifestPath);
 
-    // Build feature counts and layer availability
-    const featureCounts: Record<string, number> = {};
+    const featureCounts: Record<string, number> = { ...(core.featureCounts ?? {}) };
     const byteSizes: Record<string, number> = {};
-    const layerAvailability: Record<string, boolean> = {};
+    const tileFeatureCounts: Record<string, number> = {};
+    const layerAvailability: Record<string, boolean> = { ...(core.layerAvailability ?? {}) };
     const tileIds: string[] = [];
 
-    // Track overall projected bounds
     let minX = Infinity;
     let minZ = Infinity;
     let maxX = -Infinity;
     let maxZ = -Infinity;
 
     for (const entry of tileEntries) {
+      if (!TILE_ID_RE.test(entry.tileId)) {
+        throw new Error(`Invalid tile ID in manifest: ${entry.tileId}`);
+      }
       tileIds.push(entry.tileId);
-      featureCounts[entry.tileId] = entry.featureCount;
+      tileFeatureCounts[entry.tileId] = entry.featureCount;
       byteSizes[entry.tileId] = entry.byteSize;
 
-      // Derive layer availability from feature stableId prefixes
-      for (const id of entry.features) {
-        const kind = id.includes(":") ? id.split(":")[0]! : "unknown";
-        layerAvailability[kind] = true;
-      }
-
-      // Accumulate bounds
       const [tx0, tz0, tx1, tz1] = entry.bounds;
-      if (tx0 < minX) minX = tx0;
-      if (tz0 < minZ) minZ = tz0;
-      if (tx1 > maxX) maxX = tx1;
-      if (tz1 > maxZ) maxZ = tz1;
+      minX = Math.min(minX, tx0);
+      minZ = Math.min(minZ, tz0);
+      maxX = Math.max(maxX, tx1);
+      maxZ = Math.max(maxZ, tz1);
     }
 
+    const datasetVersion = core.version ?? core.datasetVersion ?? "0.1.0";
     const assembled: AssembledManifest = {
-      datasetVersion: core.version ?? "0.1.0",
+      datasetVersion,
       acquisitionTime: core.acquisitionTime,
       pipeline: core.pipeline ?? [],
       tileIds,
@@ -104,7 +105,8 @@ export async function GET(_request: NextRequest) {
       featureCounts,
       byteSizes,
       layerAvailability,
-      projectionOrigin: PROJECTION_ORIGIN,
+      tileFeatureCounts,
+      projectionOrigin: core.projectionOrigin ?? PROJECTION_ORIGIN,
       bounds: Number.isFinite(minX)
         ? [minX, minZ, maxX, maxZ]
         : [0, 0, 0, 0],

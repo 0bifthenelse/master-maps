@@ -37,6 +37,7 @@ import { deduplicateAll } from "./deduplicate";
 import { buildTilesAll } from "./build-tiles";
 import { buildIndexAll } from "./build-search-index";
 import { validate } from "./validate";
+import { deduplicateOsmElements, isOsmElement } from "./osmRelations";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -171,39 +172,39 @@ async function phaseMergeOsm(): Promise<void> {
   }
 
   themeFiles.sort();
-  const elements: Record<string, unknown>[] = [];
+  const mergedElements: Record<string, unknown>[] = [];
   let recordedAt = "";
-  let queries = 0;
   for (const name of themeFiles) {
     const content = JSON.parse(await fs.readFile(path.join(RAW_DIR, name), "utf8")) as {
       elements?: Record<string, unknown>[];
       timestamp?: string;
-      query?: string;
+      osm3s?: { timestamp_osm_base?: string };
     };
-    if (Array.isArray(content.elements)) elements.push(...content.elements);
-    if (content.timestamp) recordedAt = content.timestamp;
-    if (content.query) queries++;
+    if (Array.isArray(content.elements)) mergedElements.push(...content.elements);
+    recordedAt = content.timestamp ?? content.osm3s?.timestamp_osm_base ?? recordedAt;
   }
 
+  const elements = deduplicateOsmElements(mergedElements.filter(isOsmElement));
   await fs.writeFile(
     osmPath,
-    JSON.stringify({ elements, timestamp: recordedAt, themeFiles, queryCount: queries }, null, 2),
+    JSON.stringify({
+      elements,
+      timestamp: recordedAt,
+      themeFiles,
+      queryCount: themeFiles.length,
+      rawElementCount: mergedElements.length,
+    }, null, 2),
     "utf8",
   );
-  console.error(`[refresh] merge-osm: combined ${themeFiles.length} themes → ${elements.length} elements`);
+  console.error(
+    `[refresh] merge-osm: combined ${themeFiles.length} themes → `
+    + `${mergedElements.length} raw elements, ${elements.length} unique elements`,
+  );
 }
-
 async function phaseFetchOsm(offline: boolean): Promise<void> {
   if (offline) {
-    try {
-      await fs.access(path.join(RAW_DIR, "osm.json"));
-      console.error("[refresh] Offline: OSM data present");
-      return;
-    } catch {
-      console.error("[refresh] Offline: no single osm.json — attempting per-theme merge");
-      await phaseMergeOsm();
-      return;
-    }
+    await phaseMergeOsm();
+    return;
   }
   await withRetry(() => runScript("fetch-osm.ts"), "fetch-osm", 3, 2000);
   await phaseMergeOsm();
@@ -242,8 +243,9 @@ async function phaseFetchBusinesses(offline: boolean): Promise<void> {
   try {
     await fs.access(path.join(scriptsDir(), "fetch-businesses.ts"));
     await withRetry(() => runScript("fetch-businesses.ts"), "fetch-businesses", 3, 2000);
-  } catch {
-    console.error("[refresh] fetch-businesses: not yet implemented by sibling");
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`[refresh] fetch-businesses acquisition failed: ${message}`);
   }
 }
 
@@ -274,8 +276,9 @@ async function phaseFetchIgn(offline: boolean, forceIgn: boolean): Promise<void>
   try {
     await fs.access(path.join(scriptsDir(), "fetch-ign.ts"));
     await withRetry(() => runScript("fetch-ign.ts"), "fetch-ign", 3, 2000);
-  } catch {
-    console.error("[refresh] fetch-ign: not yet implemented by sibling");
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`[refresh] fetch-ign acquisition failed: ${message}`);
   }
 }
 
@@ -308,63 +311,301 @@ async function phaseValidate(): Promise<void> {
 // Manifest writing
 // ---------------------------------------------------------------------------
 
-async function writeSourceManifest(): Promise<void> {
-  await fs.writeFile(
-    path.join(MANIFESTS_DIR, "sources.json"),
-    JSON.stringify({
-      datasetVersion: "0.1.0",
-      acquisitionTime: new Date().toISOString(),
-      boundaries: { source: "geo.api.gouv.fr", insee: "32013" },
-      osm: { source: "overpass-api.de" },
-      addresses: { source: "Base Adresse Nationale", license: "etalab-2.0" },
-      businesses: { source: "sirene / annuaire-entreprises" },
-      ign: { source: "IGN Géoplateforme", unavailable: true },
-      transformation: {
-        projection: "local-spherical-equirectangular",
-        projectionOrigin: [0.566553, 43.66256],
-        coordinateSystem: "WGS84 → (x east, z north, y=0)",
-      },
-    }, null, 2), "utf8",
+interface FeatureSummary {
+  totalFeatures: number;
+  featureCounts: Record<string, number>;
+  sourceCounts: Record<string, number>;
+  layerAvailability: Record<string, boolean>;
+}
+
+async function readOptionalJson(filePath: string): Promise<unknown | null> {
+  try {
+    return JSON.parse(await fs.readFile(filePath, "utf8")) as unknown;
+  } catch {
+    return null;
+  }
+}
+
+function sourceBbox(value: unknown): [number, number, number, number] | null {
+  if (typeof value !== "object" || value === null) return null;
+  const record = value as Record<string, unknown>;
+  if (record.type === "FeatureCollection" && Array.isArray(record.features)) {
+    const boxes = record.features.map((feature) => sourceBbox(feature));
+    const valid = boxes.filter((box): box is [number, number, number, number] => box !== null);
+    if (valid.length === 0) return null;
+    return valid.reduce(
+      (acc, box) => [
+        Math.min(acc[0], box[0]),
+        Math.min(acc[1], box[1]),
+        Math.max(acc[2], box[2]),
+        Math.max(acc[3], box[3]),
+      ],
+      valid[0],
+    );
+  }
+  if (record.type === "Feature") return sourceBbox(record.geometry);
+  const type = record.type;
+  const coordinates = record.coordinates;
+  if (
+    typeof type !== "string"
+    || !Array.isArray(coordinates)
+  ) {
+    return null;
+  }
+  const points: [number, number][] = [];
+  const collect = (valueToScan: unknown): void => {
+    if (!Array.isArray(valueToScan)) return;
+    if (
+      valueToScan.length >= 2
+      && typeof valueToScan[0] === "number"
+      && typeof valueToScan[1] === "number"
+      && Number.isFinite(valueToScan[0])
+      && Number.isFinite(valueToScan[1])
+    ) {
+      points.push([valueToScan[0], valueToScan[1]]);
+      return;
+    }
+    for (const child of valueToScan) collect(child);
+  };
+  collect(coordinates);
+  if (points.length === 0) return null;
+  return points.reduce(
+    (acc, point) => [
+      Math.min(acc[0], point[0]),
+      Math.min(acc[1], point[1]),
+      Math.max(acc[2], point[0]),
+      Math.max(acc[3], point[1]),
+    ],
+    [points[0][0], points[0][1], points[0][0], points[0][1]] as [number, number, number, number],
   );
-  console.error(`[refresh] Source manifest written`);
+}
+
+async function collectFeatureSummary(): Promise<FeatureSummary> {
+  const featureCounts: Record<string, number> = {};
+  const sourceCounts: Record<string, number> = {};
+  const layerAvailability: Record<string, boolean> = {};
+  const directory = await fs.readdir(INTERMEDIATE_DIR, { withFileTypes: true });
+  let totalFeatures = 0;
+  const ignored = new Set(["provenance.json", "boundary-source.json", "ign-unavailable.json", "osm-manifest.json", "relation-issues.json"]);
+
+  for (const entry of directory) {
+    if (!entry.isFile() || !entry.name.endsWith(".json") || ignored.has(entry.name)) continue;
+    const parsed = await readOptionalJson(path.join(INTERMEDIATE_DIR, entry.name));
+    if (!Array.isArray(parsed)) continue;
+    for (const feature of parsed) {
+      if (typeof feature !== "object" || feature === null) continue;
+      const record = feature as Record<string, unknown>;
+      const kind = typeof record.kind === "string" ? record.kind : "unknown";
+      totalFeatures += 1;
+      featureCounts[kind] = (featureCounts[kind] ?? 0) + 1;
+      layerAvailability[kind] = true;
+      if (Array.isArray(record.sourceRefs)) {
+        for (const sourceRef of record.sourceRefs) {
+          if (typeof sourceRef !== "object" || sourceRef === null) continue;
+          const source = (sourceRef as Record<string, unknown>).source;
+          if (typeof source !== "string" || source.length === 0) continue;
+          sourceCounts[source] = (sourceCounts[source] ?? 0) + 1;
+        }
+      }
+    }
+  }
+
+  return { totalFeatures, featureCounts, sourceCounts, layerAvailability };
+}
+
+async function failedSourceSummary(): Promise<{ failed: string[]; unresolved: string[] }> {
+  const failed: string[] = [];
+  const unresolved: string[] = [];
+  const osmManifest = await readOptionalJson(path.join(INTERMEDIATE_DIR, "osm-manifest.json"));
+  if (typeof osmManifest === "object" && osmManifest !== null) {
+    const themes = (osmManifest as Record<string, unknown>).themes;
+    if (typeof themes === "object" && themes !== null) {
+      for (const [name, value] of Object.entries(themes)) {
+        if (typeof value !== "object" || value === null) continue;
+        const result = value as Record<string, unknown>;
+        if (result.success === false) {
+          failed.push(`osm:${name}: ${String(result.error ?? "acquisition failed")}`);
+        }
+      }
+    }
+  }
+
+  const businessOsm = await readOptionalJson(path.join(RAW_DIR, "businesses-osm.json"));
+  if (typeof businessOsm === "object" && businessOsm !== null) {
+    const result = businessOsm as Record<string, unknown>;
+    if (result.status !== "ok") {
+      failed.push(`businesses-osm: ${String(result.error ?? "acquisition failed")}`);
+    }
+  }
+
+  const ignUnavailable = await readOptionalJson(path.join(INTERMEDIATE_DIR, "ign-unavailable.json"));
+  if (typeof ignUnavailable === "object" && ignUnavailable !== null) {
+    const reason = (ignUnavailable as Record<string, unknown>).reason;
+    if (typeof reason === "string" && reason.length > 0) unresolved.push(`ign: ${reason}`);
+  }
+
+  const relationIssues = await readOptionalJson(path.join(INTERMEDIATE_DIR, "relation-issues.json"));
+  if (Array.isArray(relationIssues)) {
+    for (const issue of relationIssues) {
+      if (typeof issue !== "object" || issue === null) continue;
+      const record = issue as Record<string, unknown>;
+      unresolved.push(`osm:relation/${String(record.relationId)}: ${String(record.reason ?? "malformed relation")}`);
+    }
+  }
+  return { failed, unresolved };
+}
+
+async function writeSourceManifest(): Promise<void> {
+  const existing = await readOptionalJson(path.join(MANIFESTS_DIR, "sources.json"));
+  const sources: Record<string, unknown>[] =
+    typeof existing === "object"
+    && existing !== null
+    && Array.isArray((existing as Record<string, unknown>).sources)
+      ? ((existing as Record<string, unknown>).sources as Record<string, unknown>[]).slice()
+      : [];
+
+  const osmManifest = await readOptionalJson(path.join(INTERMEDIATE_DIR, "osm-manifest.json"));
+  if (typeof osmManifest === "object" && osmManifest !== null) {
+    const themes = (osmManifest as Record<string, unknown>).themes;
+    if (typeof themes === "object" && themes !== null) {
+      for (const [name, value] of Object.entries(themes)) {
+        if (typeof value !== "object" || value === null) continue;
+        const result = value as Record<string, unknown>;
+        sources.push({
+          source: `OpenStreetMap / Overpass (${name})`,
+          url: result.endpointUrl,
+          timestamp: result.timestamp,
+          license: "ODbL-1.0",
+          recordCount: result.recordCount ?? 0,
+          status: result.success === false ? "failed" : "ok",
+          error: result.error ?? undefined,
+        });
+      }
+    }
+  }
+
+  const sirene = await readOptionalJson(path.join(RAW_DIR, "businesses-sirene.json"));
+  if (typeof sirene === "object" && sirene !== null) {
+    const record = sirene as Record<string, unknown>;
+    sources.push({
+      source: "Annuaire des Entreprises / SIRENE",
+      url: record.sourceUrl,
+      timestamp: record.acquiredAt,
+      license: record.license,
+      recordCount: record.totalUniqueRecords ?? 0,
+      status: "ok",
+    });
+  }
+
+  const businessOsm = await readOptionalJson(path.join(RAW_DIR, "businesses-osm.json"));
+  if (typeof businessOsm === "object" && businessOsm !== null) {
+    const record = businessOsm as Record<string, unknown>;
+    sources.push({
+      source: "OpenStreetMap / Overpass (businesses)",
+      url: Array.isArray(record.sourceUrls) ? record.sourceUrls[0] : undefined,
+      timestamp: record.acquiredAt,
+      license: record.license,
+      recordCount: record.elementCount ?? 0,
+      status: record.status === "ok" ? "ok" : "failed",
+      error: record.error ?? undefined,
+    });
+  }
+
+  const businessWeb = await readOptionalJson(path.join(RAW_DIR, "businesses-web.json"));
+  if (typeof businessWeb === "object" && businessWeb !== null) {
+    const results = (businessWeb as Record<string, unknown>).results;
+    sources.push({
+      source: "Verified business websites and directories",
+      timestamp: (businessWeb as Record<string, unknown>).acquiredAt,
+      recordCount: Array.isArray(results) ? results.length : 0,
+      status: "ok",
+    });
+  }
+
+  const { failed } = await failedSourceSummary();
+  const uniqueSources = [...new Map(
+    sources.map((source) => [
+      `${String(source.source ?? "unknown")}|${String(source.url ?? "")}`,
+      source,
+    ]),
+  ).values()];
+  const manifest = {
+    datasetVersion: "0.1.0",
+    acquisitionTime: new Date().toISOString(),
+    sources: uniqueSources,
+    failedSources: failed,
+    transformation: {
+      projection: "local-spherical-equirectangular",
+      projectionOrigin: [0.566553, 43.66256],
+      coordinateSystem: "WGS84 → (x east, z north, y=0)",
+      geometryContract: "local [x,z] maps directly to Three.js [x,0,z]",
+    },
+  };
+  await fs.writeFile(path.join(MANIFESTS_DIR, "sources.json"), JSON.stringify(manifest, null, 2), "utf8");
+  console.error("[refresh] Source manifest written");
 }
 
 async function writeCoverageReport(): Promise<void> {
-  await fs.writeFile(
-    path.join(MANIFESTS_DIR, "coverage.json"),
-    JSON.stringify({
-      datasetVersion: "0.1.0",
-      acquisitionTime: new Date().toISOString(),
-      totalFeatures: 0,
-      categories: {},
-      sources: {},
-      unresolved: [],
-      failedSources: [],
-      budgets: {
-        tileCountLimit: 256,
-        maxTileBytesLimit: 750 * 1024,
-        actualTileCount: 0,
-        actualMaxTileBytes: 0,
-      },
-      note: "Populate after real acquisition runs.",
-    }, null, 2), "utf8",
-  );
-  console.error(`[refresh] Coverage report written`);
+  const summary = await collectFeatureSummary();
+  const tileManifest = await readOptionalJson(path.join(GENERATED_DIR, "tile-manifest.json"));
+  const tiles = Array.isArray(tileManifest) ? tileManifest as Array<Record<string, unknown>> : [];
+  const actualMaxTileBytes = tiles.reduce((max, tile) => {
+    const bytes = typeof tile.byteSize === "number" ? tile.byteSize : 0;
+    return Math.max(max, bytes);
+  }, 0);
+  const { failed, unresolved } = await failedSourceSummary();
+  const report = {
+    datasetVersion: "0.1.0",
+    acquisitionTime: new Date().toISOString(),
+    totalFeatures: summary.totalFeatures,
+    featureCounts: summary.featureCounts,
+    sourceCounts: summary.sourceCounts,
+    categories: summary.featureCounts,
+    sources: summary.sourceCounts,
+    unresolved,
+    failedSources: failed,
+    budgets: {
+      tileCountLimit: 256,
+      maxTileBytesLimit: 750 * 1024,
+      actualTileCount: tiles.length,
+      actualMaxTileBytes,
+      withinBudget: tiles.length <= 256 && actualMaxTileBytes <= 750 * 1024,
+    },
+  };
+  await fs.writeFile(path.join(MANIFESTS_DIR, "coverage.json"), JSON.stringify(report, null, 2), "utf8");
+  console.error("[refresh] Coverage report written");
 }
 
 async function writeGenerationManifest(): Promise<void> {
-  await fs.writeFile(
-    path.join(GENERATED_DIR, "manifest.json"),
-    JSON.stringify({
-      version: "0.1.0",
-      acquisitionTime: new Date().toISOString(),
-      pipeline: [
-        "discover-boundary", "fetch-osm", "fetch-addresses",
-        "fetch-businesses", "fetch-ign", "normalize",
-        "deduplicate", "build-tiles", "build-search-index", "validate",
-      ],
-    }, null, 2), "utf8",
-  );
+  const summary = await collectFeatureSummary();
+  const tileManifest = await readOptionalJson(path.join(GENERATED_DIR, "tile-manifest.json"));
+  const tiles = Array.isArray(tileManifest) ? tileManifest as Array<Record<string, unknown>> : [];
+  const boundary = await readOptionalJson(path.join(RAW_DIR, "auch-boundary.geojson"));
+  const boundaryBbox = sourceBbox(boundary);
+  if (!boundaryBbox) throw new Error("Cannot write generation manifest without a valid boundary bbox");
+  const firstBounds = tiles[0]?.bounds;
+  const tileSize =
+    Array.isArray(firstBounds) && typeof firstBounds[2] === "number" && typeof firstBounds[0] === "number"
+      ? firstBounds[2] - firstBounds[0]
+      : 0;
+  const manifest = {
+    version: "0.1.0",
+    datasetVersion: "0.1.0",
+    acquisitionTime: new Date().toISOString(),
+    boundary: boundaryBbox,
+    projectionOrigin: [0.566553, 43.66256],
+    tileSize,
+    tileCount: tiles.length,
+    tileBounds: tiles.map((tile) => tile.bounds),
+    featureCounts: summary.featureCounts,
+    layerAvailability: summary.layerAvailability,
+    pipeline: [
+      "discover-boundary", "fetch-osm", "fetch-addresses",
+      "fetch-businesses", "fetch-ign", "normalize",
+      "deduplicate", "build-tiles", "build-search-index", "validate",
+    ],
+  };
+  await fs.writeFile(path.join(GENERATED_DIR, "manifest.json"), JSON.stringify(manifest, null, 2), "utf8");
 }
 
 // ---------------------------------------------------------------------------

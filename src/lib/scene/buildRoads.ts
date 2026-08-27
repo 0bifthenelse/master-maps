@@ -27,10 +27,14 @@ interface LineStringRep {
   coordinates: CoordPair[];
 }
 
+interface MultiLineStringRep {
+  type: 'MultiLineString';
+  coordinates: CoordPair[][];
+}
+
 export interface RoadFeatureShape {
   kind: 'road';
   stableId: string;
-  geometry: LineStringRep;
   /** Explicit width in metres (overrides classification default). */
   width?: number;
   /** OSM highway classification. */
@@ -47,6 +51,7 @@ export interface RoadFeatureShape {
   name?: string;
   /** Source layer for z-ordering. */
   layer?: string;
+  geometry: LineStringRep | MultiLineStringRep;
 }
 
 export interface BuildResult {
@@ -238,27 +243,34 @@ export function buildRoads(
     // Optional layer filter
     if (layerFilter !== undefined && feat.highway !== layerFilter) continue;
 
-    const coords = feat.geometry.coordinates;
-    if (coords.length < 2) continue;
-
+    const lineStrings = feat.geometry.type === 'LineString'
+      ? [feat.geometry.coordinates]
+      : feat.geometry.coordinates;
     const width = resolveWidth(feat);
     const halfWidth = width / 2;
 
-    // Accumulate length for reporting
-    for (let i = 0; i < coords.length - 1; i++) {
-      const dx = coords[i + 1][0] - coords[i][0];
-      const dz = coords[i + 1][1] - coords[i][1];
-      totalLength += Math.sqrt(dx * dx + dz * dz);
+    for (const coords of lineStrings) {
+      if (coords.length < 2) continue;
+
+      // Accumulate length for reporting.
+      for (let i = 0; i < coords.length - 1; i++) {
+        const dx = coords[i + 1][0] - coords[i][0];
+        const dz = coords[i + 1][1] - coords[i][1];
+        totalLength += Math.sqrt(dx * dx + dz * dz);
+      }
+
+      const ribbon = ribbonGeometry(coords, halfWidth, fi);
+      // Tag bridge/tunnel as a draw attribute for the scene to consume.
+      if (hasBridge(feat)) ribbon.userData.bridge = true;
+      if (hasTunnel(feat)) ribbon.userData.tunnel = true;
+      if ((ribbon.getAttribute('position')?.count ?? 0) > 0) geoms.push(ribbon);
     }
 
-    const ribbon = ribbonGeometry(coords, halfWidth, fi);
-    // Tag bridge/tunnel as a draw attribute for the scene to consume
-    if (hasBridge(feat)) ribbon.userData.bridge = true;
-    if (hasTunnel(feat)) ribbon.userData.tunnel = true;
-    geoms.push(ribbon);
   }
-
   const merged = mergeGeometries(geoms);
+  if (geoms.length > 1) {
+    for (const intermediate of geoms) intermediate.dispose();
+  }
 
   return {
     geometry: merged,

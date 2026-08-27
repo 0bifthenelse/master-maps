@@ -22,6 +22,7 @@ type LocalCoordinate = [number, number];
 export type LocalGeometry =
   | { type: "Point"; coordinates: LocalCoordinate }
   | { type: "LineString"; coordinates: LocalCoordinate[] }
+  | { type: "MultiLineString"; coordinates: LocalCoordinate[][] }
   | { type: "Polygon"; coordinates: LocalCoordinate[][] }
   | { type: "MultiPolygon"; coordinates: LocalCoordinate[][][] };
 
@@ -65,6 +66,60 @@ function lineStringMidpoint(coords: LocalCoordinate[]): LocalCoordinate {
   }
 
   return coords[coords.length - 1]!;
+}
+function lineStringLength(coords: LocalCoordinate[]): number {
+  let total = 0;
+  for (let i = 0; i < coords.length - 1; i += 1) {
+    total += Math.hypot(
+      coords[i + 1]![0] - coords[i]![0],
+      coords[i + 1]![1] - coords[i]![1],
+    );
+  }
+  return total;
+}
+
+function lineStringPointAtDistance(
+  coords: LocalCoordinate[],
+  distance: number,
+): LocalCoordinate {
+  const first = coords[0];
+  if (!first) throw new Error("lineStringPointAtDistance: empty coordinate list");
+  if (coords.length === 1) return first;
+  let remaining = Math.max(0, distance);
+  for (let i = 0; i < coords.length - 1; i += 1) {
+    const [ax, az] = coords[i]!;
+    const [bx, bz] = coords[i + 1]!;
+    const length = Math.hypot(bx - ax, bz - az);
+    if (remaining <= length) {
+      const t = length === 0 ? 0 : remaining / length;
+      return [ax + (bx - ax) * t, az + (bz - az) * t];
+    }
+    remaining -= length;
+  }
+  return coords[coords.length - 1]!;
+}
+
+function multiLineStringMidpoint(lines: LocalCoordinate[][]): LocalCoordinate {
+  let totalLength = 0;
+  for (const line of lines) totalLength += lineStringLength(line);
+  if (totalLength === 0) {
+    const first = lines[0]?.[0];
+    if (!first) throw new Error("multiLineStringMidpoint: empty geometry");
+    return first;
+  }
+
+  const target = totalLength / 2;
+  let accumulated = 0;
+  for (const line of lines) {
+    const length = lineStringLength(line);
+    if (accumulated + length >= target) {
+      return lineStringPointAtDistance(line, target - accumulated);
+    }
+    accumulated += length;
+  }
+  const lastLine = lines[lines.length - 1];
+  if (!lastLine) throw new Error("multiLineStringMidpoint: empty geometry");
+  return lastLine[lastLine.length - 1]!;
 }
 
 /** Area-weighted centroid of a single ring (shoelace formula); falls back to the arithmetic mean for a degenerate (zero-area) ring. */
@@ -141,6 +196,8 @@ export function computeLocalFocus(geometry: LocalGeometry): LocalCoordinate {
       return geometry.coordinates;
     case "LineString":
       return lineStringMidpoint(geometry.coordinates);
+    case "MultiLineString":
+      return multiLineStringMidpoint(geometry.coordinates);
     case "Polygon":
       return polygonCentroid(geometry.coordinates);
     case "MultiPolygon":

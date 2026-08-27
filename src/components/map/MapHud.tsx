@@ -158,6 +158,7 @@ export function MapHud({
             <input
               ref={inputRef}
               type="search"
+              data-testid="search-input"
               placeholder="Rechercher dans Auch …"
               aria-label="Rechercher dans Auch"
               value={query}
