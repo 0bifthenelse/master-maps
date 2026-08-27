@@ -39,6 +39,8 @@ type FullCameraState = {
   target: [number, number, number];
   zoom: number;
   azimuthalAngle: number;
+  headingRadians?: number;
+  rotationZ?: number;
 };
 
 async function readFullCameraState(page: Page): Promise<FullCameraState> {
@@ -276,6 +278,105 @@ test.describe("Map application E2E", () => {
     );
     const zoomedIn = await readCameraState(page);
     expect(zoomedIn.zoom).toBeGreaterThan(before.zoom);
+  });
+
+  test("right-click drag rotates the top-down map heading", async ({ page }) => {
+    const status = await page.locator("#scene-diagnostics").getAttribute("data-renderer-status");
+    if (status !== "initialized") return;
+    const canvas = page.locator("canvas");
+    const box = await canvas.boundingBox();
+    if (!box) throw new Error("canvas has no bounding box");
+
+    const before = await readFullCameraState(page);
+    const headingBefore = (before as FullCameraState).headingRadians ?? (before as FullCameraState).rotationZ ?? before.azimuthalAngle;
+    const targetBefore = [...before.target] as [number, number, number];
+
+    // Right-drag horizontally to rotate heading
+    await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+    await page.mouse.down({ button: "right" });
+    await page.mouse.move(box.x + box.width / 2 + 200, box.y + box.height / 2, { steps: 12 });
+    await page.mouse.up({ button: "right" });
+
+    await page.waitForFunction(
+      (prev: number) => {
+        const s = document.getElementById("scene-diagnostics")?.getAttribute("data-camera-state");
+        if (!s) return false;
+        try {
+          const j = JSON.parse(s) as FullCameraState;
+          const h = j.headingRadians ?? j.rotationZ ?? j.azimuthalAngle;
+          return Math.abs(h - prev) > 0.2;
+        } catch {
+          return false;
+        }
+      },
+      headingBefore,
+      { timeout: 5000 },
+    );
+
+    const after = await readFullCameraState(page);
+    const headingAfter = (after as FullCameraState).headingRadians ?? (after as FullCameraState).rotationZ ?? after.azimuthalAngle;
+    expect(Math.abs(headingAfter - headingBefore)).toBeGreaterThan(0.2);
+    // Target must not have materially moved during rotation (pan threshold 50m vs 3000m world)
+    const moved = Math.hypot(after.target[0] - targetBefore[0], after.target[2] - targetBefore[2]);
+    expect(moved).toBeLessThan(50);
+
+    // Rotation persists after pointer release
+    await page.waitForTimeout(500);
+    const persisted = await readFullCameraState(page);
+    const headingPersisted = (persisted as FullCameraState).headingRadians ?? (persisted as FullCameraState).rotationZ ?? persisted.azimuthalAngle;
+    expect(Math.abs(headingPersisted - headingAfter)).toBeLessThan(0.05);
+
+    // Left drag still pans
+    const beforePan = await readCameraState(page);
+    await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+    await page.mouse.down({ button: "left" });
+    await page.mouse.move(box.x + box.width / 2 + 120, box.y + box.height / 2 + 80, { steps: 10 });
+    await page.mouse.up({ button: "left" });
+    await page.waitForFunction(
+      (prevX: number) => Number(document.getElementById("scene-diagnostics")?.getAttribute("data-camera-target-x")) !== prevX,
+      beforePan.x,
+      { timeout: 5000 },
+    );
+    const afterPan = await readCameraState(page);
+    expect(afterPan.x !== beforePan.x || afterPan.z !== beforePan.z).toBe(true);
+
+    // Wheel still zooms
+    const beforeZoom = await readCameraState(page);
+    await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+    await page.mouse.wheel(0, -400);
+    await page.waitForFunction(
+      (prevZoom: number) => Number(document.getElementById("scene-diagnostics")?.getAttribute("data-camera-zoom")) !== prevZoom,
+      beforeZoom.zoom,
+      { timeout: 5000 },
+    );
+    const afterZoom = await readCameraState(page);
+    expect(afterZoom.zoom).toBeGreaterThan(beforeZoom.zoom);
+
+    // Reset restores corrected default heading (0)
+    const reset = page.locator('button:has-text("Réinitialiser")');
+    await reset.click();
+    await page.waitForFunction(
+      () => {
+        const s = document.getElementById("scene-diagnostics")?.getAttribute("data-camera-state");
+        if (!s) return false;
+        try {
+          const j = JSON.parse(s) as FullCameraState;
+          const h = j.headingRadians ?? j.rotationZ ?? j.azimuthalAngle;
+          return Math.abs(h) < 0.08;
+        } catch {
+          return false;
+        }
+      },
+      undefined,
+      { timeout: 5000 },
+    );
+    const afterReset = await readFullCameraState(page);
+    const headingReset = (afterReset as FullCameraState).headingRadians ?? (afterReset as FullCameraState).rotationZ ?? afterReset.azimuthalAngle;
+    expect(Math.abs(headingReset)).toBeLessThan(0.08);
+
+    // No native context menu should have appeared (page should not have been blocked)
+    // Verify canvas still responsive after right-drag
+    await expect(page.locator("canvas")).toBeVisible();
   });
 
   test("searching a street centers the camera on its geometry", async ({ page }) => {

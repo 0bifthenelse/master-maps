@@ -14,6 +14,8 @@ export interface CameraDiagnostics {
   target: [number, number, number];
   zoom: number;
   azimuthalAngle: number;
+  headingRadians: number;
+  rotationZ: number;
 }
 
 export interface CameraHandle {
@@ -43,7 +45,9 @@ export interface MapCameraProps {
 }
 
 const DAMPING = 0.08;
-const NORTH_UP_ROTATION: [number, number, number] = [-Math.PI / 2, 0, Math.PI];
+// Corrected default: 180-degree reversal from previous [ -PI/2, 0, PI ] -> [ -PI/2, 0, 0 ]
+const NORTH_UP_ROTATION: [number, number, number] = [-Math.PI / 2, 0, 0];
+const ROTATION_SENSITIVITY = 0.005; // radians per pixel of horizontal drag
 
 export const MapCamera = forwardRef<CameraHandle, MapCameraProps>(
   (
@@ -56,8 +60,12 @@ export const MapCamera = forwardRef<CameraHandle, MapCameraProps>(
     },
     ref,
   ) => {
-    const { set, get, size } = useThree();
+    const { set, get, size, gl } = useThree();
     const cameraRef = useRef<THREE.OrthographicCamera>(null!);
+
+    /* Heading state - authoritative in-plane rotation around viewing axis.
+       0 = corrected north-up (Z=0), PI = old reversed default. */
+    const headingRef = useRef<number>(0);
 
     /* Initialise frustum once at mount, using the actual Canvas size (not
        window dimensions) so the fit is correct on any viewport. */
@@ -115,9 +123,10 @@ export const MapCamera = forwardRef<CameraHandle, MapCameraProps>(
         const camera = cameraRef.current;
         if (!camera) return;
 
+        const heading = headingRef.current;
         camera.up.set(0, 1, 0);
         camera.position.set(targetX, cameraHeight, targetZ);
-        camera.rotation.set(...NORTH_UP_ROTATION);
+        camera.rotation.set(-Math.PI / 2, 0, heading);
         camera.updateMatrixWorld();
 
         const controls = get().controls as MapControlsImpl | null;
@@ -125,7 +134,7 @@ export const MapCamera = forwardRef<CameraHandle, MapCameraProps>(
           controls.target.set(targetX, 0, targetZ);
           controls.update();
           camera.position.set(targetX, cameraHeight, targetZ);
-          camera.rotation.set(...NORTH_UP_ROTATION);
+          camera.rotation.set(-Math.PI / 2, 0, heading);
           camera.updateMatrixWorld();
         }
       },
@@ -147,6 +156,78 @@ export const MapCamera = forwardRef<CameraHandle, MapCameraProps>(
       }
       return undefined;
     }, [makeDefault, set, get]);
+
+    /* Right-drag heading rotation - authoritative heading state.
+       Uses pointer capture and suppresses context menu only on canvas. */
+    useEffect(() => {
+      // WebGPURenderer exposes domElement; named cast documents the boundary.
+      const glWithDom = gl as unknown as { domElement: HTMLCanvasElement };
+      const canvas = glWithDom.domElement;
+      if (!canvas) return;
+
+      let isRotating = false;
+      let startX = 0;
+      let startHeading = 0;
+      let activePointerId: number | null = null;
+
+      const onPointerDown = (e: PointerEvent) => {
+        if (e.button !== 2) return;
+        isRotating = true;
+        startX = e.clientX;
+        startHeading = headingRef.current;
+        activePointerId = e.pointerId;
+        try {
+          canvas.setPointerCapture(e.pointerId);
+        } catch {}
+        e.preventDefault();
+      };
+
+      const onPointerMove = (e: PointerEvent) => {
+        if (!isRotating) return;
+        if (activePointerId !== null && e.pointerId !== activePointerId) return;
+        const deltaX = e.clientX - startX;
+        const newHeading = startHeading + deltaX * ROTATION_SENSITIVITY;
+        headingRef.current = newHeading;
+        const cam = cameraRef.current;
+        if (cam) {
+          cam.rotation.set(-Math.PI / 2, 0, newHeading);
+          cam.updateMatrixWorld();
+        }
+      };
+
+      const endRotation = (e: PointerEvent) => {
+        if (!isRotating) return;
+        if (activePointerId !== null && e.pointerId !== activePointerId) return;
+        isRotating = false;
+        activePointerId = null;
+        try {
+          canvas.releasePointerCapture(e.pointerId);
+        } catch {}
+      };
+
+      const onContextMenu = (e: MouseEvent) => {
+        e.preventDefault();
+      };
+
+      canvas.addEventListener('pointerdown', onPointerDown);
+      canvas.addEventListener('pointermove', onPointerMove);
+      canvas.addEventListener('pointerup', endRotation);
+      canvas.addEventListener('pointercancel', endRotation);
+      canvas.addEventListener('contextmenu', onContextMenu);
+
+      return () => {
+        canvas.removeEventListener('pointerdown', onPointerDown);
+        canvas.removeEventListener('pointermove', onPointerMove);
+        canvas.removeEventListener('pointerup', endRotation);
+        canvas.removeEventListener('pointercancel', endRotation);
+        canvas.removeEventListener('contextmenu', onContextMenu);
+        if (activePointerId !== null) {
+          try {
+            canvas.releasePointerCapture(activePointerId);
+          } catch {}
+        }
+      };
+    }, [gl]);
 
     /* --- Imperative API --- */
 
@@ -192,6 +273,7 @@ export const MapCamera = forwardRef<CameraHandle, MapCameraProps>(
       const camera = cameraRef.current;
       if (!camera) return;
 
+      headingRef.current = 0;
       desiredTarget.current.set(centreX, 0, centreZ);
       applyNorthUp(centreX, centreZ);
       initialised.current = true;
@@ -209,9 +291,14 @@ export const MapCamera = forwardRef<CameraHandle, MapCameraProps>(
       }
       const camera = cameraRef.current;
       if (!camera) return;
-      if (!animating.current) {
-        camera.rotation.set(...NORTH_UP_ROTATION);
+
+      const applyHeading = () => {
+        camera.rotation.set(-Math.PI / 2, 0, headingRef.current);
         camera.updateMatrixWorld();
+      };
+
+      if (!animating.current) {
+        applyHeading();
         return;
       }
 
@@ -250,8 +337,7 @@ export const MapCamera = forwardRef<CameraHandle, MapCameraProps>(
         camera.zoom += zDelta * DAMPING;
         camera.updateProjectionMatrix();
       }
-      camera.rotation.set(...NORTH_UP_ROTATION);
-      camera.updateMatrixWorld();
+      applyHeading();
     });
 
     /* --- Ref API exposed to parent --- */
@@ -267,15 +353,14 @@ export const MapCamera = forwardRef<CameraHandle, MapCameraProps>(
             target: [0, 0, 0],
             zoom: 0,
             azimuthalAngle: 0,
+            headingRadians: 0,
+            rotationZ: 0,
           };
         }
         const controls = get().controls as MapControlsImpl | null;
         const target: [number, number, number] = controls
           ? [controls.target.x, controls.target.y, controls.target.z]
           : [0, 0, 0];
-        const horizontalOffset = controls
-          ? Math.hypot(camera.position.x - controls.target.x, camera.position.z - controls.target.z)
-          : 0;
         return {
           position: [
             camera.position.x,
@@ -284,9 +369,9 @@ export const MapCamera = forwardRef<CameraHandle, MapCameraProps>(
           ],
           target,
           zoom: camera.zoom,
-          azimuthalAngle: horizontalOffset < 1
-            ? 0
-            : controls?.getAzimuthalAngle() ?? 0,
+          azimuthalAngle: headingRef.current,
+          headingRadians: headingRef.current,
+          rotationZ: camera.rotation.z,
         };
       },
     }));

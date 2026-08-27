@@ -11,6 +11,8 @@ const IDLE_CAMERA_STATE: CameraDiagnostics = {
   target: [0, 0, 0],
   zoom: 0,
   azimuthalAngle: 0,
+  headingRadians: 0,
+  rotationZ: 0,
 };
 
 const IDLE_CONTROLS_STATE: ControlsDiagnostics = {
