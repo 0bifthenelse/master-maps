@@ -11,7 +11,12 @@ export interface SceneMetrics {
   waterCount: number;
   landuseCount: number;
   drawCalls: number;
-  cameraState: string;
+  /** Real camera target X, local metres — published from the mounted camera, not a requested focus. */
+  cameraTargetX: number;
+  /** Real camera target Z, local metres. */
+  cameraTargetZ: number;
+  /** Real orthographic camera zoom level. */
+  cameraZoom: number;
   rendererError: string;
 }
 
@@ -26,7 +31,9 @@ export const sceneMetrics: SceneMetrics = {
   waterCount: 0,
   landuseCount: 0,
   drawCalls: 0,
-  cameraState: "unknown",
+  cameraTargetX: 0,
+  cameraTargetZ: 0,
+  cameraZoom: 0,
   rendererError: "none",
 };
 
@@ -48,7 +55,9 @@ export function publishSceneDiagnostics(force = false): void {
     "road-count": sceneMetrics.roadCount,
     "poi-count": sceneMetrics.poiCount,
     "draw-calls": sceneMetrics.drawCalls,
-    "camera-state": sceneMetrics.cameraState,
+    "camera-target-x": sceneMetrics.cameraTargetX,
+    "camera-target-z": sceneMetrics.cameraTargetZ,
+    "camera-zoom": sceneMetrics.cameraZoom,
     "renderer-error": sceneMetrics.rendererError,
   };
   for (const [key, value] of Object.entries(values)) {

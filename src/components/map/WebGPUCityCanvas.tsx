@@ -5,6 +5,7 @@ import { Canvas } from "@react-three/fiber";
 import { WebGPURenderer } from "three/webgpu";
 import WebGPUUnsupported from "./WebGPUUnsupported";
 import LoadingState from "./LoadingState";
+import { CameraRig, type CameraRigHandle } from "./CameraRig";
 import { sceneMetrics, publishSceneDiagnostics } from "@/lib/scene/sceneMetrics";
 
 declare global {
@@ -20,25 +21,33 @@ interface RendererContract {
 export interface WebGPUCityCanvasProps {
   children: ReactNode;
   bounds?: [number, number, number, number];
+  /** Local [x, z] coordinate to focus the camera on; set to request a move. */
+  cameraFocus?: { x: number; z: number } | null;
+  /** Incrementing counter — each change triggers a reset to the full-commune view. */
+  cameraReset?: number;
+  /** Fired once a requested cameraFocus has been dispatched to the camera. */
+  onCameraMoved?: () => void;
 }
 
 const DEFAULT_BOUNDS: [number, number, number, number] = [0, -3000, 3000, 0];
 const CAMERA_HEIGHT = 10000;
-const CAMERA_FAR = 50000;
 
 function diagnosticError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-export default function WebGPUCityCanvas({ children, bounds }: WebGPUCityCanvasProps) {
+export default function WebGPUCityCanvas({
+  children,
+  bounds,
+  cameraFocus,
+  cameraReset,
+  onCameraMoved,
+}: WebGPUCityCanvasProps) {
   const [gpuStatus, setGpuStatus] = useState<"checking" | "supported" | "unsupported">("checking");
   const [initError, setInitError] = useState<string | null>(null);
   const mountedRef = useRef(true);
+  const cameraRigRef = useRef<CameraRigHandle>(null);
   const sceneBounds = bounds ?? DEFAULT_BOUNDS;
-  const centerX = (sceneBounds[0] + sceneBounds[2]) / 2;
-  const centerZ = (sceneBounds[1] + sceneBounds[3]) / 2;
-  const width = Math.max(1, sceneBounds[2] - sceneBounds[0]);
-  const height = Math.max(1, sceneBounds[3] - sceneBounds[1]);
 
   useEffect(() => {
     return () => {
@@ -141,6 +150,24 @@ export default function WebGPUCityCanvas({ children, bounds }: WebGPUCityCanvasP
     }
   }, [handleDeviceLost]);
 
+  /* Dispatch a requested focus to the mounted camera rig. Runs once per
+     cameraFocus change; onCameraMoved lets the caller clear the request
+     immediately since the move itself is animated inside MapCamera. */
+  useEffect(() => {
+    if (!cameraFocus) return;
+    cameraRigRef.current?.focusOn([cameraFocus.x, cameraFocus.z]);
+    onCameraMoved?.();
+  }, [cameraFocus, onCameraMoved]);
+
+  /* Reset is a fire-once counter: skip the initial mount value so the
+     camera doesn't "reset" before it has ever moved. */
+  const previousResetRef = useRef(cameraReset);
+  useEffect(() => {
+    if (cameraReset === undefined || cameraReset === previousResetRef.current) return;
+    previousResetRef.current = cameraReset;
+    cameraRigRef.current?.resetView();
+  }, [cameraReset]);
+
   if (gpuStatus === "checking") return <LoadingState />;
   if (gpuStatus === "unsupported") return <WebGPUUnsupported error={initError} />;
 
@@ -148,23 +175,12 @@ export default function WebGPUCityCanvas({ children, bounds }: WebGPUCityCanvasP
     <div style={{ width: "100%", height: "100%", position: "relative", overflow: "hidden" }}>
       <Canvas
         orthographic
-        camera={{
-          position: [centerX, CAMERA_HEIGHT, centerZ],
-          rotation: [-Math.PI / 2, 0, 0],
-          up: [0, 0, -1],
-          near: 1,
-          far: CAMERA_FAR,
-          left: -Math.max(width / 2, 1),
-          right: Math.max(width / 2, 1),
-          top: Math.max(height / 2, 1),
-          bottom: -Math.max(height / 2, 1),
-          zoom: 0.9,
-        }}
         gl={glFactory as Parameters<typeof Canvas>[0]["gl"]}
         dpr={[1, 2]}
         frameloop="always"
         style={{ display: "block", width: "100%", height: "100%" }}
       >
+        <CameraRig ref={cameraRigRef} communeBounds={sceneBounds} cameraHeight={CAMERA_HEIGHT} />
         {children}
       </Canvas>
     </div>

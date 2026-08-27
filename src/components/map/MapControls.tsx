@@ -1,9 +1,9 @@
-// @ts-nocheck
 'use client';
 
 import { useThree } from '@react-three/fiber';
 import { MapControls as DreiMapControls } from '@react-three/drei';
 import { forwardRef, useEffect, useRef, useImperativeHandle, useCallback } from 'react';
+import type { OrthographicCamera } from 'three';
 import type { MapControls as MapControlsImpl } from 'three-stdlib';
 
 /* ------------------------------------------------------------------ */
@@ -49,10 +49,10 @@ export interface MapControlsProps {
   /** Commune bounds [west, south, east, north] in local metres — used by HJKL */
   communeBounds?: [number, number, number, number];
   /** Callback when camera changes */
-  onChange?: (e?: THREE.Event) => void;
+  onChange?: () => void;
 }
 
-const TEXT_TAGS = new Set(['INPUT', 'TEXTAREA', 'SELECT']);
+const TEXT_TAGS: Record<string, true> = { INPUT: true, TEXTAREA: true, SELECT: true };
 
 /**
  * Determine whether a keyboard event should be absorbed by this component
@@ -60,7 +60,7 @@ const TEXT_TAGS = new Set(['INPUT', 'TEXTAREA', 'SELECT']);
  */
 function shouldHandle(e: KeyboardEvent): boolean {
   if (!(e.target instanceof HTMLElement)) return false;
-  if (TEXT_TAGS.has(e.target.tagName)) return false;
+  if (TEXT_TAGS[e.target.tagName]) return false;
   if (e.target.isContentEditable) return false;
   return true;
 }
@@ -96,19 +96,13 @@ export const MapControls = forwardRef<ControlsHandle, MapControlsProps>(
         const controls = controlsRef.current;
         if (!controls) return;
 
-        const camera = get().camera;
+        const camera = get().camera as unknown as OrthographicCamera;
         if (!camera || !('isOrthographicCamera' in camera)) return;
 
-        const ortho = camera as THREE.OrthographicCamera;
-
-        /*
-          Visible span in world units:
-          FIXME width  = (right  - left) / zoom
-                height = (top    - bottom) / zoom
-          Move target by 25 % of the visible span.
-        */
-        const halfSpanX = ((ortho.right - ortho.left) / ortho.zoom) * 0.25;
-        const halfSpanZ = ((ortho.top - ortho.bottom) / ortho.zoom) * 0.25;
+        // Visible span in world units: (frustum extent) / zoom.
+        // Move target by 25% of the visible span per keypress.
+        const halfSpanX = ((camera.right - camera.left) / camera.zoom) * 0.25;
+        const halfSpanZ = ((camera.top - camera.bottom) / camera.zoom) * 0.25;
 
         /* Which direction does "north" point on screen?  Need to account for
            azimuthal (in-plane) rotation.  Zero rotation → +z is up on screen.
@@ -122,9 +116,9 @@ export const MapControls = forwardRef<ControlsHandle, MapControlsProps>(
 
         switch (e.code) {
           case 'KeyH': /* west  */ { dx = -1; break; }
-          case 'KeyL': /* east  */ { dx =  1; break; }
+          case 'KeyL': /* east  */ { dx = 1; break; }
           case 'KeyJ': /* south */ { dz = -1; break; }
-          case 'KeyK': /* north */ { dz =  1; break; }
+          case 'KeyK': /* north */ { dz = 1; break; }
           default:
             return;
         }
@@ -149,7 +143,7 @@ export const MapControls = forwardRef<ControlsHandle, MapControlsProps>(
     /* --- Diagnostics --- */
 
     useImperativeHandle(ref, () => ({
-      getControlsState: () => {
+      getControlsState: (): ControlsDiagnostics => {
         const c = controlsRef.current;
         if (!c) {
           return {
@@ -159,11 +153,12 @@ export const MapControls = forwardRef<ControlsHandle, MapControlsProps>(
             zoom: 0,
           };
         }
+        const camera = get().camera as unknown as OrthographicCamera;
         return {
           target: [c.target.x, c.target.y, c.target.z],
           azimuthalAngle: c.getAzimuthalAngle(),
           polarAngle: c.getPolarAngle(),
-          zoom: (get().camera as THREE.OrthographicCamera)?.zoom ?? 0,
+          zoom: camera?.zoom ?? 0,
         };
       },
     }));

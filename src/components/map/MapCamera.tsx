@@ -1,9 +1,9 @@
-// @ts-nocheck
 'use client';
 
 import { useThree, useFrame } from '@react-three/fiber';
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef } from 'react';
 import * as THREE from 'three';
+import type { MapControls as MapControlsImpl } from 'three-stdlib';
 
 /* ------------------------------------------------------------------ */
 /*  Public API                                                         */
@@ -55,10 +55,11 @@ export const MapCamera = forwardRef<CameraHandle, MapCameraProps>(
     },
     ref,
   ) => {
-    const { set, get } = useThree();
+    const { set, get, size } = useThree();
     const cameraRef = useRef<THREE.OrthographicCamera>(null!);
 
-    /* Initialise frustum once at mount */
+    /* Initialise frustum once at mount, using the actual Canvas size (not
+       window dimensions) so the fit is correct on any viewport. */
     const initFrustum = useCallback(
       (zoom: number): THREE.OrthographicCamera => {
         const camera = cameraRef.current;
@@ -69,10 +70,7 @@ export const MapCamera = forwardRef<CameraHandle, MapCameraProps>(
         const worldWidth = worldEast - worldWest;
         const worldHeight = worldNorth - worldSouth;
 
-        const aspect =
-          typeof window !== 'undefined'
-            ? window.innerWidth / window.innerHeight
-            : 16 / 9;
+        const aspect = size.height > 0 ? size.width / size.height : 16 / 9;
 
         let fw: number;
         let fh: number;
@@ -84,15 +82,17 @@ export const MapCamera = forwardRef<CameraHandle, MapCameraProps>(
           fw = worldHeight * aspect;
         }
 
-        camera.left = -fw / 2;
-        camera.right = fw / 2;
-        camera.top = fh / 2;
-        camera.bottom = -fh / 2;
+        // 15% padding so the commune boundary is visible with margin.
+        const pad = 1.15;
+        camera.left = (-fw / 2) * pad;
+        camera.right = (fw / 2) * pad;
+        camera.top = (fh / 2) * pad;
+        camera.bottom = (-fh / 2) * pad;
         camera.zoom = zoom;
         camera.updateProjectionMatrix();
         return camera;
       },
-      [communeBounds],
+      [communeBounds, size],
     );
 
     /* Centre of the commune */
@@ -108,6 +108,12 @@ export const MapCamera = forwardRef<CameraHandle, MapCameraProps>(
     const animating = useRef(false);
     const desiredZoom = useRef(initialZoom);
 
+    /* Re-fit the frustum whenever the Canvas is resized (mobile rotation,
+       window resize) so the commune stays fully visible. */
+    useEffect(() => {
+      if (cameraRef.current) initFrustum(cameraRef.current.zoom || initialZoom);
+    }, [initFrustum, initialZoom]);
+
     /* Set camera as R3F default once mounted */
     useEffect(() => {
       if (makeDefault && cameraRef.current) {
@@ -115,6 +121,7 @@ export const MapCamera = forwardRef<CameraHandle, MapCameraProps>(
         set({ camera: cameraRef.current });
         return () => set({ camera: old });
       }
+      return undefined;
     }, [makeDefault, set, get]);
 
     /* --- Imperative API --- */
@@ -130,13 +137,11 @@ export const MapCamera = forwardRef<CameraHandle, MapCameraProps>(
           /* Fit the supplied bounds inside the frustum with 20 % padding */
           const fw = focusBounds[2] - focusBounds[0];
           const fh = focusBounds[3] - focusBounds[1];
-          const aspect =
-            typeof window !== 'undefined'
-              ? window.innerWidth / window.innerHeight
-              : 16 / 9;
+          const aspect = size.height > 0 ? size.width / size.height : 16 / 9;
           const pad = 1.2;
 
-          let nfw: number, nfh: number;
+          let nfw: number;
+          let nfh: number;
           if (fw / fh > aspect) {
             nfw = fw * pad;
             nfh = nfw / aspect;
@@ -156,7 +161,7 @@ export const MapCamera = forwardRef<CameraHandle, MapCameraProps>(
 
         animating.current = true;
       },
-      [],
+      [size],
     );
 
     const doResetView = useCallback(() => {
@@ -177,7 +182,7 @@ export const MapCamera = forwardRef<CameraHandle, MapCameraProps>(
       if (!camera) return;
 
       /* Animate target via the controls when available */
-      const controls: { target: THREE.Vector3 } | null = get().controls;
+      const controls = get().controls as MapControlsImpl | null;
       if (controls) {
         const t = controls.target;
         const dx = desiredTarget.current.x - t.x;
@@ -218,7 +223,7 @@ export const MapCamera = forwardRef<CameraHandle, MapCameraProps>(
     useImperativeHandle(ref, () => ({
       focusOn: doFocusOn,
       resetView: doResetView,
-      getCameraState: () => {
+      getCameraState: (): CameraDiagnostics => {
         const camera = cameraRef.current;
         if (!camera) {
           return {
@@ -229,7 +234,7 @@ export const MapCamera = forwardRef<CameraHandle, MapCameraProps>(
           };
         }
         const euler = new THREE.Euler().setFromQuaternion(camera.quaternion);
-        const controls: { target: THREE.Vector3 } | null = get().controls;
+        const controls = get().controls as MapControlsImpl | null;
         return {
           position: [
             camera.position.x,
@@ -248,9 +253,8 @@ export const MapCamera = forwardRef<CameraHandle, MapCameraProps>(
     return (
       <orthographicCamera
         ref={cameraRef}
-        makeDefault={makeDefault}
-        position={[centreX, cameraHeight, centreZ]}
-        rotation={[-Math.PI / 2, 0, 0]}
+        position={[centreX, cameraHeight, centreZ] as [number, number, number]}
+        rotation={[-Math.PI / 2, 0, 0] as [number, number, number]}
         zoom={initialZoom}
         near={1}
         far={cameraHeight * 4}

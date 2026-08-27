@@ -35,6 +35,7 @@ import LoadingState from "@/components/map/LoadingState";
 import WebGPUUnsupported from "@/components/map/WebGPUUnsupported";
 import { publishSceneDiagnostics, sceneMetrics } from "@/lib/scene/sceneMetrics";
 import { searchIndex as runSearchIndex, type SearchRecord as SearchIndexRecord } from "@/lib/data/search";
+import { computeLocalFocus, type LocalGeometry as FocusLocalGeometry } from "@/lib/geo/focus";
 
 // ---------------------------------------------------------------------------
 // Local type definitions — match the schema contracts expected from
@@ -254,7 +255,7 @@ const renderableKinds: Record<FeatureKind, boolean> = {
   business: true,
   address: false,
   transport: false,
-  boundary: false,
+  boundary: true,
 };
 
 interface SearchRecord {
@@ -301,8 +302,14 @@ function countFeatures(tileMap: Map<string, TileData>): number {
   return count;
 }
 
-/** Extract a focus [x, z] from a MapFeature. */
+/** Compute a focus [x, z] from a MapFeature's local geometry, falling back
+ *  to its stored anchor coordinate when no local geometry is available. */
 function focusFromFeature(feature: MapFeature): { x: number; z: number } | null {
+  if ("localGeometry" in feature && feature.localGeometry) {
+    const localGeometry = feature.localGeometry as FocusLocalGeometry;
+    const [x, z] = computeLocalFocus(localGeometry);
+    return { x, z };
+  }
   if (feature.localCoord) {
     const [x, z] = feature.localCoord;
     if (x !== undefined && z !== undefined) {
@@ -337,6 +344,7 @@ export default function MapShell() {
     x: number;
     z: number;
   } | null>(null);
+  const [cameraResetCounter, setCameraResetCounter] = useState(0);
   const [layers, setLayers] =
     useState<Record<string, boolean>>(DEFAULT_LAYERS);
   const [manifest, setManifest] = useState<ManifestData | null>(null);
@@ -557,6 +565,7 @@ export default function MapShell() {
 
   const handleResetView = useCallback((): void => {
     setCameraFocus(null);
+    setCameraResetCounter((c) => c + 1);
   }, []);
 
   const handleFeatureSelect = useCallback(
@@ -566,7 +575,7 @@ export default function MapShell() {
     [],
   );
 
-  const handleCameraMoveComplete = useCallback((): void => {
+  const handleCameraMoved = useCallback((): void => {
     setCameraFocus(null);
   }, []);
 
@@ -780,15 +789,17 @@ export default function MapShell() {
         {!hasCriticalError && (
           <>
             {webGpuStatus === "supported" && manifest ? (
-              <WebGPUCityCanvas bounds={manifest.bounds}>
+              <WebGPUCityCanvas
+                bounds={manifest.bounds}
+                cameraFocus={cameraFocus}
+                cameraReset={cameraResetCounter}
+                onCameraMoved={handleCameraMoved}
+              >
                 <CityScene
                   features={sceneFeatures}
                   layers={layers}
                   selectedFeature={selectedFeature}
                   onFeatureSelect={handleFeatureSelect}
-                  cameraFocus={cameraFocus}
-                  onCameraMoveComplete={handleCameraMoveComplete}
-                  bounds={manifest.bounds}
                 />
               </WebGPUCityCanvas>
             ) : webGpuStatus === "unsupported" ? (

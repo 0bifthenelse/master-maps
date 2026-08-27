@@ -6,9 +6,11 @@ import {
   waterMat,
   buildingMat,
   landuseMat,
+  boundaryLineMat,
   getPaperColor,
 } from "@/lib/scene/materials";
 import { sceneMetrics, publishSceneDiagnostics } from "@/lib/scene/sceneMetrics";
+import buildBoundary from "@/lib/scene/buildBoundary";
 import { buildBuildings } from "@/lib/scene/buildBuildings";
 import { buildRoads } from "@/lib/scene/buildRoads";
 import buildWater from "@/lib/scene/buildWater";
@@ -22,7 +24,7 @@ type Geometry =
   | { type: "Polygon"; coordinates: Coordinate[][] }
   | { type: "MultiPolygon"; coordinates: Coordinate[][][] };
 
-type FeatureKind = "building" | "road" | "water" | "landuse" | "poi" | "business";
+type FeatureKind = "building" | "road" | "water" | "landuse" | "poi" | "business" | "boundary";
 
 export interface SceneFeature {
   kind: FeatureKind;
@@ -50,9 +52,6 @@ export interface CitySceneProps {
   layers: Record<string, boolean>;
   selectedFeature?: unknown;
   onFeatureSelect?: (feature: unknown | null) => void;
-  cameraFocus?: { x: number; z: number } | null;
-  onCameraMoveComplete?: () => void;
-  bounds?: [number, number, number, number];
 }
 
 function visible(feature: SceneFeature, layers: Record<string, boolean>): boolean {
@@ -60,6 +59,7 @@ function visible(feature: SceneFeature, layers: Record<string, boolean>): boolea
   if (feature.kind === "road") return layers.roads !== false;
   if (feature.kind === "water") return layers.water !== false;
   if (feature.kind === "landuse") return layers.landuse !== false;
+  if (feature.kind === "boundary") return layers.boundary !== false;
   return layers.pois !== false;
 }
 
@@ -88,12 +88,13 @@ function isLanduseFeature(feature: SceneFeature): feature is LanduseScene {
 function isPoiFeature(feature: SceneFeature): feature is PoiScene {
   return (feature.kind === "poi" || feature.kind === "business") && feature.geometry.type === "Point";
 }
+function isBoundaryFeature(feature: SceneFeature): feature is SceneFeature & { kind: "boundary"; geometry: Extract<Geometry, { type: "Polygon" | "MultiPolygon" }> } {
+  return feature.kind === "boundary" && isPolygon(feature.geometry);
+}
 
 export default function CityScene({
   features,
   layers,
-  cameraFocus,
-  bounds,
 }: CitySceneProps) {
   const activeFeatures = useMemo(
     () => features.filter((feature) => visible(feature, layers)),
@@ -105,6 +106,7 @@ export default function CityScene({
     water: activeFeatures.filter(isWaterFeature),
     landuse: activeFeatures.filter(isLanduseFeature),
     poi: activeFeatures.filter(isPoiFeature),
+    boundary: activeFeatures.filter(isBoundaryFeature),
   }), [activeFeatures]);
   const buildingResult = useMemo(
     () => buildBuildings(groups.building.map((feature) => ({ ...feature, kind: "building" as const }))),
@@ -133,6 +135,10 @@ export default function CityScene({
     () => buildPois(groups.poi.map((feature) => ({ ...feature, kind: "poi" as const }))),
     [groups.poi],
   );
+  const boundaryResult = useMemo(
+    () => buildBoundary(groups.boundary.map((feature) => ({ ...feature, kind: "boundary" as const }))),
+    [groups.boundary],
+  );
 
   useEffect(() => {
     sceneMetrics.loadedFeatureCount = features.length;
@@ -146,20 +152,16 @@ export default function CityScene({
       roadResult.geometry,
       waterResult.geometry,
       landuseResult.geometry,
+      boundaryResult.geometry,
     ].filter((geometry) => (geometry.getAttribute("position")?.count ?? 0) > 0).length;
     sceneMetrics.drawCalls = geometryCount + (poiResult.mesh.count > 0 ? 1 : 0);
-    sceneMetrics.cameraState = cameraFocus
-      ? `focus:(${cameraFocus.x.toFixed(1)},${cameraFocus.z.toFixed(1)})`
-      : bounds
-        ? `bounds:(${bounds[0].toFixed(1)},${bounds[1].toFixed(1)})-(${bounds[2].toFixed(1)},${bounds[3].toFixed(1)})`
-        : "idle";
     // React commits this effect synchronously after the scene graph
     // reflects the current feature set — publish immediately instead of
     // waiting for the next requestAnimationFrame tick, which otherwise
     // leaves a window where renderer-status reads "initialized" while
     // building/road/poi/draw counts still read their stale defaults.
     publishSceneDiagnostics(true);
-  }, [features, groups, buildingResult, roadResult, waterResult, landuseResult, poiResult, cameraFocus, bounds]);
+  }, [features, groups, buildingResult, roadResult, waterResult, landuseResult, poiResult, boundaryResult]);
 
   return (
     <>
@@ -178,6 +180,9 @@ export default function CityScene({
           <mesh geometry={buildingResult.geometry} material={buildingMat} renderOrder={3} />
         ) : null}
         {poiResult.mesh ? <primitive object={poiResult.mesh} renderOrder={4} /> : null}
+        {boundaryResult.geometry.getAttribute("position")?.count ? (
+          <lineSegments geometry={boundaryResult.geometry} material={boundaryLineMat} renderOrder={5} />
+        ) : null}
       </group>
     </>
   );
