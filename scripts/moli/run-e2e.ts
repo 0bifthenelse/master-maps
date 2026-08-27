@@ -44,11 +44,11 @@ async function main() {
   next.stderr?.on("data", (d: Buffer) => process.stderr.write(`[next:err] ${d}`));
 
   console.log("Starting Moli serve...");
-  const moli = spawn("moli", ["serve", "--layout", "--host", "127.0.0.1", "--port", String(MOLI_PORT)], {
-    cwd: ROOT,
-    stdio: ["ignore", "pipe", "pipe"],
-    shell: true,
-  });
+  const moli = spawn(
+    "moli",
+    ["serve", "--layout", "--host", "127.0.0.1", "--port", String(MOLI_PORT), "--timeout", "600"],
+    { cwd: ROOT, stdio: ["ignore", "pipe", "pipe"], shell: true },
+  );
 
   moli.stdout?.on("data", (d: Buffer) => process.stdout.write(`[moli] ${d}`));
   moli.stderr?.on("data", (d: Buffer) => process.stderr.write(`[moli:err] ${d}`));

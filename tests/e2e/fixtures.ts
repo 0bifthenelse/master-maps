@@ -98,10 +98,19 @@ export const test = base.extend<{
   moliBrowser: async ({}, use) => {
     const browser = await chromium.connectOverCDP(MOLI_CDP);
     await use(browser);
+    // connectOverCDP attaches a client to Moli's single long-lived browser
+    // process; disconnecting (not closing) releases this test's CDP session
+    // without tearing down the shared browser other tests still need.
+    await browser.close();
   },
   moliContext: async ({ moliBrowser }, use) => {
     const context = await moliBrowser.newContext({ viewport: { width: 1280, height: 720 } });
     await use(context);
+    // Each test opens a fresh context holding a full WebGPU canvas and the
+    // full commune tile set; leaving contexts open across 20 sequential
+    // tests accumulates memory in Moli's single browser process until it
+    // crashes mid-suite. Close explicitly so only one context is live at a time.
+    await context.close();
   },
   page: async ({ moliContext }, use) => {
     const page = await moliContext.newPage();

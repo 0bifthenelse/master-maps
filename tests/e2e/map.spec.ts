@@ -26,6 +26,15 @@ function assertNoRuntimeErrors(errors: BrowserErrors): void {
   expect(errors.consoleErrors, "console.error events").toEqual([]);
 }
 
+async function readCameraState(page: Page): Promise<{ x: number; z: number; zoom: number }> {
+  const diagnostics = page.locator("#scene-diagnostics");
+  return diagnostics.evaluate((element) => ({
+    x: Number(element.getAttribute("data-camera-target-x")),
+    z: Number(element.getAttribute("data-camera-target-z")),
+    zoom: Number(element.getAttribute("data-camera-zoom")),
+  }));
+}
+
 test.describe("Map application E2E", () => {
   test.beforeEach(async ({ page, errors }) => {
     await page.goto("/");
@@ -51,7 +60,9 @@ test.describe("Map application E2E", () => {
       roads: Number(element.getAttribute("data-road-count")),
       pois: Number(element.getAttribute("data-poi-count")),
       draws: Number(element.getAttribute("data-draw-calls")),
-      camera: element.getAttribute("data-camera-state"),
+      cameraTargetX: Number(element.getAttribute("data-camera-target-x")),
+      cameraTargetZ: Number(element.getAttribute("data-camera-target-z")),
+      cameraZoom: Number(element.getAttribute("data-camera-zoom")),
       error: element.getAttribute("data-renderer-error"),
     }));
     expect(attrs.tiles).toBeGreaterThan(0);
@@ -65,7 +76,7 @@ test.describe("Map application E2E", () => {
     expect(attrs.backend).toBe("webgpu");
     expect(attrs.buildings + attrs.roads + attrs.pois).toBeGreaterThan(0);
     expect(attrs.draws).toBeGreaterThan(0);
-    expect(attrs.camera).not.toBe("unknown");
+    expect(attrs.cameraZoom).toBeGreaterThan(0);
     expect(attrs.error).toBe("none");
 
     const canvas = page.locator("canvas");
@@ -88,7 +99,7 @@ test.describe("Map application E2E", () => {
     await searchInput.fill("Nocibé");
     const results = page.locator('[role="listbox"]');
     await expect(results).toBeVisible();
-    await expect(results).toContainText(/[Nn]ocib[eé]/);
+    await expect(results).toContainText(/nocib[eé]/i);
     await results.locator('[role="option"]').first().click();
     await expect(page.getByRole("complementary", { name: "Détails de l'élément" })).toBeVisible();
     await page.screenshot({ path: `${ARTIFACTS_DIR}/map/nocibe-selected.png` });
@@ -118,5 +129,147 @@ test.describe("Map application E2E", () => {
     const box = await canvas.boundingBox();
     expect(box?.width ?? 0).toBeGreaterThan(0);
     expect(box?.height ?? 0).toBeGreaterThan(0);
+  });
+
+  test("H J K L move the camera in compass directions", async ({ page }) => {
+    const status = await page.locator("#scene-diagnostics").getAttribute("data-renderer-status");
+    if (status !== "initialized") return;
+    const canvas = page.locator("canvas");
+    await canvas.click();
+    const before = await readCameraState(page);
+    await page.keyboard.press("KeyL"); // east
+    await page.waitForFunction(
+      (prevX) => Number(document.getElementById("scene-diagnostics")?.getAttribute("data-camera-target-x")) !== prevX,
+      before.x,
+      { timeout: 5000 },
+    );
+    const afterEast = await readCameraState(page);
+    expect(afterEast.x).toBeGreaterThan(before.x);
+
+    await page.keyboard.press("KeyK"); // north
+    await page.waitForFunction(
+      (prevZ) => Number(document.getElementById("scene-diagnostics")?.getAttribute("data-camera-target-z")) !== prevZ,
+      afterEast.z,
+      { timeout: 5000 },
+    );
+    const afterNorth = await readCameraState(page);
+    expect(afterNorth.z).toBeGreaterThan(afterEast.z);
+  });
+
+  test("H J K L do nothing while the search input is focused", async ({ page }) => {
+    const status = await page.locator("#scene-diagnostics").getAttribute("data-renderer-status");
+    if (status !== "initialized") return;
+    const searchInput = page.locator('input[type="search"]');
+    await searchInput.focus();
+    const before = await readCameraState(page);
+    await page.keyboard.press("KeyH");
+    await page.keyboard.press("KeyJ");
+    await page.keyboard.press("KeyK");
+    await page.keyboard.press("KeyL");
+    await page.waitForTimeout(300);
+    const after = await readCameraState(page);
+    expect(after.x).toBeCloseTo(before.x, 6);
+    expect(after.z).toBeCloseTo(before.z, 6);
+  });
+
+  test("mouse drag pans the map", async ({ page }) => {
+    const status = await page.locator("#scene-diagnostics").getAttribute("data-renderer-status");
+    if (status !== "initialized") return;
+    const canvas = page.locator("canvas");
+    const box = await canvas.boundingBox();
+    if (!box) throw new Error("canvas has no bounding box");
+    const before = await readCameraState(page);
+    await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+    await page.mouse.down();
+    await page.mouse.move(box.x + box.width / 2 + 120, box.y + box.height / 2 + 80, { steps: 10 });
+    await page.mouse.up();
+    await page.waitForFunction(
+      (prevX) => Number(document.getElementById("scene-diagnostics")?.getAttribute("data-camera-target-x")) !== prevX,
+      before.x,
+      { timeout: 5000 },
+    );
+    const after = await readCameraState(page);
+    expect(after.x !== before.x || after.z !== before.z).toBe(true);
+  });
+
+  test("mouse wheel zooms in and out", async ({ page }) => {
+    const status = await page.locator("#scene-diagnostics").getAttribute("data-renderer-status");
+    if (status !== "initialized") return;
+    const canvas = page.locator("canvas");
+    const box = await canvas.boundingBox();
+    if (!box) throw new Error("canvas has no bounding box");
+    const before = await readCameraState(page);
+    await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+    await page.mouse.wheel(0, -400); // zoom in
+    await page.waitForFunction(
+      (prevZoom) => Number(document.getElementById("scene-diagnostics")?.getAttribute("data-camera-zoom")) !== prevZoom,
+      before.zoom,
+      { timeout: 5000 },
+    );
+    const zoomedIn = await readCameraState(page);
+    expect(zoomedIn.zoom).toBeGreaterThan(before.zoom);
+  });
+
+  test("searching a street centers the camera on its geometry", async ({ page }) => {
+    const status = await page.locator("#scene-diagnostics").getAttribute("data-renderer-status");
+    if (status !== "initialized") return;
+    const before = await readCameraState(page);
+    const searchInput = page.locator('input[type="search"]');
+    await searchInput.fill("Avenue d'Alsace");
+    const results = page.locator('[role="listbox"]');
+    await expect(results).toBeVisible();
+    await results.locator('[role="option"]').first().click();
+    await page.waitForFunction(
+      (prevX) => Number(document.getElementById("scene-diagnostics")?.getAttribute("data-camera-target-x")) !== prevX,
+      before.x,
+      { timeout: 5000 },
+    );
+    const after = await readCameraState(page);
+    expect(after.x !== before.x || after.z !== before.z).toBe(true);
+  });
+
+  test("reset view returns to the full-commune fit after pan and search", async ({ page }) => {
+    const status = await page.locator("#scene-diagnostics").getAttribute("data-renderer-status");
+    if (status !== "initialized") return;
+    const initial = await readCameraState(page);
+
+    const searchInput = page.locator('input[type="search"]');
+    await searchInput.fill("Nocibé");
+    const results = page.locator('[role="listbox"]');
+    await expect(results).toBeVisible();
+    await results.locator('[role="option"]').first().click();
+    await page.waitForFunction(
+      (prevX) => Number(document.getElementById("scene-diagnostics")?.getAttribute("data-camera-target-x")) !== prevX,
+      initial.x,
+      { timeout: 5000 },
+    );
+
+    const reset = page.locator('button:has-text("Réinitialiser")');
+    await reset.click();
+    await page.waitForFunction(
+      (prevX) => Math.abs(Number(document.getElementById("scene-diagnostics")?.getAttribute("data-camera-target-x")) - prevX) < 0.5,
+      initial.x,
+      { timeout: 5000 },
+    );
+    const afterReset = await readCameraState(page);
+    expect(afterReset.x).toBeCloseTo(initial.x, 0);
+    expect(afterReset.z).toBeCloseTo(initial.z, 0);
+
+    // Search must still work after pan/reset navigation.
+    await searchInput.fill("Nocibé");
+    await expect(results).toBeVisible();
+  });
+
+  test("mobile viewport fits the commune without cropping", async ({ page }) => {
+    await page.setViewportSize({ width: 375, height: 667 });
+    await page.reload();
+    await waitForScene(page);
+    const status = await page.locator("#scene-diagnostics").getAttribute("data-renderer-status");
+    if (status !== "initialized") return;
+    const state = await readCameraState(page);
+    expect(state.zoom).toBeGreaterThan(0);
+    const canvas = page.locator("canvas");
+    const box = await canvas.boundingBox();
+    expect(box?.width ?? 0).toBeCloseTo(375, 0);
   });
 });
