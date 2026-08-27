@@ -1,0 +1,22 @@
+{
+  "territory": { "code": "32", "name": "Gers" },
+  "source": "IGN Admin Express COG, BAN, OpenStreetMap and geo.api.gouv.fr spot corroboration",
+  "anchors": {
+    "gareAuch": { "coordinate": [0.5967168714285714, 43.64730908571429], "sourceUrl": "https://www.openstreetmap.org/way/65477442" },
+    "cathedralSainteMarie": { "coordinate": [0.586107265060241, 43.64626884518072], "sourceUrl": "https://www.openstreetmap.org/way/65470768" },
+    "prefectureGers": { "coordinate": [0.5857, 43.6477], "sourceUrl": "https://www.openstreetmap.org/way/65461658" },
+    "boulevardSadiCarnot": { "coordinate": [0.588768775, 43.647426925], "sourceUrl": "https://www.openstreetmap.org/way/29892033" },
+    "avenueDAlsace": { "coordinate": [0.591534, 43.64844878], "sourceUrl": "https://www.openstreetmap.org/way/29891995" },
+    "condom": { "coordinate": [0.3712, 43.9582], "sourceUrl": "https://www.openstreetmap.org/search?query=Condom%2C%20Gers" },
+    "lectoure": { "coordinate": [0.6217, 43.9346], "sourceUrl": "https://www.openstreetmap.org/search?query=Lectoure%2C%20Gers" },
+    "fleurance": { "coordinate": [0.6638, 43.8492], "sourceUrl": "https://www.openstreetmap.org/search?query=Fleurance%2C%20Gers" },
+    "eauze": { "coordinate": [0.1017, 43.8608], "sourceUrl": "https://www.openstreetmap.org/search?query=Eauze%2C%20Gers" },
+    "vicFezensac": { "coordinate": [0.3012, 43.7585], "sourceUrl": "https://www.openstreetmap.org/search?query=Vic-Fezensac%2C%20Gers" },
+    "mirande": { "coordinate": [0.4042, 43.5157], "sourceUrl": "https://www.openstreetmap.org/search?query=Mirande%2C%20Gers" },
+    "marciac": { "coordinate": [0.1612, 43.5241], "sourceUrl": "https://www.openstreetmap.org/search?query=Marciac%2C%20Gers" },
+    "nogaro": { "coordinate": [-0.0348, 43.7589], "sourceUrl": "https://www.openstreetmap.org/search?query=Nogaro%2C%20Gers" },
+    "samatan": { "coordinate": [0.9294, 43.4921], "sourceUrl": "https://www.openstreetmap.org/search?query=Samatan%2C%20Gers" },
+    "lisleJourdain": { "coordinate": [1.081, 43.6134], "sourceUrl": "https://www.openstreetmap.org/search?query=L%27Isle-Jourdain%2C%20Gers" }
+  },
+  "auchRegressionFixture": "tests/fixtures/auch-landmark-anchors.json"
+}

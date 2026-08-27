@@ -5,6 +5,7 @@ import { useFrame } from "@react-three/fiber";
 import { MapCamera, type CameraDiagnostics, type CameraHandle } from "./MapCamera";
 import { MapControls, type ControlsDiagnostics, type ControlsHandle } from "./MapControls";
 import { sceneMetrics, publishSceneDiagnostics } from "@/lib/scene/sceneMetrics";
+import type { OrthographicCamera } from "three";
 
 const IDLE_CAMERA_STATE: CameraDiagnostics = {
   position: [0, 0, 0],
@@ -29,11 +30,18 @@ export interface CameraRigHandle {
   getControlsState: () => ControlsDiagnostics;
 }
 
+export interface ViewportSnapshot {
+  target: [number, number];
+  zoom: number;
+  width: number;
+  height: number;
+}
+
 export interface CameraRigProps {
-  /** Full commune bounds [west, south, east, north] in local metres */
+  /** Full territory bounds [west, south, east, north] in render metres. */
   communeBounds: [number, number, number, number];
-  /** Height of the camera above the ground plane */
   cameraHeight?: number;
+  onViewportChange?: (snapshot: ViewportSnapshot) => void;
 }
 
 /** Minimum interval between diagnostics publishes, matching CityScene's cadence. */
@@ -47,7 +55,7 @@ const DIAGNOSTICS_INTERVAL_MS = 100;
  * throttled to DIAGNOSTICS_INTERVAL_MS.
  */
 export const CameraRig = forwardRef<CameraRigHandle, CameraRigProps>(
-  ({ communeBounds, cameraHeight }, ref) => {
+  ({ communeBounds, cameraHeight, onViewportChange }, ref) => {
     const cameraRef = useRef<CameraHandle>(null);
     const controlsRef = useRef<ControlsHandle>(null);
     const lastPublish = useRef(0);
@@ -71,6 +79,13 @@ export const CameraRig = forwardRef<CameraRigHandle, CameraRigProps>(
       sceneMetrics.cameraZoom = cameraState.zoom;
       sceneMetrics.cameraState = JSON.stringify(cameraState);
       publishSceneDiagnostics();
+      const camera = state.camera as OrthographicCamera;
+      onViewportChange?.({
+        target: [cameraState.target[0], cameraState.target[2]],
+        zoom: cameraState.zoom,
+        width: Math.abs(camera.right - camera.left),
+        height: Math.abs(camera.top - camera.bottom),
+      });
     });
 
     return (

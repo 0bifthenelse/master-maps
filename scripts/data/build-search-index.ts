@@ -174,7 +174,7 @@ async function loadData(
     if (Array.isArray(parsed)) {
       for (const f of parsed as MapFeature[]) {
         features.push(f);
-        tileMap.set(f.stableId, tileId);
+        if (!tileMap.has(f.stableId) || tileId.startsWith("l0_")) tileMap.set(f.stableId, tileId);
       }
     }
   }
@@ -211,9 +211,10 @@ export function buildSearchIndex(
   tileMap: Map<string, string>,
   outputPath: string,
 ): SearchRecord[] {
+  const uniqueFeatures = [...new Map(features.map((feature) => [feature.stableId, feature])).values()];
   const records: SearchRecord[] = [];
 
-  for (const f of features) {
+  for (const f of uniqueFeatures) {
     const name = f.name ?? f.businessName ?? f.displayName ?? f.stableId;
     const normalized = normalizedKey(name);
     const aliases = generateAliases(f);
@@ -255,6 +256,27 @@ export function buildSearchIndex(
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
+async function writeJsonArray(filePath: string, values: Iterable<unknown>): Promise<void> {
+  const handle = await fs.open(filePath, "w");
+  let buffer = "[";
+  let first = true;
+  try {
+    for (const value of values) {
+      const encoded = JSON.stringify(value);
+      if (encoded === undefined) continue;
+      if (!first) buffer += ",\n";
+      buffer += encoded;
+      first = false;
+      if (buffer.length >= 1024 * 1024) {
+        await handle.write(buffer);
+        buffer = "";
+      }
+    }
+    await handle.write(`${buffer}\n]\n`);
+  } finally {
+    await handle.close();
+  }
+}
 
 export async function buildIndexAll(
   inDir?: string,
@@ -269,7 +291,7 @@ export async function buildIndexAll(
   const { features, tileMap } = await loadData(ind);
   const records = buildSearchIndex(features, tileMap, path.join(otd, "index.json"));
 
-  await fs.writeFile(path.join(otd, "index.json"), JSON.stringify(records, null, 2), "utf8");
+  await writeJsonArray(path.join(otd, "index.json"), records);
   console.error(`[search-index] Wrote ${records.length} search records to ${otd}/index.json`);
 }
 

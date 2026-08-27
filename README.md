@@ -1,10 +1,9 @@
 # master-maps
 
-Interactive 2D WebGPU map of Auch (Gers, France) built with Next.js, React Three Fiber, and open data sources. The map renders flat building footprints, roads, water, land use, and POI markers on an orthographic camera. It has no 3D city model, no extruded buildings, and no terrain relief.
+Interactive 2D WebGPU map of the full Gers department, France, built with Next.js, React Three Fiber, and open data sources. The map renders flat building footprints, roads, water, land use, and POI markers on an orthographic camera. It has no 3D city model, no extruded buildings, and no terrain relief.
 
 ## Purpose
-
-A cartographic visualisation of Auch that uses public open-data sources to produce a verified, source-backed city map. The primary use case is exploring the city centre, identifying the Nocibé commercial zone on Avenue d'Alsace, and auditing the commercial corridor toward Place Villaret Joyeuse.
+A cartographic visualisation of Gers that uses public open-data sources to produce a verified, source-backed department map. Auch remains the primary regression area for commercial search, landmark selection, and corridor audits.
 
 ## Visual mode
 
@@ -62,15 +61,20 @@ src/
     map.ts               MapFeature discriminated union types
 scripts/data/
   refresh.ts             full acquisition and generation pipeline
-  discover-auch-boundary.ts geo.api.gouv.fr commune boundary
-  fetch-osm.ts           Overpass queries (roads, buildings, POIs)
+  discover-auch-boundary.ts compatibility entrypoint for the Gers boundary
+  fetch-admin-express.ts IGN Admin Express COG department boundary
+  fetch-bdtopo.ts        IGN BD TOPO GeoPackage layer exports
+  fetch-osm.ts           Geofabrik extract and Overpass enrichment
   fetch-addresses.ts     Base Adresse Nationale (BAN) records
   fetch-businesses.ts    SIRENE, Annuaire des Entreprises, PagesJaunes
   fetch-ign.ts           IGN Geoplateforme WFS layers
   normalize.ts           raw-source to typed features
+  normalizeBdtopo.ts     BD TOPO geometry normalization
+  normalizeOsmBulk.ts    bulk OSM geometry normalization
   deduplicate.ts         stable-ID deduplication
-  build-tiles.ts         tile budget and generation
+  build-tiles.ts         LOD tile generation and clipping
   build-search-index.ts  accent-insensitive search index
+  qa-spatial.ts          CRS and source-to-render diagnostics
   validate.ts            data validation
 tests/
   unit/                  unit tests (projection, bounds, tiling)
@@ -79,7 +83,7 @@ tests/
   visual/                visual-state matrix definitions
   fixtures/              checked-in test fixtures
   artifacts/             ignored test output (screenshots, traces)
-data/                    ignored city data volume
+data/                    ignored department data volume
   raw/                   downloaded source responses
   intermediate/          transformed records
   generated/             tiles, manifest, search index, coverage

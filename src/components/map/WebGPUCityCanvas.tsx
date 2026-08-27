@@ -21,12 +21,15 @@ interface RendererContract {
 export interface WebGPUCityCanvasProps {
   children: ReactNode;
   bounds?: [number, number, number, number];
-  /** Local [x, z] coordinate to focus the camera on; set to request a move. */
   cameraFocus?: { x: number; z: number } | null;
-  /** Incrementing counter — each change triggers a reset to the full-commune view. */
   cameraReset?: number;
-  /** Fired once a requested cameraFocus has been dispatched to the camera. */
   onCameraMoved?: () => void;
+  onViewportChange?: (snapshot: {
+    target: [number, number];
+    zoom: number;
+    width: number;
+    height: number;
+  }) => void;
 }
 
 const DEFAULT_BOUNDS: [number, number, number, number] = [0, -3000, 3000, 0];
@@ -42,6 +45,7 @@ export default function WebGPUCityCanvas({
   cameraFocus,
   cameraReset,
   onCameraMoved,
+  onViewportChange,
 }: WebGPUCityCanvasProps) {
   const [gpuStatus, setGpuStatus] = useState<"checking" | "supported" | "unsupported">("checking");
   const [initError, setInitError] = useState<string | null>(null);
@@ -180,7 +184,12 @@ export default function WebGPUCityCanvas({
         frameloop="always"
         style={{ display: "block", width: "100%", height: "100%" }}
       >
-        <CameraRig ref={cameraRigRef} communeBounds={sceneBounds} cameraHeight={CAMERA_HEIGHT} />
+        <CameraRig
+          ref={cameraRigRef}
+          communeBounds={sceneBounds}
+          cameraHeight={CAMERA_HEIGHT}
+          onViewportChange={onViewportChange}
+        />
         {children}
       </Canvas>
     </div>

@@ -9,20 +9,22 @@
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "test": "npm run test:unit && npm run test:integration",
-    "test:unit": "vitest run tests/unit",
     "test:integration": "vitest run tests/integration",
     "test:e2e": "tsx scripts/moli/run-e2e.ts",
+    "data": "tsx scripts/data/refresh.ts",
     "data:refresh": "tsx scripts/data/refresh.ts",
     "data:validate": "tsx scripts/data/validate.ts",
+    "data:qa": "tsx scripts/data/qa-spatial.ts",
     "data:build": "tsx scripts/data/refresh.ts --offline"
   },
   "dependencies": {
+    "@react-three/drei": "10.7.8",
+    "@react-three/fiber": "9.7.0",
     "next": "16.3.3",
+    "proj4": "^2.21.0",
     "react": "19.2.8",
     "react-dom": "19.2.8",
     "three": "0.185.1",
-    "@react-three/fiber": "9.7.0",
-    "@react-three/drei": "10.7.8",
     "zod": "4.4.3"
   },
   "devDependencies": {

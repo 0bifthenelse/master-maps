@@ -45,9 +45,16 @@ export interface MapCameraProps {
 }
 
 const DAMPING = 0.08;
-// Corrected default: 180-degree reversal from previous [ -PI/2, 0, PI ] -> [ -PI/2, 0, 0 ]
-const NORTH_UP_ROTATION: [number, number, number] = [-Math.PI / 2, 0, 0];
-const ROTATION_SENSITIVITY = 0.005; // radians per pixel of horizontal drag
+const CAMERA_TOP_DOWN_PITCH = -Math.PI / 2;
+const ROTATION_SENSITIVITY = 0.005;
+
+/** Three's right-handed top-down basis maps +Z to screen down at zero roll.
+ * Flip only NDC-Y in the orthographic projection so +X remains screen-right
+ * and +Z remains screen-up without mutating geographic geometry. */
+export function updateNorthUpProjection(camera: THREE.OrthographicCamera): void {
+  camera.updateProjectionMatrix();
+  camera.projectionMatrix.elements[5] *= -1;
+}
 
 export const MapCamera = forwardRef<CameraHandle, MapCameraProps>(
   (
@@ -98,7 +105,7 @@ export const MapCamera = forwardRef<CameraHandle, MapCameraProps>(
         camera.top = (fh / 2) * pad;
         camera.bottom = (-fh / 2) * pad;
         camera.zoom = zoom;
-        camera.updateProjectionMatrix();
+        updateNorthUpProjection(camera);
         return camera;
       },
       [communeBounds, size],
@@ -126,7 +133,7 @@ export const MapCamera = forwardRef<CameraHandle, MapCameraProps>(
         const heading = headingRef.current;
         camera.up.set(0, 1, 0);
         camera.position.set(targetX, cameraHeight, targetZ);
-        camera.rotation.set(-Math.PI / 2, 0, heading);
+        camera.rotation.set(CAMERA_TOP_DOWN_PITCH, 0, heading);
         camera.updateMatrixWorld();
 
         const controls = get().controls as MapControlsImpl | null;
@@ -134,7 +141,7 @@ export const MapCamera = forwardRef<CameraHandle, MapCameraProps>(
           controls.target.set(targetX, 0, targetZ);
           controls.update();
           camera.position.set(targetX, cameraHeight, targetZ);
-          camera.rotation.set(-Math.PI / 2, 0, heading);
+          camera.rotation.set(CAMERA_TOP_DOWN_PITCH, 0, heading);
           camera.updateMatrixWorld();
         }
       },
@@ -190,7 +197,7 @@ export const MapCamera = forwardRef<CameraHandle, MapCameraProps>(
         headingRef.current = newHeading;
         const cam = cameraRef.current;
         if (cam) {
-          cam.rotation.set(-Math.PI / 2, 0, newHeading);
+          cam.rotation.set(CAMERA_TOP_DOWN_PITCH, 0, newHeading);
           cam.updateMatrixWorld();
         }
       };
@@ -260,7 +267,7 @@ export const MapCamera = forwardRef<CameraHandle, MapCameraProps>(
           camera.top = nfh / 2;
           camera.bottom = -nfh / 2;
           camera.zoom = 1;
-          camera.updateProjectionMatrix();
+          updateNorthUpProjection(camera);
           desiredZoom.current = 1;
         }
 
@@ -293,7 +300,7 @@ export const MapCamera = forwardRef<CameraHandle, MapCameraProps>(
       if (!camera) return;
 
       const applyHeading = () => {
-        camera.rotation.set(-Math.PI / 2, 0, headingRef.current);
+        camera.rotation.set(CAMERA_TOP_DOWN_PITCH, 0, headingRef.current);
         camera.updateMatrixWorld();
       };
 
@@ -335,7 +342,7 @@ export const MapCamera = forwardRef<CameraHandle, MapCameraProps>(
       const zDelta = desiredZoom.current - camera.zoom;
       if (Math.abs(zDelta) > 0.01) {
         camera.zoom += zDelta * DAMPING;
-        camera.updateProjectionMatrix();
+        updateNorthUpProjection(camera);
       }
       applyHeading();
     });
@@ -381,7 +388,7 @@ export const MapCamera = forwardRef<CameraHandle, MapCameraProps>(
         ref={cameraRef}
         position={[centreX, cameraHeight, centreZ] as [number, number, number]}
         up={[0, 1, 0]}
-        rotation={NORTH_UP_ROTATION}
+        rotation={[CAMERA_TOP_DOWN_PITCH, 0, 0]}
         zoom={initialZoom}
         near={1}
         far={cameraHeight * 4}

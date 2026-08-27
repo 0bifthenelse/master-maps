@@ -1,5 +1,5 @@
 /**
- * fetch-businesses.ts — acquire business records for Auch (32013).
+ * fetch-businesses.ts — department-wide business acquisition for Gers (32).
  *
  * Sources:
  *   1. Annuaire des Entreprises / SIRENE (recherche-entreprises.api.gouv.fr)
@@ -62,7 +62,7 @@ interface SireneRawFile {
   sourceUrl: string;
   version: string;
   license: string;
-  commune: { code: string; name: string };
+  department: { code: string; name: string };
   acquiredAt: string;
   totalQueries: number;
   totalUniqueRecords: number;
@@ -77,7 +77,7 @@ interface OsmRawFile {
   sourceName: string;
   sourceUrls: string[];
   license: string;
-  commune: { code: string; name: string };
+  department: { code: string; name: string };
   bbox: { west: number; east: number; south: number; north: number };
   queryText: string;
   acquiredAt: string;
@@ -156,15 +156,13 @@ export interface FetchBusinessesResult {
   rawFiles: string[];
 }
 
-// ── Constants ──────────────────────────────────────────────────────────────
-
-const INSEE_CODE = "32013";
-const COMMUNE_NAME = "Auch";
+const DEPARTMENT_CODE = GERS_TERRITORY.code;
+const TERRITORY_NAME = GERS_TERRITORY.name;
 const BBOX = {
-  west: 0.486087 as const,
-  east: 0.647019 as const,
-  south: 43.617419 as const,
-  north: 43.707701 as const,
+  west: GERS_TERRITORY.bootstrapBbox[0],
+  east: GERS_TERRITORY.bootstrapBbox[2],
+  south: GERS_TERRITORY.bootstrapBbox[1],
+  north: GERS_TERRITORY.bootstrapBbox[3],
 } as const;
 
 const USER_AGENT =
@@ -218,6 +216,7 @@ import { access, mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { GERS_TERRITORY } from "../../src/lib/data/territory";
 
 /** Get a human-readable message from an unknown error. */
 function errMsg(e: unknown): string {
@@ -500,8 +499,8 @@ async function moliAvailable(): Promise<boolean> {
 
 /**
  * Parse a SIRENE "entreprises result" (from recherche-entreprises JSON) into an
- * extracted business record focusing on the local Auch establishment.
- * Uses `matching_etablissements[0]` when available for local coordinates/address.
+ * extracted business record focusing on the selected department establishment.
+ * Uses the first matching establishment or falls back to the registered head office.
  */
 function extractSireneRecord(
   apiResult: Record<string, unknown>,
@@ -571,11 +570,11 @@ async function querySirene(
 }
 
 /**
- * Acquire all SIRENE / Annuaire records for Auch.
+ * Acquire all SIRENE / Annuaire records for Gers department 32.
  *
  * Strategy:
- *   1. Paginated commune-wide scan (q='', commune=32013, per_page=25, page=1..N).
- *   2. Targeted name queries for known leads (NOCIBE, FANTOCHE, CRU).
+ *   1. Paginated department-wide scan with `departement=32`.
+ *   2. Targeted name queries for known regression leads.
  *
  * Returns the assembled raw file data plus metadata.
  */
@@ -602,7 +601,7 @@ async function acquireSirene(
     // First page to get total_results
     const first = await querySirene({
       q: "",
-      commune: INSEE_CODE,
+      departement: DEPARTMENT_CODE,
       per_page: perPage,
       page: 1,
     });
@@ -621,8 +620,8 @@ async function acquireSirene(
     }
 
     queries.push({
-      query: { q: "", commune: INSEE_CODE, per_page: perPage, page: 1 },
-      url: `${ANNIAURE_BASE}/search?q=&commune=${INSEE_CODE}&per_page=${perPage}&page=1`,
+      query: { q: "", departement: DEPARTMENT_CODE, per_page: perPage, page: 1 },
+      url: `${ANNIAURE_BASE}/search?q=&departement=${DEPARTMENT_CODE}&per_page=${perPage}&page=1`,
       status: "ok",
       httpStatus: first.status,
       sha256: first.sha256,
@@ -645,7 +644,7 @@ async function acquireSirene(
       try {
         const pageResult = await querySirene({
           q: "",
-          commune: INSEE_CODE,
+          departement: DEPARTMENT_CODE,
           per_page: perPage,
           page,
         });
@@ -657,8 +656,8 @@ async function acquireSirene(
         }
 
         queries.push({
-          query: { q: "", commune: INSEE_CODE, per_page: perPage, page },
-          url: `${ANNIAURE_BASE}/search?q=&commune=${INSEE_CODE}&per_page=${perPage}&page=${page}`,
+          query: { q: "", departement: DEPARTMENT_CODE, per_page: perPage, page },
+          url: `${ANNIAURE_BASE}/search?q=&departement=${DEPARTMENT_CODE}&per_page=${perPage}&page=${page}`,
           status: "ok",
           httpStatus: pageResult.status,
           sha256: pageResult.sha256,
@@ -669,13 +668,13 @@ async function acquireSirene(
         failures.push({
           step: "sirene-commune-pagination",
           source: "recherche-entreprises.api.gouv.fr",
-          url: `${ANNIAURE_BASE}/search?q=&commune=${INSEE_CODE}&per_page=${perPage}&page=${page}`,
+          url: `${ANNIAURE_BASE}/search?q=&departement=${DEPARTMENT_CODE}&per_page=${perPage}&page=${page}`,
           error: errMsg(err),
           severity: "warning",
         });
         queries.push({
-          query: { q: "", commune: INSEE_CODE, per_page: perPage, page },
-          url: `${ANNIAURE_BASE}/search?q=&commune=${INSEE_CODE}&per_page=${perPage}&page=${page}`,
+          query: { q: "", departement: DEPARTMENT_CODE, per_page: perPage, page },
+          url: `${ANNIAURE_BASE}/search?q=&departement=${DEPARTMENT_CODE}&per_page=${perPage}&page=${page}`,
           status: "error",
           error: errMsg(err),
           recordCount: 0,
@@ -689,7 +688,7 @@ async function acquireSirene(
     failures.push({
       step: "sirene-commune-initial",
       source: "recherche-entreprises.api.gouv.fr",
-      url: `${ANNIAURE_BASE}/search?q=&commune=${INSEE_CODE}&per_page=25&page=1`,
+      url: `${ANNIAURE_BASE}/search?q=&departement=${DEPARTMENT_CODE}&per_page=25&page=1`,
       error: msg,
       severity: "error",
     });
@@ -710,7 +709,7 @@ async function acquireSirene(
     try {
       const result = await querySirene({
         q: nq.q,
-        commune: INSEE_CODE,
+        departement: DEPARTMENT_CODE,
         per_page: 25,
         page: 1,
       });
@@ -751,8 +750,8 @@ async function acquireSirene(
       }
 
       queries.push({
-        query: { q: nq.q, commune: INSEE_CODE, per_page: 25, page: 1 },
-        url: `${ANNIAURE_BASE}/search?q=${nq.q}&commune=${INSEE_CODE}&per_page=25&page=1`,
+        query: { q: nq.q, departement: DEPARTMENT_CODE, per_page: 25, page: 1 },
+        url: `${ANNIAURE_BASE}/search?q=${nq.q}&departement=${DEPARTMENT_CODE}&per_page=25&page=1`,
         status: "ok",
         httpStatus: result.status,
         sha256: result.sha256,
@@ -763,13 +762,13 @@ async function acquireSirene(
       failures.push({
         step: `sirene-targeted-query-${nq.label}`,
         source: "recherche-entreprises.api.gouv.fr",
-        url: `${ANNIAURE_BASE}/search?q=${nq.q}&commune=${INSEE_CODE}&per_page=25&page=1`,
+        url: `${ANNIAURE_BASE}/search?q=${nq.q}&departement=${DEPARTMENT_CODE}&per_page=25&page=1`,
         error: errMsg(err),
         severity: "warning",
       });
       queries.push({
-        query: { q: nq.q, commune: INSEE_CODE, per_page: 25, page: 1 },
-        url: `${ANNIAURE_BASE}/search?q=${nq.q}&commune=${INSEE_CODE}&per_page=25&page=1`,
+        query: { q: nq.q, departement: DEPARTMENT_CODE, per_page: 25, page: 1 },
+        url: `${ANNIAURE_BASE}/search?q=${nq.q}&departement=${DEPARTMENT_CODE}&per_page=25&page=1`,
         status: "error",
         error: errMsg(err),
         recordCount: 0,
@@ -795,7 +794,7 @@ async function acquireSirene(
     sourceUrl: ANNIAURE_BASE,
     version: "2.6",
     license: SIRENE_LICENSE,
-    commune: { code: INSEE_CODE, name: COMMUNE_NAME },
+    department: { code: DEPARTMENT_CODE, name: TERRITORY_NAME },
     acquiredAt: new Date().toISOString(),
     totalQueries: queries.length,
     totalUniqueRecords: uniqueRecords.length,
@@ -807,7 +806,7 @@ async function acquireSirene(
   const sourceEntry: SourceManifestEntry = {
     source: `recherche-entreprises.api.gouv.fr (${SIRENE_LICENSE})`,
     url: `${ANNIAURE_BASE}/search`,
-    query: `q=&commune=${INSEE_CODE}&per_page=${perPage}`,
+    query: `q=&departement=${DEPARTMENT_CODE}&per_page=${perPage}`,
     acquiredAt: rawFile.acquiredAt,
     license: SIRENE_LICENSE,
     recordCount: uniqueRecords.length,
@@ -939,7 +938,7 @@ async function acquireOsmBusiness(
       sourceName: "OpenStreetMap (Overpass API)",
       sourceUrls: [...OVERPASS_ENDPOINTS],
       license: OSM_LICENSE,
-      commune: { code: INSEE_CODE, name: COMMUNE_NAME },
+      department: { code: DEPARTMENT_CODE, name: TERRITORY_NAME },
       bbox: { ...BBOX },
       queryText,
       acquiredAt: new Date().toISOString(),
@@ -975,7 +974,7 @@ async function acquireOsmBusiness(
     sourceName: "OpenStreetMap (Overpass API)",
     sourceUrls: [...OVERPASS_ENDPOINTS],
     license: OSM_LICENSE,
-    commune: { code: INSEE_CODE, name: COMMUNE_NAME },
+    department: { code: DEPARTMENT_CODE, name: TERRITORY_NAME },
     bbox: { ...BBOX },
     queryText,
     acquiredAt: new Date().toISOString(),

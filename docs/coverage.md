@@ -1,50 +1,25 @@
-# Coverage Report — Auch 2D WebGPU Map
+# Gers coverage
 
-**Generated from:** `data/manifests/coverage.json` after a successful data refresh.
+Master Maps production coverage is the Gers department, code 32. Auch anchors remain regression checks, not the dataset boundary.
 
-## Status: DATA REFRESH NOT YET COMPLETE
+## Spatial coverage
 
-The automated data refresh (`npm run data:refresh`) has been attempted but cannot complete due to inter-script coordination gaps (parallel agent execution). Boundary discovery succeeded but subsequent scripts fail to locate the output.
+The boundary comes from IGN Admin Express COG. The current stored response is a complete MultiPolygon in EPSG:4326. The pipeline preserves all components and holes.
 
-## Manual Refresh Instructions
+IGN BD TOPO provides canonical buildings, roads, hydrographic surfaces, and hydrographic segments in Lambert-93 source data. The client receives clipped fragments from detailed 2048 metre tiles and coarser 8192 metre and 32768 metre levels.
 
-To acquire real data, run the following sequence:
+OpenStreetMap via Geofabrik provides regional enrichment. BAN provides all department addresses inside the authoritative boundary. SIRENE provides department business identity.
 
-```bash
-# 1. Discover Auch boundary
-npx tsx scripts/data/discover-auch-boundary.ts
+## Regression anchors
 
-# 2. Fetch OSM data (requires working overpass-api.de)
-npx tsx scripts/data/fetch-osm.ts
+The fixture `tests/fixtures/auch-landmark-anchors.json` preserves Gare d'Auch, Cathédrale Sainte-Marie, Boulevard Sadi Carnot, Avenue d'Alsace, and related Auch references. `tests/fixtures/gers-landmark-anchors.json` adds Condom, Lectoure, Fleurance, Eauze, Vic-Fezensac, Mirande, Marciac, Nogaro, Samatan, and L'Isle-Jourdain.
 
-# 3. Fetch BAN addresses
-npx tsx scripts/data/fetch-addresses.ts
+## Verification
 
-# 4. Fetch business records
-npx tsx scripts/data/fetch-businesses.ts
+`npx tsx scripts/data/qa-spatial.ts` writes the spatial report. It checks EPSG:2154 round trips, source-to-render residuals, and stable-ID tile fragments. Unit tests check CRS conversion, MultiPolygon preservation, tile-edge clipping, tessellation joins, and north-up screen projection.
 
-# 5. Fetch IGN terrain (may report unavailable)
-npx tsx scripts/data/fetch-ign.ts
+Google Maps can corroborate relationships around Auch during visual review. Google geometry, tiles, imagery, and bulk Places data do not enter the repository.
 
-# 6. Normalize and generate tiles
-npx tsx scripts/data/refresh.ts --offline
-```
+## Known source limits
 
-## Required Coverage Metrics
-
-After a successful refresh, `data/manifests/coverage.json` will contain:
-
-| Metric | Expected |
-|--------|----------|
-| Dataset version | 0.1.0 |
-| Boundary | Auch (INSEE 32013) |
-| Bounding box | 0.486087,43.617419 to 0.647019,43.707701 |
-| Sources | OSM, geo.api.gouv.fr, BAN, IGN, SIRENE |
-| Nocibé | 28 avenue d'Alsace, BAN ID 32013_0050_00028 |
-
-## Known Gaps
-
-- Inter-script data path coordination (boundary source → OSM consumer)
-- IGN terrain unavailability expected (recorded gracefully)
-- Official Nocibé pages may crash Moli (recorded limitation)
-- Place Villaret Joyeuse commercial gallery name unresolved
+IGN, BAN, SIRENE, and OSM are independently maintained datasets. Their names, update times, classification fields, and object segmentation can differ. The software records those differences and applies field-specific precedence. It does not claim that independent sources always equal Google Maps.

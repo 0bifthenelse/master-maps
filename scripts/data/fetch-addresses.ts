@@ -1,7 +1,7 @@
 /**
  * @file fetch-addresses.ts
- * Fetches BAN (Base Adresse Nationale) address data for department 32 (Gers),
- * filters by commune code 32013 (Auch) and the commune boundary polygon.
+ * Fetches BAN addresses for every commune in Gers department 32, retaining
+ * only positions inside the complete authoritative department boundary.
  *
  * BAN bulk data: https://adresse.data.gouv.fr/data/ban/adresses/latest/csv/
  * Department 32 CSV: adresses-32.csv.gz (semicolon-delimited, gzip-compressed)
@@ -21,13 +21,13 @@
  * Also writes to data/manifests/sources.json the acquisition metadata.
  */
 
-import { writeFile, mkdir } from "node:fs/promises";
+import { writeFile, mkdir, readFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { createGunzip } from "node:zlib";
 import { Readable } from "node:stream";
 import * as path from "node:path";
 import * as readline from "node:readline/promises";
-
+import { GERS_TERRITORY } from "../../src/lib/data/territory";
 /**
  * MASTER_MAPS_DATA_DIR - configured data root, defaults to "data"
  */
@@ -40,16 +40,11 @@ const DATA_DIR = process.env.MASTER_MAPS_DATA_DIR ?? "data";
 const BAN_CSV_GZ_URL =
   "https://adresse.data.gouv.fr/data/ban/adresses/latest/csv/adresses-32.csv.gz";
 
-/**
- * Geo API commune contour endpoint
- */
-const GEO_API_COMMUNE_URL =
-  "https://geo.api.gouv.fr/communes/32013?fields=contour&format=geojson&geometry=contour";
 
 /**
- * Known local boundary file (produced by discover-auch-boundary.ts)
+ * Authoritative department boundary file produced by fetch-admin-express.ts.
  */
-const BOUNDARY_RAW_PATH = path.join(DATA_DIR, "raw", "auch-boundary.geojson");
+const BOUNDARY_RAW_PATH = path.join(DATA_DIR, "raw", GERS_TERRITORY.boundaryRawFile);
 
 /**
  * Output paths
@@ -61,10 +56,6 @@ const SOURCES_MANIFEST_PATH = path.join(
   "sources.json",
 );
 
-/**
- * INSEE code for Auch
- */
-const AUCH_INSEE = "32013";
 
 /**
  * Known BAN license string
@@ -72,13 +63,9 @@ const AUCH_INSEE = "32013";
  */
 const BAN_LICENSE = "Etalab-2.0";
 
-/**
- * Boundary shape (simple polygon ring, lon/lat pairs).
- * GeoJSON Polygon: coordinates[0] = outer ring, coordinates[1..n] = holes.
- */
 interface Boundary {
-  type: "Polygon";
-  coordinates: number[][][];
+  type: "Polygon" | "MultiPolygon";
+  coordinates: number[][][] | number[][][][];
 }
 
 /**
@@ -150,49 +137,22 @@ interface SourceManifestEntry {
 // ---------------------------------------------------------------------------
 
 /**
- * Load the Auch commune boundary polygon.
- * Tries cached raw boundary file first, then fetches from geo.api.gouv.fr.
+ * Load the complete Admin Express COG department boundary. Missing or
+ * malformed authoritative geometry is a hard acquisition failure.
  */
 async function loadBoundary(): Promise<Boundary> {
-  // Try cached file produced by discover-auch-boundary.ts
-  try {
-    const { readFile } = await import("node:fs/promises");
-    const cached = await readFile(BOUNDARY_RAW_PATH, "utf-8");
-    const parsed = JSON.parse(cached);
-    // Accept either Feature with geometry or direct Polygon
-    const geom = parsed?.geometry ?? parsed;
-    if (geom?.type === "Polygon") {
-      return geom as Boundary;
-    }
-    // If MultiPolygon, take the largest ring-set for filtering
-    if (geom?.type === "MultiPolygon") {
-      const polys = geom.coordinates as number[][][][];
-      const largest = polys.reduce((a: number[][][], b: number[][][]) =>
-        b[0]!.length > a[0]!.length ? b : a,
-      );
-      return { type: "Polygon", coordinates: largest };
-    }
-  } catch {
-    // File missing or unreadable
-  }
-
-  // Fetch from API
-  const res = await fetch(GEO_API_COMMUNE_URL);
-  if (!res.ok) {
-    throw new Error(
-      `Failed to fetch commune boundary: ${res.status} ${res.statusText}`,
-    );
-  }
-  const data = (await res.json()) as {
-    type: string;
-    geometry: Boundary;
+  const cached = await readFile(BOUNDARY_RAW_PATH, "utf8");
+  const parsed = JSON.parse(cached) as {
+    geometry?: Boundary;
+    features?: Array<{ geometry?: Boundary }>;
+    type?: string;
   };
-  if (data?.geometry?.type !== "Polygon") {
-    throw new Error(
-      `Unexpected boundary geometry type: ${data?.geometry?.type}`,
-    );
+  const geometry = parsed.features?.[0]?.geometry ?? parsed.geometry
+    ?? (parsed.type === "Polygon" || parsed.type === "MultiPolygon" ? parsed as unknown as Boundary : undefined);
+  if (!geometry || (geometry.type !== "Polygon" && geometry.type !== "MultiPolygon")) {
+    throw new Error(`Invalid Gers boundary in ${BOUNDARY_RAW_PATH}`);
   }
-  return data.geometry as Boundary;
+  return geometry;
 }
 
 // ---------------------------------------------------------------------------
@@ -241,61 +201,47 @@ function pointInRing(
   return inside;
 }
 
-/**
- * Check if a WGS84 point [lon, lat] is inside a Polygon (with holes).
- * Point must be inside outer ring and outside all inner rings.
- */
-function pointInPolygon(
-  point: readonly [number, number],
-  polygon: Boundary,
-): boolean {
-  const outerRing = polygon.coordinates[0]!;
-  if (!pointInRing(point, outerRing)) {
-    return false;
-  }
-  // Check holes (inner rings)
-  for (let i = 1; i < polygon.coordinates.length; i++) {
-    const innerRing = polygon.coordinates[i]!;
-    if (pointInRing(point, innerRing)) {
-      return false;
-    }
+type PolygonRings = number[][][];
+
+function pointInPolygon(point: readonly [number, number], rings: PolygonRings): boolean {
+  const outerRing = rings[0];
+  if (!outerRing || !pointInRing(point, outerRing)) return false;
+  for (const innerRing of rings.slice(1)) {
+    if (pointInRing(point, innerRing)) return false;
   }
   return true;
 }
 
-// ---------------------------------------------------------------------------
-// CSV parsing
-// ---------------------------------------------------------------------------
+function pointInBoundary(point: readonly [number, number], boundary: Boundary): boolean {
+  const polygons: PolygonRings[] = boundary.type === "Polygon"
+    ? [boundary.coordinates]
+    : boundary.coordinates;
+  return polygons.some((rings) => pointInPolygon(point, rings));
+}
 
-/**
- * Parse a semicolon-delimited CSV line into fields.
- * Handles quoted fields with RFC 4180 basic escaping ("" -> ").
- */
 function parseCsvLine(line: string): string[] {
   const fields: string[] = [];
   let current = "";
   let inQuotes = false;
-
-  for (let i = 0; i < line.length; i++) {
-    const ch = line[i]!;
-    if (ch === '"') {
-      if (inQuotes && line[i + 1] === '"') {
-        current += '"';
-        i++;
+  for (let index = 0; index < line.length; index += 1) {
+    const character = line[index];
+    if (character === "\"") {
+      if (inQuotes && line[index + 1] === "\"") {
+        current += "\"";
+        index += 1;
       } else {
         inQuotes = !inQuotes;
       }
-    } else if (ch === ";" && !inQuotes) {
+    } else if (character === ";" && !inQuotes) {
       fields.push(current);
       current = "";
     } else {
-      current += ch;
+      current += character;
     }
   }
   fields.push(current);
   return fields;
 }
-
 /**
  * Map parsed CSV fields to BanCsvRow by numerical index.
  *
@@ -371,7 +317,6 @@ async function acquireAddresses(): Promise<{
   acquisitionTimestamp: string;
   etag: string;
   totalInDepartment: number;
-  totalInAuch: number;
   totalInBoundary: number;
 }> {
   // 1. Download BAN CSV.gz for department 32
@@ -394,7 +339,7 @@ async function acquireAddresses(): Promise<{
   const compressedBuffer = Buffer.from(arrayBuffer);
 
   // 2. Load boundary polygon
-  console.log("Loading Auch commune boundary...");
+  console.log("Loading Gers department boundary...");
   const boundary = await loadBoundary();
 
   // 3. Decompress and parse CSV line-by-line
@@ -412,7 +357,6 @@ async function acquireAddresses(): Promise<{
   let headerParsed = false;
   const allAddresses: AddressRecord[] = [];
   let totalDepartment = 0;
-  let totalAuch = 0;
   let totalInBoundary = 0;
 
   for await (const rawLine of rl) {
@@ -429,11 +373,8 @@ async function acquireAddresses(): Promise<{
     const row = parseCsvRow(fields);
     totalDepartment++;
 
-    // Filter by INSEE code 32013
-    if (row.codeInsee !== AUCH_INSEE) {
-      continue;
-    }
-    totalAuch++;
+    // BAN already supplies the complete department. Boundary containment is
+    // the final geographic guard and works across every polygon component.
 
     // Filter by boundary polygon
     const lon = Number.parseFloat(row.lon);
@@ -442,7 +383,7 @@ async function acquireAddresses(): Promise<{
       continue;
     }
 
-    if (!pointInPolygon([lon, lat], boundary)) {
+    if (!pointInBoundary([lon, lat], boundary)) {
       continue;
     }
     totalInBoundary++;
@@ -454,16 +395,13 @@ async function acquireAddresses(): Promise<{
   const sha256Hex = hash.digest("hex");
 
   console.log(`Department 32 total CSV rows: ${totalDepartment}`);
-  console.log(`Auch (32013) total: ${totalAuch}`);
-  console.log(`Within boundary polygon: ${totalInBoundary}`);
-
+  console.log(`Within Gers boundary: ${totalInBoundary}`);
   return {
     records: allAddresses,
     sha256: sha256Hex,
     acquisitionTimestamp,
     etag,
     totalInDepartment: totalDepartment,
-    totalInAuch: totalAuch,
     totalInBoundary: totalInBoundary,
   };
 }
@@ -524,16 +462,13 @@ async function main(): Promise<void> {
   // Write raw JSON output
   const outputPayload = {
     dataset: "ban",
-    department: "32",
-    inseeCode: AUCH_INSEE,
-    commune: "Auch",
+    department: GERS_TERRITORY.code,
     acquisitionTimestamp: result.acquisitionTimestamp,
     license: BAN_LICENSE,
     sourceUrl: BAN_CSV_GZ_URL,
     recordCount: result.records.length,
     stats: {
       departmentTotal: result.totalInDepartment,
-      auchTotal: result.totalInAuch,
       boundaryFiltered: result.totalInBoundary,
     },
     addresses: result.records,
@@ -553,10 +488,9 @@ async function main(): Promise<void> {
     source: "ban",
     url: BAN_CSV_GZ_URL,
     parameters: {
-      department: "32",
+      department: GERS_TERRITORY.code,
       format: "csv",
-      inseeFilter: AUCH_INSEE,
-      boundaryFilter: "geo.api.gouv.fr commune contour",
+      boundaryFilter: "IGN ADMIN EXPRESS COG department geometry",
     },
     timestamp: result.acquisitionTimestamp,
     license: BAN_LICENSE,

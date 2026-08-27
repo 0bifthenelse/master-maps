@@ -38,6 +38,7 @@ import { buildTilesAll } from "./build-tiles";
 import { buildIndexAll } from "./build-search-index";
 import { validate } from "./validate";
 import { deduplicateOsmElements, isOsmElement } from "./osmRelations";
+import { GERS_TERRITORY } from "../../src/lib/data/territory";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -127,19 +128,22 @@ async function runScript(scriptName: string, extraArgs: string[] = []): Promise<
 }
 
 async function phaseDiscoverBoundary(offline: boolean): Promise<void> {
+  const boundaryPath = path.join(RAW_DIR, "gers-boundary.geojson");
   if (offline) {
-    for (const name of ["boundary.geojson", "auch-boundary.geojson"]) {
-      try {
-        await fs.access(path.join(RAW_DIR, name));
-        console.error(`[refresh] Offline: boundary data present (${name})`);
-        return;
-      } catch {
-        // try next candidate name
-      }
-    }
-    throw new Error("Offline mode requires raw/boundary.geojson or raw/auch-boundary.geojson — not found");
+    await fs.access(boundaryPath);
+    console.error("[refresh] Offline: Gers boundary present");
+    return;
   }
-  await withRetry(() => runScript("discover-auch-boundary.ts"), "discover-boundary");
+  await withRetry(() => runScript("fetch-admin-express.ts"), "fetch-admin-express");
+}
+
+async function phaseFetchBdtopo(offline: boolean): Promise<void> {
+  if (offline) {
+    await fs.access(path.join(INTERMEDIATE_DIR, "bdtopo-manifest.json"));
+    console.error("[refresh] Offline: BD TOPO manifest present");
+    return;
+  }
+  await withRetry(() => runScript("fetch-bdtopo.ts"), "fetch-bdtopo", 2, 2000);
 }
 
 /**
@@ -148,29 +152,35 @@ async function phaseDiscoverBoundary(offline: boolean): Promise<void> {
  * files when available; a previously written osm.json is left untouched.
  */
 async function phaseMergeOsm(): Promise<void> {
+  const osmPath = path.join(RAW_DIR, "osm.json");
+  try {
+    await fs.access(path.join(RAW_DIR, "osm-bulk.geojson"));
+    console.error("[refresh] Bulk OSM has priority over cached Overpass dumps");
+    try { await fs.unlink(path.join(INTERMEDIATE_DIR, "osm-manifest.json")); } catch { /* no stale manifest */ }
+    return;
+  } catch {
+    // Use bounded Overpass theme data only when bulk data is unavailable.
+  }
   const themeFiles: string[] = [];
   try {
     const dir = await fs.readdir(RAW_DIR, { withFileTypes: true });
     for (const entry of dir) {
-      if (entry.isFile() && /^osm-[^/]+\.json$/.test(entry.name)) {
-        themeFiles.push(entry.name);
-      }
+      if (entry.isFile() && /^osm-[^/]+\.json$/.test(entry.name)) themeFiles.push(entry.name);
     }
   } catch {
-    themeFiles.length = 0;
+    throw new Error("Cannot inspect raw OSM directory");
   }
-
-  const osmPath = path.join(RAW_DIR, "osm.json");
   if (themeFiles.length === 0) {
     try {
-      await fs.access(osmPath);
-      console.error("[refresh] merge-osm: no per-theme files, existing osm.json present");
+      await fs.access(path.join(RAW_DIR, "osm-bulk.geojson"));
+      console.error("[refresh] Bulk OSM GeoJSON present; no Overpass merge required");
       return;
     } catch {
-      throw new Error("No Overpass theme files in raw/ — cannot build osm.json");
+      await fs.access(osmPath);
+      console.error("[refresh] Existing OSM JSON present");
+      return;
     }
   }
-
   themeFiles.sort();
   const mergedElements: Record<string, unknown>[] = [];
   let recordedAt = "";
@@ -183,23 +193,9 @@ async function phaseMergeOsm(): Promise<void> {
     if (Array.isArray(content.elements)) mergedElements.push(...content.elements);
     recordedAt = content.timestamp ?? content.osm3s?.timestamp_osm_base ?? recordedAt;
   }
-
   const elements = deduplicateOsmElements(mergedElements.filter(isOsmElement));
-  await fs.writeFile(
-    osmPath,
-    JSON.stringify({
-      elements,
-      timestamp: recordedAt,
-      themeFiles,
-      queryCount: themeFiles.length,
-      rawElementCount: mergedElements.length,
-    }, null, 2),
-    "utf8",
-  );
-  console.error(
-    `[refresh] merge-osm: combined ${themeFiles.length} themes → `
-    + `${mergedElements.length} raw elements, ${elements.length} unique elements`,
-  );
+  await fs.writeFile(osmPath, JSON.stringify({ elements, timestamp: recordedAt, themeFiles, queryCount: themeFiles.length, rawElementCount: mergedElements.length }, null, 2), "utf8");
+  console.error(`[refresh] merge-osm: ${mergedElements.length} raw elements, ${elements.length} unique elements`);
 }
 async function phaseFetchOsm(offline: boolean): Promise<void> {
   if (offline) {
@@ -219,10 +215,7 @@ async function phaseFetchAddresses(offline: boolean): Promise<void> {
         return;
       } catch { /* try next */ }
     }
-    // Write a stub so normaliser doesn't fail
-    await fs.writeFile(path.join(RAW_DIR, "ban-addresses.json"), JSON.stringify({ dataset: "ban", addresses: [], license: "etalab-2.0" }), "utf8");
-    console.error("[refresh] Offline: no cached addresses — wrote stub");
-    return;
+    throw new Error("Offline mode requires raw/ban-addresses.json");
   }
   await withRetry(() => runScript("fetch-addresses.ts"), "fetch-addresses", 3, 2000);
 }
@@ -236,9 +229,7 @@ async function phaseFetchBusinesses(offline: boolean): Promise<void> {
         return;
       } catch { /* try next */ }
     }
-    await fs.writeFile(path.join(RAW_DIR, "businesses-sirene.json"), JSON.stringify({ dataset: "businesses-sirene", records: [] }), "utf8");
-    console.error("[refresh] Offline: no cached businesses — wrote stub");
-    return;
+    throw new Error("Offline mode requires raw/businesses-sirene.json");
   }
   try {
     await fs.access(path.join(scriptsDir(), "fetch-businesses.ts"));
@@ -522,6 +513,22 @@ async function writeSourceManifest(): Promise<void> {
     });
   }
 
+  for (const fileName of ["boundary-source.json", "bdtopo-manifest.json", "osm-bulk-manifest.json"]) {
+    const record = await readOptionalJson(path.join(INTERMEDIATE_DIR, fileName));
+    if (typeof record !== "object" || record === null) continue;
+    const value = record as Record<string, unknown>;
+    sources.push({
+      source: value.source ?? (fileName === "boundary-source.json" ? "IGN ADMIN EXPRESS COG" : "OpenStreetMap contributors via Geofabrik"),
+      url: value.resource,
+      edition: value.edition,
+      timestamp: value.acquisitionTime ?? value.acquiredAt,
+      license: value.license,
+      crs: value.sourceCrs ?? value.crs,
+      sha256: value.sha256 ?? value.sourceSha256,
+      recordCount: value.recordCount ?? value.featureCount ?? 0,
+      status: "ok",
+    });
+  }
   const { failed } = await failedSourceSummary();
   const uniqueSources = [...new Map(
     sources.map((source) => [
@@ -535,10 +542,10 @@ async function writeSourceManifest(): Promise<void> {
     sources: uniqueSources,
     failedSources: failed,
     transformation: {
-      projection: "local-spherical-equirectangular",
-      projectionOrigin: [0.566553, 43.66256],
-      coordinateSystem: "WGS84 → (x east, z north, y=0)",
-      geometryContract: "local [x,z] maps directly to Three.js [x,0,z]",
+      processingCrs: GERS_TERRITORY.processingCrs,
+      renderOrigin: GERS_TERRITORY.renderOriginWgs84,
+      coordinateSystem: "EPSG:2154 easting/northing relative to render origin; Three.js [x,0,z]",
+      geometryContract: "source WGS84 geometry and derived Lambert-93 render geometry are both retained",
     },
   };
   await fs.writeFile(path.join(MANIFESTS_DIR, "sources.json"), JSON.stringify(manifest, null, 2), "utf8");
@@ -565,11 +572,11 @@ async function writeCoverageReport(): Promise<void> {
     unresolved,
     failedSources: failed,
     budgets: {
-      tileCountLimit: 256,
-      maxTileBytesLimit: 750 * 1024,
+      policy: "viewport working set and per-tile byte size; no global tile-count cap",
+      maxTileBytesLimit: 8 * 1024 * 1024,
       actualTileCount: tiles.length,
       actualMaxTileBytes,
-      withinBudget: tiles.length <= 256 && actualMaxTileBytes <= 750 * 1024,
+      withinBudget: actualMaxTileBytes <= 8 * 1024 * 1024,
     },
   };
   await fs.writeFile(path.join(MANIFESTS_DIR, "coverage.json"), JSON.stringify(report, null, 2), "utf8");
@@ -580,29 +587,38 @@ async function writeGenerationManifest(): Promise<void> {
   const summary = await collectFeatureSummary();
   const tileManifest = await readOptionalJson(path.join(GENERATED_DIR, "tile-manifest.json"));
   const tiles = Array.isArray(tileManifest) ? tileManifest as Array<Record<string, unknown>> : [];
-  const boundary = await readOptionalJson(path.join(RAW_DIR, "auch-boundary.geojson"));
+  const boundary = await readOptionalJson(path.join(RAW_DIR, GERS_TERRITORY.boundaryRawFile));
   const boundaryBbox = sourceBbox(boundary);
-  if (!boundaryBbox) throw new Error("Cannot write generation manifest without a valid boundary bbox");
+  if (!boundaryBbox) throw new Error("Cannot write generation manifest without a valid Gers boundary bbox");
   const firstBounds = tiles[0]?.bounds;
-  const tileSize =
-    Array.isArray(firstBounds) && typeof firstBounds[2] === "number" && typeof firstBounds[0] === "number"
-      ? firstBounds[2] - firstBounds[0]
-      : 0;
+  const tileSize = Array.isArray(firstBounds) && typeof firstBounds[2] === "number" && typeof firstBounds[0] === "number"
+    ? firstBounds[2] - firstBounds[0] : 0;
+  const lods = [...new Set(tiles.map((tile) => Number(tile.lod ?? 0)))].sort((a, b) => a - b).map((level) => ({
+    level,
+    tileSize: level === 0 ? GERS_TERRITORY.detailedTileSize : level === 1 ? GERS_TERRITORY.regionalTileSize : GERS_TERRITORY.overviewTileSize,
+    tileCount: tiles.filter((tile) => Number(tile.lod ?? 0) === level).length,
+  }));
   const manifest = {
     version: "0.1.0",
     datasetVersion: "0.1.0",
     acquisitionTime: new Date().toISOString(),
+    territoryCode: GERS_TERRITORY.code,
+    territoryName: GERS_TERRITORY.name,
+    interchangeCrs: GERS_TERRITORY.interchangeCrs,
+    processingCrs: GERS_TERRITORY.processingCrs,
+    renderOrigin: GERS_TERRITORY.renderOriginWgs84,
     boundary: boundaryBbox,
-    projectionOrigin: [0.566553, 43.66256],
+    projectionOrigin: GERS_TERRITORY.renderOriginWgs84,
     tileSize,
     tileCount: tiles.length,
     tileBounds: tiles.map((tile) => tile.bounds),
+    lods,
     featureCounts: summary.featureCounts,
     layerAvailability: summary.layerAvailability,
     pipeline: [
-      "discover-boundary", "fetch-osm", "fetch-addresses",
-      "fetch-businesses", "fetch-ign", "normalize",
-      "deduplicate", "build-tiles", "build-search-index", "validate",
+      "fetch-admin-express", "fetch-bdtopo", "fetch-osm", "fetch-addresses",
+      "fetch-businesses", "fetch-ign", "normalize", "deduplicate", "build-tiles",
+      "build-search-index", "validate",
     ],
   };
   await fs.writeFile(path.join(GENERATED_DIR, "manifest.json"), JSON.stringify(manifest, null, 2), "utf8");
@@ -614,47 +630,35 @@ async function writeGenerationManifest(): Promise<void> {
 
 export async function refreshAll(options?: RefreshOptions): Promise<void> {
   const opts = options ?? { offline: false, forceIgn: false };
-  console.error("[refresh] Starting Auch data refresh");
+  console.error("[refresh] Starting Gers department 32 data refresh");
   const start = Date.now();
-
   await ensureDirs();
-
-  console.error("[refresh] Phase 1/10: discover-boundary");
+  console.error("[refresh] Phase 1/11: fetch-admin-express");
   await phaseDiscoverBoundary(opts.offline);
-
-  console.error("[refresh] Phase 2/10: fetch-osm");
+  console.error("[refresh] Phase 2/11: fetch-bdtopo");
+  await phaseFetchBdtopo(opts.offline);
+  console.error("[refresh] Phase 3/11: fetch-osm");
   await phaseFetchOsm(opts.offline);
-
-  console.error("[refresh] Phase 3/10: fetch-addresses");
+  console.error("[refresh] Phase 4/11: fetch-addresses");
   await phaseFetchAddresses(opts.offline);
-
-  console.error("[refresh] Phase 4/10: fetch-businesses");
+  console.error("[refresh] Phase 5/11: fetch-businesses");
   await phaseFetchBusinesses(opts.offline);
-
-  console.error("[refresh] Phase 5/10: fetch-ign");
+  console.error("[refresh] Phase 6/11: fetch-ign-elevation");
   await phaseFetchIgn(opts.offline, opts.forceIgn);
-
-  console.error("[refresh] Phase 6/10: normalize");
+  console.error("[refresh] Phase 7/11: normalize");
   await phaseNormalize();
-
-  console.error("[refresh] Phase 7/10: deduplicate");
+  console.error("[refresh] Phase 8/11: deduplicate");
   await phaseDeduplicate();
-
-  console.error("[refresh] Phase 8/10: build-tiles");
+  console.error("[refresh] Phase 9/11: build-tiles");
   await phaseBuildTiles();
-
-  console.error("[refresh] Phase 9/10: build-search-index");
+  console.error("[refresh] Phase 10/11: build-search-index");
   await phaseBuildSearchIndex();
-
-  console.error("[refresh] Phase 10/10: validate");
+  console.error("[refresh] Phase 11/11: validate");
   await phaseValidate();
-
   await writeSourceManifest();
   await writeCoverageReport();
   await writeGenerationManifest();
-
-  const elapsed = ((Date.now() - start) / 1000).toFixed(1);
-  console.error(`[refresh] Complete (${elapsed}s)`);
+  console.error(`[refresh] Complete (${((Date.now() - start) / 1000).toFixed(1)}s)`);
 }
 
 // ---------------------------------------------------------------------------

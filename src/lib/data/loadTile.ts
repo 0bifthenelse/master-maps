@@ -1,12 +1,12 @@
 /**
- * Tile loader for the Auch map data pipeline.
- * Fetches tiles from /api/map/tile/{tileId} with AbortController support,
- * bounded LRU cache, response-size checks, and manifest validation.
+ * Viewport tile loader for the Gers map. Fetches one LOD fragment tile at a
+ * time with AbortController support, bounded LRU cache, and validation.
  */
 
 // ---- Local fallback types (converge when schema.ts lands) ----
 interface TileManifestFallback {
   tileId: string;
+  lod?: number;
   bounds: [number, number, number, number];
   featureCount: number;
   byteSize: number;
@@ -26,7 +26,7 @@ interface CacheEntry {
 }
 
 const DEFAULT_MAX_CACHE_SIZE_MB = 128;
-const DEFAULT_MAX_TILE_SIZE_BYTES = 768 * 1024; // 750 KiB budget + margin
+const DEFAULT_MAX_TILE_SIZE_BYTES = 8 * 1024 * 1024;
 const DEFAULT_MAX_CACHE_ENTRIES = 64;
 
 class LRUMap<K, V> {
@@ -74,12 +74,12 @@ class LRUMap<K, V> {
     return this._map.size;
   }
 
-  /** Pop and return the oldest entry key, or undefined if empty. */
-  popOldest(): K | undefined {
-    const first = this._map.keys().next();
+  /** Pop and return the oldest entry, preserving its value for accounting. */
+  popOldest(): { key: K; value: V } | undefined {
+    const first = this._map.entries().next();
     if (first.done || first.value === undefined) return undefined;
-    this._map.delete(first.value);
-    return first.value;
+    this._map.delete(first.value[0]);
+    return { key: first.value[0], value: first.value[1] };
   }
 }
 
@@ -161,13 +161,9 @@ function validateManifest(obj: unknown): TileManifestFallback {
 function evictDownTo(maxBytes: number): void {
   if (!cache) return;
   while (cache.size > 0 && cacheByteSize > maxBytes) {
-    const oldestKey = cache.popOldest();
-    if (oldestKey === undefined) break;
-    const entry = cache.get(oldestKey);
-    if (entry) {
-      cacheByteSize -= entry.size;
-    }
-    cache.delete(oldestKey);
+    const oldest = cache.popOldest();
+    if (!oldest) break;
+    cacheByteSize -= oldest.value.size;
   }
 }
 

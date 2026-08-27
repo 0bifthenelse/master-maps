@@ -1,17 +1,16 @@
 import { NextRequest, NextResponse } from "next/server";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
+import { GERS_TERRITORY } from "@/lib/data/territory";
 
 export const dynamic = "force-static";
-
-// Projection origin from scripts/data/normalize.ts
-const PROJECTION_ORIGIN: [number, number] = [0.566553, 43.66256];
 const TILE_ID_RE = /^[a-zA-Z0-9_-]+$/;
 
 // --- Inline subset of DatasetManifestSchema fields the client needs ---
 
 interface TileEntry {
   tileId: string;
+  lod?: number;
   bounds: [number, number, number, number];
   featureCount: number;
   byteSize: number;
@@ -21,6 +20,11 @@ interface TileEntry {
 interface AssembledManifest {
   datasetVersion: string;
   acquisitionTime: string;
+  territoryCode: string;
+  territoryName: string;
+  interchangeCrs: string;
+  processingCrs: string;
+  renderOrigin: [number, number];
   pipeline: string[];
   tileIds: string[];
   tiles: TileEntry[];
@@ -29,7 +33,6 @@ interface AssembledManifest {
   layerAvailability: Record<string, boolean>;
   tileFeatureCounts: Record<string, number>;
   projectionOrigin: [number, number];
-  /** Local projected bounds computed from tile entries */
   bounds: [number, number, number, number];
 }
 
@@ -54,7 +57,6 @@ export async function GET(_request: NextRequest) {
   const dataRoot = process.env.MASTER_MAPS_DATA_DIR ?? "data";
   const manifestPath = join(dataRoot, "generated", "manifest.json");
   const tileManifestPath = join(dataRoot, "generated", "tile-manifest.json");
-
   try {
     const core = await readJson<{
       version?: string;
@@ -63,10 +65,13 @@ export async function GET(_request: NextRequest) {
       pipeline?: string[];
       featureCounts?: Record<string, number>;
       layerAvailability?: Record<string, boolean>;
+      territoryCode?: string;
+      territoryName?: string;
+      interchangeCrs?: string;
+      processingCrs?: string;
+      renderOrigin?: [number, number];
       projectionOrigin?: [number, number];
     }>(manifestPath);
-
-    // Read tile-manifest for per-tile metadata
     const tileEntries = await readJson<TileEntry[]>(tileManifestPath);
 
     const featureCounts: Record<string, number> = { ...(core.featureCounts ?? {}) };
@@ -99,6 +104,11 @@ export async function GET(_request: NextRequest) {
     const assembled: AssembledManifest = {
       datasetVersion,
       acquisitionTime: core.acquisitionTime,
+      territoryCode: core.territoryCode ?? GERS_TERRITORY.code,
+      territoryName: core.territoryName ?? GERS_TERRITORY.name,
+      interchangeCrs: core.interchangeCrs ?? GERS_TERRITORY.interchangeCrs,
+      processingCrs: core.processingCrs ?? GERS_TERRITORY.processingCrs,
+      renderOrigin: core.renderOrigin ?? GERS_TERRITORY.renderOriginWgs84,
       pipeline: core.pipeline ?? [],
       tileIds,
       tiles: tileEntries,
@@ -106,10 +116,8 @@ export async function GET(_request: NextRequest) {
       byteSizes,
       layerAvailability,
       tileFeatureCounts,
-      projectionOrigin: core.projectionOrigin ?? PROJECTION_ORIGIN,
-      bounds: Number.isFinite(minX)
-        ? [minX, minZ, maxX, maxZ]
-        : [0, 0, 0, 0],
+      projectionOrigin: core.projectionOrigin ?? GERS_TERRITORY.renderOriginWgs84,
+      bounds: Number.isFinite(minX) ? [minX, minZ, maxX, maxZ] : [0, 0, 0, 0],
     };
 
     return NextResponse.json(assembled, {

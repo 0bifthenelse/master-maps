@@ -1,13 +1,6 @@
 /**
- * tiling.ts — Deterministic tile grid for the Auch map.
- *
- * Half-open convention: [min, max) for all tiles except the maximum edge
- * (furthest east / furthest north), which uses inclusive [min, max] so that
- * the commune boundary point at exactly maxX/maxY (bounds.maxY in Bounds2D)
- * is assigned to the last tile rather than falling outside the grid.
- *
- * Axis contract: x = east, z = north (z maps from Bounds2D's minY/maxY).
- * All positions are in local projected metres.
+ * Lambert-93 tile grid. Coordinates use x=easting and z=northing relative to
+ * the documented render origin. Tile assignment uses complete feature bounds.
  */
 
 import { Bounds2D } from './bounds';
@@ -28,6 +21,22 @@ export interface TileBudget {
 export interface TileCoord {
   col: number;
   row: number;
+}
+export interface TileLevel {
+  level: 0 | 1 | 2;
+  tileSize: number;
+}
+
+export const GERS_TILE_LEVELS: readonly TileLevel[] = [
+  { level: 0, tileSize: 2048 },
+  { level: 1, tileSize: 8192 },
+  { level: 2, tileSize: 32768 },
+];
+
+export function chooseTileLevel(visibleSpanMetres: number): TileLevel {
+  if (visibleSpanMetres <= 12000) return GERS_TILE_LEVELS[0]!;
+  if (visibleSpanMetres <= 60000) return GERS_TILE_LEVELS[1]!;
+  return GERS_TILE_LEVELS[2]!;
 }
 
 // ---------------------------------------------------------------------------

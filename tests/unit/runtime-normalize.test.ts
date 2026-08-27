@@ -35,7 +35,7 @@ describe("runtime normalization geometry contract", () => {
     const local = deriveLocalCoords({ type: "LineString", coordinates: [[0, 0], [0, 1]] }, projection);
     expect(local).toEqual({
       type: "LineString",
-      coordinates: [[0, 0], [0, expect.any(Number)]],
+      coordinates: [[0, 0], [expect.any(Number), expect.any(Number)]],
     });
     expect(local.type === "LineString" ? local.coordinates[1][1] : 0).toBeGreaterThan(0);
 

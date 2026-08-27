@@ -2,8 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 
-// 750 KiB tile budget plus safety margin — matches loadTile.ts default
-const MAX_TILE_SIZE = 768 * 1024;
+const MAX_TILE_SIZE = 8 * 1024 * 1024;
 
 // Tile IDs are grid coordinates or stable slugs: alphanumeric, underscore, hyphen
 const TILE_ID_RE = /^[a-zA-Z0-9_-]+$/;

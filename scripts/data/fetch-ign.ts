@@ -15,6 +15,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import crypto from "node:crypto";
+import { GERS_TERRITORY } from "../../src/lib/data/territory";
 
 // ---------------------------------------------------------------------------
 // Local type definitions (duplicated from src/lib/data/schema.ts until it
@@ -74,13 +75,8 @@ const INTERMEDIATE_DIR = path.join(DATA_DIR, "intermediate");
 /** IGN Géoplateforme WFS base endpoint */
 const WFS_BASE = "https://data.geopf.fr/wfs/ows";
 
-/** Auch bounding box (WGS84) — west, south, east, north */
-const AUCH_BBOX: [number, number, number, number] = [
-  0.486087,
-  43.617419,
-  0.647019,
-  43.707701,
-];
+/** Gers department bootstrap envelope for elevation discovery. */
+const TERRITORY_BBOX: [number, number, number, number] = [...GERS_TERRITORY.bootstrapBbox];
 
 /** WFS count limit — the server caps at 5000 */
 const WFS_COUNT = 5000;
@@ -280,7 +276,7 @@ async function main() {
   console.error(`[fetch-ign] Capabilities (${cap.layers.length} types) → ${capFile}`);
 
   // ---- Phase 2: Select elevation layers covering Auch -------------------
-  const [bw, bs, be, bn] = AUCH_BBOX;
+  const [bw, bs, be, bn] = TERRITORY_BBOX;
 
   const applicable = cap.layers.filter((l) => {
     const isElevation =
@@ -332,7 +328,7 @@ async function main() {
       const {raw: rawJson, featureCount} = await fetchWfsFeatures(
         WFS_BASE,
         layer.name,
-        AUCH_BBOX,
+        TERRITORY_BBOX,
       );
 
       const hash = sha256(rawJson);

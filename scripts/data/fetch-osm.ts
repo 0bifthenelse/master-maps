@@ -1,15 +1,10 @@
 #!/usr/bin/env tsx
 /// <reference lib="es2024.promise" />
 /**
- * fetch-osm.ts — Overpass API acquisition for Auch commune
+ * fetch-osm.ts — bulk OpenStreetMap enrichment acquisition for Gers department.
  *
- * Reads the Auch boundary polygon from the boundary source (written by
- * discover-auch-boundary.ts), builds constrained Overpass queries by theme,
- * fetches with retry and endpoint fallback, stores raw responses in
- * data/raw/osm-{theme}.json, and writes an acquisition manifest to
- * data/intermediate/osm-manifest.json.
- *
- * Usage:  tsx scripts/data/fetch-osm.ts
+ * The preferred path downloads the current Geofabrik Midi-Pyrenees extract and
+ * clips it with osmium. Overpass remains an explicit spot/enrichment fallback.
  *
  * Environment:
  *   MASTER_MAPS_DATA_DIR  data root directory (default "data")
@@ -22,6 +17,11 @@
 import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { createWriteStream } from 'node:fs';
+import { Readable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -337,7 +337,7 @@ async function fetchOverpass(query: string): Promise<OverpassResult> {
           method: 'POST',
           signal: controller.signal,
           headers: {
-            'User-Agent': 'master-maps/1.0 (OSM acquisition for Auch, France; contact@ifthenelse.com)',
+            'User-Agent': 'master-maps/1.0 (OSM acquisition for Gers department, France; contact@ifthenelse.com)',
             Accept: 'application/json',
             'Content-Type': 'application/x-www-form-urlencoded',
           },
@@ -509,31 +509,73 @@ function parseBoundaryRecord(raw: unknown): ParsedBoundaryRecord | null {
 
   return null;
 }
+const execFileAsync = promisify(execFile);
+const OSM_BULK_URL = "https://download.geofabrik.de/europe/france/midi-pyrenees-latest.osm.pbf";
+
+async function fetchBulkOsm(): Promise<void> {
+  const pbfPath = path.join(RAW_DIR, "midi-pyrenees-latest.osm.pbf");
+  try {
+    await readFile(pbfPath);
+  } catch {
+    const response = await fetch(OSM_BULK_URL, { headers: { Accept: "application/octet-stream" } });
+    if (!response.ok || !response.body) throw new Error(`Geofabrik bulk extract failed: HTTP ${response.status}`);
+    await pipeline(Readable.fromWeb(response.body as Parameters<typeof Readable.fromWeb>[0]), createWriteStream(pbfPath));
+  }
+  const sourceHash = crypto.createHash("sha256").update(await readFile(pbfPath)).digest("hex");
+  const boundaryPath = path.join(RAW_DIR, "gers-boundary.geojson");
+  const extractPath = path.join(RAW_DIR, "gers-osm.osm.pbf");
+  const filteredPath = path.join(RAW_DIR, "gers-osm-enrichment.osm.pbf");
+  const geojsonPath = path.join(RAW_DIR, "osm-bulk.geojson");
+  await execFileAsync("osmium", ["extract", "-p", boundaryPath, pbfPath, "-o", extractPath, "--overwrite"], { maxBuffer: 2 * 1024 * 1024 });
+  await execFileAsync("osmium", [
+    "tags-filter", extractPath, "-o", filteredPath, "--overwrite",
+    "w/highway=path,footway,cycleway,bridleway,track,pedestrian,steps",
+    "n/amenity", "n/shop", "n/tourism", "n/historic", "n/name",
+    "w/amenity", "w/shop", "w/tourism", "w/historic", "w/name",
+    "r/amenity", "r/shop", "r/tourism", "r/historic", "r/name",
+  ], { maxBuffer: 2 * 1024 * 1024 });
+  await execFileAsync("osmium", ["export", filteredPath, "-o", geojsonPath, "--overwrite", "--add-unique-id", "type_id"], { maxBuffer: 2 * 1024 * 1024 });
+  const geojson = JSON.parse(await readFile(geojsonPath, "utf8")) as { features?: unknown[] };
+  if (!Array.isArray(geojson.features) || geojson.features.length === 0) {
+    throw new Error("Geofabrik extract produced no features inside the Gers boundary");
+  }
+  await writeFile(path.join(INTERMEDIATE_DIR, "osm-bulk-manifest.json"), JSON.stringify({
+    source: "OpenStreetMap contributors via Geofabrik",
+    resource: OSM_BULK_URL,
+    acquiredAt: new Date().toISOString(),
+    license: "ODbL-1.0",
+    crs: "EPSG:4326",
+    sourceSha256: sourceHash,
+    featureCount: geojson.features.length,
+    boundary: "data/raw/gers-boundary.geojson",
+    method: "osmium extract and export",
+  }, null, 2) + "\n", "utf8");
+  console.log(`Bulk OSM extract: ${geojson.features.length} features`);
+}
+
 
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
 async function main(): Promise<void> {
-  console.log('=== OSM Acquisition for Auch ===\n');
+  console.log('=== OSM enrichment acquisition for Gers department 32 ===\n');
 
   // Ensure output directories exist
   await mkdir(RAW_DIR, { recursive: true });
   await mkdir(INTERMEDIATE_DIR, { recursive: true });
+  if (process.env.OSM_USE_OVERPASS !== "1") {
+    await fetchBulkOsm();
+    return;
+  }
 
-  // ---- Load boundary polygon ----
-  console.log('Loading boundary polygon...');
-
+  console.log('Loading Gers boundary...');
   let boundaryGeometry: { type: string; coordinates: unknown } | null = null;
   let bbox: [number, number, number, number] | null = null;
-
   const candidatePaths = [
+    path.join(RAW_DIR, 'gers-boundary.geojson'),
     path.join(INTERMEDIATE_DIR, 'boundary-source.json'),
-    path.join(RAW_DIR, 'boundary.json'),
-    path.join(INTERMEDIATE_DIR, 'boundary.json'),
-    path.join(RAW_DIR, 'auch-boundary.geojson'),
   ];
-
   for (const filePath of candidatePaths) {
     try {
       const content = await readFile(filePath, 'utf-8');
@@ -542,20 +584,15 @@ async function main(): Promise<void> {
       if (record) {
         boundaryGeometry = record.geometry;
         bbox = record.bbox;
-        console.log(`  Loaded from ${filePath}  (type=${boundaryGeometry.type})`);
+        console.log(`  Loaded from ${filePath} (type=${boundaryGeometry.type})`);
         break;
       }
     } catch {
-      // file not found or unparseable — try next
       continue;
     }
   }
-
   if (!boundaryGeometry) {
-    throw new Error(
-      'Cannot find boundary polygon. Run scripts/data/discover-auch-boundary.ts first.\n' +
-        `  Searched: ${candidatePaths.join(', ')}`,
-    );
+    throw new Error(`Cannot find Gers boundary. Searched: ${candidatePaths.join(', ')}`);
   }
 
   const polyStr = geometryToPoly(boundaryGeometry);
@@ -571,7 +608,7 @@ async function main(): Promise<void> {
 
   // ---- Fetch each theme ----
   const manifest: OsmManifest = {
-    dataset: 'osm-auch',
+    dataset: 'osm-gers',
     acquisitionTime: new Date().toISOString(),
     boundaryBbox: bbox,
     themeCount: THEMES.length,

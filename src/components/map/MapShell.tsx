@@ -36,6 +36,7 @@ import WebGPUUnsupported from "@/components/map/WebGPUUnsupported";
 import { publishSceneDiagnostics, sceneMetrics } from "@/lib/scene/sceneMetrics";
 import { searchIndex as runSearchIndex, type SearchRecord as SearchIndexRecord } from "@/lib/data/search";
 import { computeLocalFocus, type LocalGeometry as FocusLocalGeometry } from "@/lib/geo/focus";
+import { loadTile } from "@/lib/data/loadTile";
 
 // ---------------------------------------------------------------------------
 // Local type definitions — match the schema contracts expected from
@@ -182,9 +183,9 @@ type MapFeature =
   | AddressFeature
   | TransportFeature
   | MapFeatureBase;
-
 interface TileManifestEntry {
   tileId: string;
+  lod?: number;
   bounds: [number, number, number, number];
   featureCount: number;
   byteSize: number;
@@ -258,6 +259,12 @@ interface TileData {
   features: RawMapFeature[];
   bounds: [number, number, number, number];
 }
+interface ViewportSnapshot {
+  target: [number, number];
+  zoom: number;
+  width: number;
+  height: number;
+}
 const renderableKinds: Record<FeatureKind, boolean> = {
   building: true,
   road: true,
@@ -306,6 +313,43 @@ const TILE_LOAD_CONCURRENCY = 8;
 // ---------------------------------------------------------------------------
 
 /** Count loaded features across all tiles. */
+function visibleTileIds(
+  manifest: ManifestData,
+  viewport: ViewportSnapshot | null,
+): string[] {
+  const entries = manifest.tiles ?? [];
+  if (entries.length === 0) return [];
+  const manifestBounds = manifest.bounds ?? [
+    entries[0].bounds[0],
+    entries[0].bounds[1],
+    entries[entries.length - 1].bounds[2],
+    entries[entries.length - 1].bounds[3],
+  ];
+  const target = viewport?.target ?? [
+    (manifestBounds[0] + manifestBounds[2]) / 2,
+    (manifestBounds[1] + manifestBounds[3]) / 2,
+  ];
+  const width = viewport?.width ?? manifestBounds[2] - manifestBounds[0];
+  const height = viewport?.height ?? manifestBounds[3] - manifestBounds[1];
+  const zoom = Math.max(viewport?.zoom ?? 1, 0.001);
+  const visibleWidth = width / zoom;
+  const visibleHeight = height / zoom;
+  const span = Math.max(visibleWidth, visibleHeight);
+  const lod = span <= 12000 ? 0 : span <= 60000 ? 1 : 2;
+  const candidates = entries.filter((entry) => (entry.lod ?? 0) === lod);
+  const tileSize = candidates[0] ? candidates[0].bounds[2] - candidates[0].bounds[0] : span;
+  const viewBounds: [number, number, number, number] = [
+    target[0] - visibleWidth / 2 - tileSize,
+    target[1] - visibleHeight / 2 - tileSize,
+    target[0] + visibleWidth / 2 + tileSize,
+    target[1] + visibleHeight / 2 + tileSize,
+  ];
+  return candidates.filter((entry) =>
+    entry.bounds[0] <= viewBounds[2] && entry.bounds[2] >= viewBounds[0]
+    && entry.bounds[1] <= viewBounds[3] && entry.bounds[3] >= viewBounds[1],
+  ).map((entry) => entry.tileId);
+}
+
 function countFeatures(tileMap: Map<string, TileData>): number {
   let count = 0;
   for (const tile of tileMap.values()) {
@@ -361,6 +405,7 @@ export default function MapShell() {
     useState<Record<string, boolean>>(DEFAULT_LAYERS);
   const [manifest, setManifest] = useState<ManifestData | null>(null);
   const [tiles, setTiles] = useState<Map<string, TileData>>(new Map());
+  const [viewport, setViewport] = useState<ViewportSnapshot | null>(null);
   const [searchIndex, setSearchIndex] = useState<SearchRecord[]>([]);
   const [searchQuery, setSearchQuery] = useState("");
   const [loading, setLoading] = useState(true);
@@ -397,122 +442,82 @@ export default function MapShell() {
     }
   }, [theme]);
 
-  // ---- Data loading ----
+  // ---- Manifest and search metadata load ----
   useEffect(() => {
-    let cancelled = false;
-
-    async function loadData(): Promise<void> {
+    const controller = new AbortController();
+    async function loadMetadata(): Promise<void> {
       try {
         setLoading(true);
         setError(null);
-
-        // Detect WebGPU support
-        const gpuSupported =
-          typeof navigator !== "undefined" &&
-          typeof navigator.gpu !== "undefined" &&
-          navigator.gpu !== null;
-        if (!cancelled) {
-          setWebGpuStatus(gpuSupported ? "supported" : "unsupported");
-        }
-
-        // Fetch dataset manifest
-        const manifestRes = await fetch("/api/map/manifest", {
-          headers: { Accept: "application/json" },
-        });
-        if (!manifestRes.ok) {
-          const body = await manifestRes.text().catch(() => "");
-          if (manifestRes.status === 503) {
-            throw new Error(
-              `DATASET_UNAVAILABLE: ${manifestRes.status} ${body}`,
-            );
-          }
-          throw new Error(
-            `Manifest load failed: ${manifestRes.status} ${body}`,
-          );
-        }
-        const manifestData: ManifestData = await manifestRes.json();
-        if (cancelled) return;
+        const gpuSupported = typeof navigator !== "undefined" && navigator.gpu !== undefined;
+        setWebGpuStatus(gpuSupported ? "supported" : "unsupported");
+        const manifestRes = await fetch("/api/map/manifest", { signal: controller.signal, headers: { Accept: "application/json" } });
+        if (!manifestRes.ok) throw new Error(`Manifest load failed: ${manifestRes.status}`);
+        const manifestData = await manifestRes.json() as ManifestData;
+        if (controller.signal.aborted) return;
         setManifest(manifestData);
-
-        // Fetch search index
-        const searchRes = await fetch("/api/map/search", {
-          headers: { Accept: "application/json" },
-        });
-        if (searchRes.ok) {
-          const searchBody = await searchRes.json();
-          const records: SearchRecord[] = Array.isArray(searchBody)
-            ? searchBody
-            : (searchBody.records ?? []);
-          if (!cancelled) setSearchIndex(records);
-        } else {
-          throw new Error(`Search index load failed: ${searchRes.status}`);
+        const searchRes = await fetch("/api/map/search", { signal: controller.signal, headers: { Accept: "application/json" } });
+        if (!searchRes.ok) throw new Error(`Search index load failed: ${searchRes.status}`);
+        const searchBody = await searchRes.json() as SearchRecord[] | { records?: SearchRecord[] };
+        setSearchIndex(Array.isArray(searchBody) ? searchBody : searchBody.records ?? []);
+        setLoading(false);
+      } catch (cause) {
+        if (!controller.signal.aborted) {
+          setError(cause instanceof Error ? cause.message : "Failed to load map metadata");
+          setLoading(false);
         }
-
-        // Resolve tile IDs
-        const tileIds: string[] =
-          manifestData.tileIds ??
-          manifestData.tiles?.map((t) => t.tileId) ??
-          [];
-
-        // Load tiles in parallel batches
-        const loaded = new Map<string, TileData>();
-
-        for (let i = 0; i < tileIds.length; i += TILE_LOAD_CONCURRENCY) {
-          if (cancelled) return;
-          const batch = tileIds.slice(i, i + TILE_LOAD_CONCURRENCY);
-          const results = await Promise.all(
-            batch.map(async (tileId) => {
-              try {
-                const res = await fetch(
-                  `/api/map/tile/${encodeURIComponent(tileId)}`,
-                  { headers: { Accept: "application/json" } },
-                );
-                if (!res.ok) {
-                  console.warn(`Tile ${tileId} load failed: ${res.status}`);
-                  return null;
-                }
-                const envelope: TileEnvelope = await res.json();
-                if (!Array.isArray(envelope.features)) {
-                  throw new Error(`Tile ${tileId} has no feature array`);
-                }
-                return {
-                  tileId,
-                  data: {
-                    tileId,
-                    features: envelope.features,
-                    bounds: envelope.manifest.bounds,
-                  },
-                };
-              } catch (err) {
-                console.warn(`Tile ${tileId} fetch error:`, err);
-                return null;
-              }
-            }),
-          );
-          if (cancelled) return;
-          for (const r of results) {
-            if (r) loaded.set(r.tileId, r.data);
-          }
-        }
-
-        if (!cancelled) setTiles(loaded);
-      } catch (err) {
-        if (!cancelled) {
-          const message =
-            err instanceof Error ? err.message : "Failed to load map data";
-          setError(message);
-        }
-      } finally {
-        if (!cancelled) setLoading(false);
       }
     }
-
-    void loadData();
-
-    return () => {
-      cancelled = true;
-    };
+    void loadMetadata();
+    return () => controller.abort();
   }, []);
+
+  // ---- Viewport tile streaming ----
+  useEffect(() => {
+    if (!manifest) return undefined;
+    const controller = new AbortController();
+    const desiredIds = visibleTileIds(manifest, viewport);
+    const desired = new Set(desiredIds);
+    const pending = desiredIds.filter((tileId) => !tiles.has(tileId));
+    async function streamTiles(): Promise<void> {
+      await Promise.resolve();
+      if (controller.signal.aborted) return;
+      setTiles((previous) => {
+        const retained = new Map<string, TileData>();
+        for (const [tileId, tile] of previous) if (desired.has(tileId)) retained.set(tileId, tile);
+        if (retained.size === previous.size && [...retained.keys()].every((tileId) => previous.has(tileId))) return previous;
+        return retained;
+      });
+      for (let offset = 0; offset < pending.length; offset += TILE_LOAD_CONCURRENCY) {
+        if (controller.signal.aborted) return;
+        const batch = pending.slice(offset, offset + TILE_LOAD_CONCURRENCY);
+        const results = await Promise.all(batch.map(async (tileId) => {
+          try {
+            const envelope = await loadTile(tileId, controller.signal);
+            return {
+              tileId,
+              data: {
+                tileId,
+                features: envelope.features as RawMapFeature[],
+                bounds: envelope.manifest.bounds,
+              },
+            };
+          } catch (cause) {
+            if (!controller.signal.aborted) console.warn(`Tile ${tileId} fetch error`, cause);
+            return null;
+          }
+        }));
+        if (controller.signal.aborted) return;
+        setTiles((previous) => {
+          const next = new Map(previous);
+          for (const result of results) if (result && desired.has(result.tileId)) next.set(result.tileId, result.data);
+          return next;
+        });
+      }
+    }
+    void streamTiles();
+    return () => controller.abort();
+  }, [manifest, viewport, tiles]);
 
   // ---- Scene diagnostics ----
   useEffect(() => {
@@ -549,22 +554,35 @@ export default function MapShell() {
   }, []);
 
   const handleSearchResultSelect = useCallback(
-    (featureId: string): void => {
-      const raw = Array.from(tiles.values())
-        .flatMap((tile) => tile.features)
+    async (featureId: string): Promise<void> => {
+      const indexed = searchIndex.find((record) => record.featureId === featureId);
+      let raw = Array.from(tiles.values()).flatMap((tile) => tile.features)
         .find((feature) => feature.stableId === featureId);
+      if (!raw && indexed) {
+        try {
+          const envelope = await loadTile(indexed.tileId);
+          const tile: TileData = {
+            tileId: indexed.tileId,
+            features: envelope.features as RawMapFeature[],
+            bounds: envelope.manifest.bounds,
+          };
+          setTiles((previous) => new Map(previous).set(tile.tileId, tile));
+          raw = tile.features.find((feature) => feature.stableId === featureId);
+        } catch (cause) {
+          console.warn(`Search tile ${indexed.tileId} load failed`, cause);
+        }
+      }
       if (!raw) return;
       const selected = {
         ...raw,
         id: raw.stableId,
         name: raw.name ?? raw.displayName,
-        localCoord:
-          raw.x !== undefined && raw.z !== undefined ? [raw.x, raw.z] : undefined,
+        localCoord: raw.x !== undefined && raw.z !== undefined ? [raw.x, raw.z] : undefined,
       } as unknown as MapFeature;
       handleSearchSelect(selected);
       setSearchQuery("");
     },
-    [tiles, handleSearchSelect],
+    [searchIndex, tiles, handleSearchSelect],
   );
 
 
@@ -808,6 +826,7 @@ export default function MapShell() {
                 cameraFocus={cameraFocus}
                 cameraReset={cameraResetCounter}
                 onCameraMoved={handleCameraMoved}
+                onViewportChange={setViewport}
               >
                 <CityScene
                   features={sceneFeatures}

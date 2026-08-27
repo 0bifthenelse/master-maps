@@ -1,14 +1,7 @@
 #!/usr/bin/env tsx
 /**
- * normalize.ts — Converts raw source records to typed discriminated unions,
- * clips geometry to the commune boundary polygon, derives local coordinates,
- * and records every transformation.
- *
- * Reads files produced by the fetch-* siblings and writes per-kind JSON
- * files to the intermediate directory for the deduplication and tiling
- * stages.
- *
- * Usage: tsx scripts/data/normalize.ts [--raw-dir <path>] [--out-dir <path>]
+ * normalize.ts converts source records into canonical WGS84 geometry plus
+ * Lambert-93-relative render geometry. Metric operations remain in EPSG:2154.
  */
 
 import * as fs from "node:fs/promises";
@@ -18,6 +11,8 @@ import {
   clipPolygonToPolygon,
   type PolygonGeometry,
 } from "../../src/lib/geo/polygon";
+import { wgs84ToRender } from "../../src/lib/geo/crs";
+import { GERS_TERRITORY } from "../../src/lib/data/territory";
 import {
   deduplicateOsmElements,
   isOsmElement,
@@ -27,10 +22,13 @@ import {
   type OsmWayElement,
   type RelationIssue,
 } from "./osmRelations";
+import { createBoundaryIndex } from "./boundaryIndex";
 
+import { normalizeBdtopo } from "./normalizeBdtopo";
 // ---------------------------------------------------------------------------
 // Type stubs — matches schema contracts from the plan §4
 // ---------------------------------------------------------------------------
+import { normalizeOsmBulk } from "./normalizeOsmBulk";
 
 interface SourceReference {
   source: string;
@@ -81,8 +79,9 @@ interface MapFeatureBase {
 interface BoundaryFeature extends MapFeatureBase {
   kind: "boundary";
   rings: number[][][];
-  centroidX: number;
+  polygons?: number[][][][];
   centroidZ: number;
+  territoryCode: string;
 }
 
 interface BuildingFeature extends MapFeatureBase {
@@ -167,46 +166,17 @@ type MapFeature =
   | BoundaryFeature | BuildingFeature | RoadFeature | WaterFeature
   | LanduseFeature | PoiFeature | BusinessFeature | AddressFeature | TransportFeature;
 
-// ---------------------------------------------------------------------------
-// Projection — local spherical equirectangular (matches src/lib/geo/projection)
-// ---------------------------------------------------------------------------
+const forward = (lon: number, lat: number): [number, number] => wgs84ToRender([lon, lat]);
 
-const METERS_PER_DEGREE = 111_319.9;
-/** Origin chosen as approximate Auch centre (finely from boundary centroid). */
-const PROJECTION_ORIGIN: [number, number] = [0.566553, 43.66256];
-const COS_ORIGIN_LAT = Math.cos(PROJECTION_ORIGIN[1] * Math.PI / 180);
-
-function forward(lon: number, lat: number): [number, number] {
-  const dLng = lon - PROJECTION_ORIGIN[0];
-  const dLat = lat - PROJECTION_ORIGIN[1];
-  return [dLng * METERS_PER_DEGREE * COS_ORIGIN_LAT, dLat * METERS_PER_DEGREE];
-}
 
 // ---------------------------------------------------------------------------
 // Point-in-polygon (ray casting, WGS84)
 // ---------------------------------------------------------------------------
 
-function pointInRing(px: number, py: number, ring: number[][]): boolean {
-  let inside = false;
-  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
-    const ax = ring[i][0], ay = ring[i][1];
-    const bx = ring[j][0], by = ring[j][1];
-    if ((ay > py) !== (by > py) &&
-        px < ((bx - ax) * (py - ay)) / (by - ay) + ax) {
-      inside = !inside;
-    }
-  }
-  return inside;
+function boundaryPolygonComponents(boundary: BoundaryFeature): number[][][][] {
+  return boundary.polygons ?? [boundary.rings];
 }
 
-function pointInPolygon(px: number, py: number, rings: number[][][]): boolean {
-  if (!rings.length || !rings[0].length) return false;
-  if (!pointInRing(px, py, rings[0])) return false;
-  for (let i = 1; i < rings.length; i++) {
-    if (pointInRing(px, py, rings[i])) return false;
-  }
-  return true;
-}
 
 
 // ---------------------------------------------------------------------------
@@ -332,7 +302,7 @@ async function loadRawSources(rawDir: string) {
 
   let boundaryRaw: string;
   try {
-    boundaryRaw = await fs.readFile(path.join(rawDir, "auch-boundary.geojson"), readOpt);
+    boundaryRaw = await fs.readFile(path.join(rawDir, GERS_TERRITORY.boundaryRawFile), readOpt);
   } catch {
     boundaryRaw = '{"type":"FeatureCollection","features":[]}';
   }
@@ -342,6 +312,16 @@ async function loadRawSources(rawDir: string) {
     osmRaw = await fs.readFile(path.join(rawDir, "osm.json"), readOpt);
   } catch {
     osmRaw = '{"elements":[],"timestamp":"","query":""}';
+  }
+
+  let osmBulkRaw: { type?: string; features?: Record<string, unknown>[] } = { features: [] };
+  try {
+    osmBulkRaw = JSON.parse(await fs.readFile(path.join(rawDir, "osm-bulk.geojson"), readOpt)) as typeof osmBulkRaw;
+  } catch {
+    // Bulk OSM is optional for offline fixture runs; source acquisition records failures.
+  }
+  if ((osmBulkRaw.features?.length ?? 0) > 0) {
+    osmRaw = '{"elements":[],"timestamp":"bulk","query":"geofabrik"}';
   }
 
   let addrRaw: string;
@@ -403,9 +383,27 @@ async function loadRawSources(rawDir: string) {
     } catch { /* no marker */ }
   } catch { /* ign dir unreadable */ }
 
+  const bdtopoFeatures: Record<string, unknown>[] = [];
+  try {
+    const entries = await fs.readdir(rawDir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isFile() || !entry.name.startsWith("bdtopo-") || !entry.name.endsWith(".geojson")) continue;
+      const parsed = JSON.parse(await fs.readFile(path.join(rawDir, entry.name), readOpt)) as {
+        features?: Record<string, unknown>[];
+      };
+      for (const feature of parsed.features ?? []) {
+        bdtopoFeatures.push({ ...feature, sourceLayer: entry.name });
+      }
+    }
+  } catch {
+    // BD TOPO absence remains visible in validation and source manifests.
+  }
+
   return {
     boundary: JSON.parse(boundaryRaw) as Record<string, unknown>,
     osm: JSON.parse(osmRaw) as { elements: Record<string, unknown>[]; timestamp: string; query: string },
+    osmBulk: osmBulkRaw,
+    bdtopo: bdtopoFeatures,
     addresses: JSON.parse(addrRaw) as { addresses?: Record<string, unknown>[]; license?: string },
     businesses: JSON.parse(bizSireneRaw) as { records?: Record<string, unknown>[] },
     businessesOsm: JSON.parse(bizOsmRaw) as { status?: string; body?: unknown },
@@ -421,51 +419,76 @@ async function loadRawSources(rawDir: string) {
 function normalizeBoundary(raw: Record<string, unknown>): BoundaryFeature {
   const fc = raw as { features?: Array<{ geometry?: { type?: string; coordinates?: unknown } }> };
   const feature = fc.features?.[0];
-  if (!feature?.geometry) throw new Error("normalizeBoundary: no valid geometry in boundary GeoJSON");
-
-  let rings: number[][][];
+  if (!feature?.geometry) throw new Error("normalizeBoundary: no valid geometry in Admin Express response");
   const geom = feature.geometry;
+  let polygons: number[][][][] = [];
   if (geom.type === "Polygon") {
-    rings = geom.coordinates as number[][][];
+    polygons = [geom.coordinates as number[][][]];
   } else if (geom.type === "MultiPolygon") {
-    const polys = geom.coordinates as number[][][][];
-    rings = polys.reduce((a, b) => (b[0]?.length ?? 0) > (a[0]?.length ?? 0) ? b : a, polys[0] ?? []);
+    polygons = geom.coordinates as number[][][][];
   } else {
     throw new Error(`normalizeBoundary: unsupported geometry type: ${geom.type}`);
   }
-
+  if (polygons.length === 0 || !polygons.every((polygon) => polygon.length > 0)) {
+    throw new Error("normalizeBoundary: boundary contains no complete polygons");
+  }
+  const rings = polygons[0];
   const centroid = computePolygonCentroid(rings);
   const [cx, cy] = centroid;
   const [lx, lz] = forward(cx, cy);
   const now = new Date().toISOString();
-  const sourceRefs: SourceReference[] = [
-    { source: "geo.api.gouv.fr", timestamp: now, license: "etalab-2.0" },
-  ];
-
+  const sourceGeometry = {
+    type: geom.type,
+    coordinates: geom.coordinates,
+  } as OsmNormalizedGeometry;
+  const sourceRefs: SourceReference[] = [{
+    source: "IGN ADMIN EXPRESS COG",
+    timestamp: now,
+    license: "Licence Ouverte / Open Licence 2.0",
+  }];
   return {
     kind: "boundary",
-    stableId: "boundary:auch-32013",
+    stableId: `boundary:department/${GERS_TERRITORY.code}`,
+    sourceId: `admin-express:${GERS_TERRITORY.code}`,
     lon: cx,
     lat: cy,
     x: lx,
     z: lz,
     rings,
-    centroidX: lx,
-    centroidZ: lz,
-    geometry: { type: "Polygon", coordinates: rings },
-    localGeometry: { type: "Polygon", coordinates: rings.map(r => r.map(p => forward(p[0], p[1]))) },
+    polygons,
+    territoryCode: GERS_TERRITORY.code,
+    geometry: sourceGeometry,
+    localGeometry: localizeBoundaryGeometry(sourceGeometry),
     provenance: [{
-      featureId: "boundary:auch-32013",
+      featureId: `boundary:department/${GERS_TERRITORY.code}`,
       property: "geometry",
-      winner: "geo.api.gouv.fr",
-      contenders: ["geo.api.gouv.fr"],
-      priority: 90,
+      winner: "IGN ADMIN EXPRESS COG",
+      contenders: ["IGN ADMIN EXPRESS COG"],
+      priority: 100,
       timestamp: now,
     }],
-    confidence: 1.0,
+    confidence: 1,
     status: "active",
     sourceRefs,
   };
+}
+
+function localizeBoundaryGeometry(geometry: OsmNormalizedGeometry): Record<string, unknown> {
+  switch (geometry.type) {
+    case "Polygon":
+      return {
+        type: "Polygon",
+        coordinates: geometry.coordinates.map((ring) => ring.map(([lon, lat]) => forward(lon, lat))),
+      };
+    case "MultiPolygon":
+      return {
+        type: "MultiPolygon",
+        coordinates: geometry.coordinates.map((polygon) =>
+          polygon.map((ring) => ring.map(([lon, lat]) => forward(lon, lat)))),
+      };
+    default:
+      throw new Error(`normalizeBoundary: expected polygon geometry, got ${geometry.type}`);
+  }
 }
 
 export interface OsmNormalizationResult {
@@ -493,11 +516,11 @@ export function normalizeOsmWithReport(
   raw: { elements: Record<string, unknown>[]; timestamp: string; query: string },
   boundary: BoundaryFeature,
 ): OsmNormalizationResult {
-  const boundaryRings = boundary.rings as [number, number][][];
-  const boundaryPolygon: PolygonGeometry = {
+  const boundaryPolygons: PolygonGeometry[] = boundaryPolygonComponents(boundary).map((rings) => ({
     type: "Polygon",
-    coordinates: boundaryRings,
-  };
+    coordinates: rings,
+  }));
+  const boundaryIndex = createBoundaryIndex(boundaryPolygons.map((polygon) => polygon.coordinates));
   const now = new Date().toISOString();
   const elements = deduplicateOsmElements(raw.elements.filter(isOsmElement));
   const features: MapFeature[] = [];
@@ -585,11 +608,7 @@ export function normalizeOsmWithReport(
     const points: [number, number][] = [];
     const collect = (value: unknown): void => {
       if (!Array.isArray(value)) return;
-      if (
-        value.length >= 2
-        && typeof value[0] === "number"
-        && typeof value[1] === "number"
-      ) {
+      if (value.length >= 2 && typeof value[0] === "number" && typeof value[1] === "number") {
         points.push([value[0], value[1]]);
         return;
       }
@@ -610,19 +629,15 @@ export function normalizeOsmWithReport(
     geometry: Extract<OsmNormalizedGeometry, { type: "Polygon" | "MultiPolygon" }>,
   ): Extract<OsmNormalizedGeometry, { type: "Polygon" | "MultiPolygon" }> | null => {
     const polygons: [number, number][][][] = [];
-    const sourcePolygons = geometry.type === "Polygon"
-      ? [geometry.coordinates]
-      : geometry.coordinates;
+    const sourcePolygons = geometry.type === "Polygon" ? [geometry.coordinates] : geometry.coordinates;
+    if (sourcePolygons.every((polygon) => boundaryIndex.polygonInside(polygon))) return geometry;
+    if (sourcePolygons.every((polygon) => boundaryIndex.polygonOutside(polygon))) return null;
     for (const sourcePolygon of sourcePolygons) {
-      const clipped = clipPolygonToPolygon(
-        { type: "Polygon", coordinates: sourcePolygon },
-        boundaryPolygon,
-      );
-      if (!clipped) continue;
-      if (clipped.type === "Polygon") {
-        polygons.push(clipped.coordinates);
-      } else {
-        polygons.push(...clipped.coordinates);
+      for (const boundaryPolygon of boundaryPolygons) {
+        const clipped = clipPolygonToPolygon({ type: "Polygon", coordinates: sourcePolygon }, boundaryPolygon);
+        if (!clipped) continue;
+        if (clipped.type === "Polygon") polygons.push(clipped.coordinates);
+        else polygons.push(...clipped.coordinates);
       }
     }
     if (polygons.length === 0) return null;
@@ -633,7 +648,10 @@ export function normalizeOsmWithReport(
   const clipLineGeometry = (
     coordinates: [number, number][],
   ): Extract<OsmNormalizedGeometry, { type: "LineString" | "MultiLineString" }> | null => {
-    const clippedLines = clipLineStringToPolygon(coordinates, boundaryPolygon);
+    if (boundaryIndex.lineInside(coordinates)) return { type: "LineString", coordinates };
+    if (boundaryIndex.lineOutside(coordinates)) return null;
+    const clippedLines: [number, number][][] = [];
+    for (const boundaryPolygon of boundaryPolygons) clippedLines.push(...clipLineStringToPolygon(coordinates, boundaryPolygon));
     if (clippedLines.length === 0) return null;
     if (clippedLines.length === 1) return { type: "LineString", coordinates: clippedLines[0] };
     return { type: "MultiLineString", coordinates: clippedLines };
@@ -776,7 +794,7 @@ export function normalizeOsmWithReport(
       housenumber: tags["addr:housenumber"] ?? "",
       street: tags["addr:street"] ?? "",
       postcode: tags["addr:postcode"] ?? "",
-      city: tags["addr:city"] ?? "Auch",
+      city: tags["addr:city"] ?? GERS_TERRITORY.name,
     } as AddressFeature);
   };
 
@@ -841,12 +859,12 @@ export function normalizeOsmWithReport(
 
     let geometry: OsmNormalizedGeometry | null = null;
     if (coordinates.length === 1) {
-      const point = coordinates[0];
-      if (!pointInPolygon(point[0], point[1], boundary.rings)) continue;
+      const point = coordinates[0]!;
+      if (!boundaryIndex.contains(point)) continue;
       geometry = { type: "Point", coordinates: point };
     } else {
-      const first = coordinates[0];
-      const last = coordinates[coordinates.length - 1];
+      const first = coordinates[0]!;
+      const last = coordinates[coordinates.length - 1]!;
       const isClosed = first[0] === last[0] && first[1] === last[1];
       if (
         isClosed
@@ -863,7 +881,7 @@ export function normalizeOsmWithReport(
         geometry = clipLineGeometry(coordinates);
       } else {
         const anchor = geometryAnchor({ type: "LineString", coordinates });
-        if (!pointInPolygon(anchor[0], anchor[1], boundary.rings)) continue;
+        if (!boundaryIndex.contains(anchor)) continue;
         geometry = { type: "Point", coordinates: anchor };
       }
     }
@@ -885,7 +903,8 @@ function normalizeAddresses(
   boundary: BoundaryFeature,
 ): AddressFeature[] {
   if (!raw.addresses?.length) return [];
-  const boundaryRings = boundary.rings;
+  const boundaryPolygons = boundaryPolygonComponents(boundary);
+  const boundaryIndex = createBoundaryIndex(boundaryPolygons);
   const now = new Date().toISOString();
   const features: AddressFeature[] = [];
 
@@ -893,13 +912,13 @@ function normalizeAddresses(
     const lon = r.lon as number;
     const lat = r.lat as number;
     if (!isFinite(lon) || !isFinite(lat)) continue;
-    if (!pointInPolygon(lon, lat, boundaryRings)) continue;
+    if (!boundaryIndex.contains([lon, lat])) continue;
 
     const [lx, lz] = forward(lon, lat);
     const housenumber = String(r.numero ?? "");
     const street = String(r.streetName ?? r.street ?? "");
     const postcode = String(r.postalCode ?? "");
-    const city = String(r.city ?? "Auch");
+    const city = String(r.city ?? GERS_TERRITORY.name);
     const banId = String(r.banId ?? "");
     const name = [housenumber, street].filter(Boolean).join(" ");
     const geomHash = coordHash([[lon, lat]], 1);
@@ -948,7 +967,8 @@ export function normalizeBusinesses(
   osmRaw: { status?: string; body?: unknown },
   webRaw: { results?: Record<string, unknown>[] },
 ): BusinessFeature[] {
-  const boundaryRings = boundary.rings;
+  const boundaryPolygons = boundaryPolygonComponents(boundary);
+  const boundaryIndex = createBoundaryIndex(boundaryPolygons);
   const now = new Date().toISOString();
   const features: BusinessFeature[] = [];
   const propertySources = new Map<string, Map<string, string>>();
@@ -1039,7 +1059,7 @@ export function normalizeBusinesses(
   };
 
   const insideBoundary = (lon: number, lat: number): boolean =>
-    pointInPolygon(lon, lat, boundaryRings);
+    boundaryIndex.contains([lon, lat]);
 
   const distanceMetres = (
     first: [number, number],
@@ -1254,9 +1274,9 @@ function normalizeIgn(
   boundary: BoundaryFeature,
 ): MapFeature[] {
   if (raw.unavailable || !raw.features?.length) return [];
-  const features: MapFeature[] = [];
+  const boundaryPolygons = boundaryPolygonComponents(boundary);
+  const boundaryIndex = createBoundaryIndex(boundaryPolygons);
   const now = new Date().toISOString();
-  const boundaryRings = boundary.rings;
 
   for (const f of raw.features) {
     const geom = f.geometry as { type?: string; coordinates?: unknown } | undefined;
@@ -1284,7 +1304,7 @@ function normalizeIgn(
     } else continue;
 
     if (!isFinite(lon) || !isFinite(lat)) continue;
-    if (!pointInPolygon(lon, lat, boundaryRings)) continue;
+    if (!boundaryIndex.contains([lon, lat])) continue;
 
     const [lx, lz] = forward(lon, lat);
     const name = String(props.name ?? "");
@@ -1325,19 +1345,61 @@ function normalizeIgn(
 // Writer
 // ---------------------------------------------------------------------------
 
+async function writeJsonArray(filePath: string, values: Iterable<unknown>): Promise<void> {
+  const handle = await fs.open(filePath, "w");
+  let buffer = "[";
+  let first = true;
+  try {
+    for (const value of values) {
+      const encoded = JSON.stringify(value);
+      if (encoded === undefined) continue;
+      if (!first) buffer += ",\n";
+      buffer += encoded;
+      first = false;
+      if (buffer.length >= 1024 * 1024) {
+        await handle.write(buffer);
+        buffer = "";
+      }
+    }
+    await handle.write(`${buffer}\n]\n`);
+  } finally {
+    await handle.close();
+  }
+}
+
 async function writeNormalizedFeatures(features: MapFeature[], outDir: string): Promise<void> {
+  const preserved = new Set([
+    "boundary-source.json",
+    "bdtopo-manifest.json",
+    "ign-unavailable.json",
+    "osm-manifest.json",
+    "osm-bulk-manifest.json",
+  ]);
+  for (const entry of await fs.readdir(outDir, { withFileTypes: true })) {
+    if (entry.isFile() && entry.name.endsWith(".json") && !preserved.has(entry.name)) {
+      await fs.unlink(path.join(outDir, entry.name));
+    }
+  }
+
   const groups = new Map<string, MapFeature[]>();
   for (const f of features) {
     const list = groups.get(f.kind) ?? [];
     list.push(f);
     groups.set(f.kind, list);
   }
+  const chunkSize = 20_000;
   for (const [kind, list] of groups) {
-    await fs.writeFile(path.join(outDir, `${kind}.json`), JSON.stringify(list, null, 2), "utf8");
+    for (let offset = 0; offset < list.length; offset += chunkSize) {
+      const suffix = offset === 0 ? "" : `-${String(offset / chunkSize).padStart(4, "0")}`;
+      await writeJsonArray(path.join(outDir, `${kind}${suffix}.json`), list.slice(offset, offset + chunkSize));
+    }
   }
-  const allProvenance: ProvenanceRecord[] = [];
-  for (const f of features) allProvenance.push(...f.provenance);
-  await fs.writeFile(path.join(outDir, "provenance.json"), JSON.stringify(allProvenance, null, 2), "utf8");
+  function* provenanceRecords(): Iterable<ProvenanceRecord> {
+    for (const feature of features) {
+      yield* feature.provenance;
+    }
+  }
+  await writeJsonArray(path.join(outDir, "provenance.json"), provenanceRecords());
 }
 
 // ---------------------------------------------------------------------------
@@ -1353,6 +1415,8 @@ export async function normalizeAll(rawDir?: string, outDir?: string): Promise<vo
   const sources = await loadRawSources(rd);
   const boundary = normalizeBoundary(sources.boundary);
   const osmResult = normalizeOsmWithReport(sources.osm, boundary);
+  const bdtopoFeatures = normalizeBdtopo(sources.bdtopo, boundaryPolygonComponents(boundary)) as MapFeature[];
+  const osmBulkFeatures = normalizeOsmBulk(sources.osmBulk.features ?? []) as MapFeature[];
   const addrFeatures = normalizeAddresses(sources.addresses, boundary);
   const bizFeatures = normalizeBusinesses(
     sources.businesses,
@@ -1367,7 +1431,15 @@ export async function normalizeAll(rawDir?: string, outDir?: string): Promise<vo
     JSON.stringify(osmResult.relationIssues, null, 2),
     "utf8",
   );
-  const all: MapFeature[] = [boundary, ...osmResult.features, ...addrFeatures, ...bizFeatures, ...ignFeatures];
+  const all: MapFeature[] = [
+    boundary,
+    ...osmBulkFeatures,
+    ...bdtopoFeatures,
+    ...osmResult.features,
+    ...addrFeatures,
+    ...bizFeatures,
+    ...ignFeatures,
+  ];
   await writeNormalizedFeatures(all, od);
   console.error(`[normalize] Wrote ${all.length} features to ${od}`);
   const kindCounts = new Map<string, number>();

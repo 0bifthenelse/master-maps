@@ -1,8 +1,8 @@
 // ---------------------------------------------------------------------------
-// Master Maps — Canonical Zod schemas for the Auch 2D map dataset
+// Master Maps canonical schemas for the Gers department dataset.
 //
-// All normalized features, manifest entries, coverage reports, and
-// focus records are validated through these schemas before storage.
+// All normalized features, manifest entries, coverage reports, and focus
+// records are validated through these schemas before storage.
 //
 // Zod 4.4.3 — self‑contained; does NOT import src/types/map.ts.
 // Inferred TypeScript types are exported alongside each schema.
@@ -166,6 +166,13 @@ export const FeatureBaseSchema = z.object({
   provenance: z.array(ProvenanceRecordSchema).default([]),
   sourceRefs: z.array(SourceReferenceSchema).default([]),
 });
+export const BoundaryFeatureSchema = FeatureBaseSchema.extend({
+  kind: z.literal("boundary"),
+  territoryCode: z.string().min(1),
+  geometry: z.union([PolygonSchema, MultiPolygonSchema]),
+}).strict();
+export type BoundaryFeature = z.infer<typeof BoundaryFeatureSchema>;
+
 
 // ===========================================================================
 // Per‑feature kind schemas
@@ -286,6 +293,7 @@ export type TransportFeature = z.infer<typeof TransportFeatureSchema>;
 // ===========================================================================
 
 export const MapFeatureSchema = z.discriminatedUnion("kind", [
+  BoundaryFeatureSchema,
   BuildingFeatureSchema,
   RoadFeatureSchema,
   WaterFeatureSchema,
@@ -304,6 +312,7 @@ export type MapFeature = z.infer<typeof MapFeatureSchema>;
 export const TileManifestSchema = z
   .object({
     tileId: z.string().min(1),
+    lod: z.number().int().nonnegative().default(0),
     bounds: z.tuple([
       z.number(), // minX
       z.number(), // minY
@@ -313,6 +322,8 @@ export const TileManifestSchema = z
     featureCount: z.number().int().nonnegative(),
     byteSize: z.number().int().nonnegative(),
     features: z.array(z.string().min(1)),
+    fragmentOf: z.string().optional(),
+    geometryBounds: z.tuple([z.number(), z.number(), z.number(), z.number()]).optional(),
   })
   .strict();
 export type TileManifest = z.infer<typeof TileManifestSchema>;
@@ -378,10 +389,22 @@ export const DatasetManifestSchema = z
   .object({
     datasetVersion: z.string().min(1),
     acquisitionTime: z.string(),
+    territoryCode: z.string().default("32"),
+    territoryName: z.string().default("Gers"),
+    interchangeCrs: z.string().default("EPSG:4326"),
+    processingCrs: z.string().default("EPSG:2154"),
+    renderOrigin: CoordinateSchema.optional(),
     boundary: BboxSchema,
     projectionOrigin: CoordinateSchema,
     tileSize: z.number().positive(),
     tileBounds: z.array(BboxSchema).optional(),
+    lods: z.array(
+      z.object({
+        level: z.number().int().nonnegative(),
+        tileSize: z.number().positive(),
+        tileCount: z.number().int().nonnegative(),
+      }).strict(),
+    ).optional(),
     featureCounts: z.record(z.string(), z.number().int().nonnegative()),
     byteSizes: z.record(z.string(), z.number().int().nonnegative()).optional(),
     layerAvailability: z.record(z.string(), z.boolean()).optional(),
@@ -473,6 +496,7 @@ export function validateGeometry(geom: unknown, label: string = "geometry"): Geo
 
 /** Discriminant keys for per‑kind feature access. */
 export const FEATURE_KINDS = [
+  "boundary",
   "building",
   "road",
   "water",
