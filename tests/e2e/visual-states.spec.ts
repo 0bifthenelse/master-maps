@@ -1,5 +1,10 @@
 import { test, expect, checkPngNotBlank, ARTIFACTS_DIR, type BrowserErrors } from "./fixtures";
 import type { Page } from "@playwright/test";
+function sleep(milliseconds: number): Promise<void> {
+  const waiter = Promise.withResolvers<void>();
+  setTimeout(waiter.resolve, milliseconds);
+  return waiter.promise;
+}
 
 const VIEWPORTS = [
   { name: "desktop", width: 1280, height: 720 },
@@ -89,7 +94,7 @@ test.describe("Visual states", () => {
 
   test("loading state is visible before data resolves", async ({ page }) => {
     await page.route("**/api/map/**", async (route) => {
-      await new Promise((resolve) => setTimeout(resolve, 500));
+      await sleep(500);
       await route.continue();
     });
     await page.goto("/");

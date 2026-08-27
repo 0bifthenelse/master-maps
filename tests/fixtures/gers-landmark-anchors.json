@@ -1,6 +1,6 @@
 {
   "territory": { "code": "32", "name": "Gers" },
-  "source": "IGN Admin Express COG, BAN, OpenStreetMap and geo.api.gouv.fr spot corroboration",
+  "source": "IGN Admin Express COG, IGN BD TOPO, BAN, and OpenStreetMap",
   "anchors": {
     "gareAuch": { "coordinate": [0.5967168714285714, 43.64730908571429], "sourceUrl": "https://www.openstreetmap.org/way/65477442" },
     "cathedralSainteMarie": { "coordinate": [0.586107265060241, 43.64626884518072], "sourceUrl": "https://www.openstreetmap.org/way/65470768" },

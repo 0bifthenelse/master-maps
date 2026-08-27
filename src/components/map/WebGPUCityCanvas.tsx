@@ -21,7 +21,7 @@ interface RendererContract {
 export interface WebGPUCityCanvasProps {
   children: ReactNode;
   bounds?: [number, number, number, number];
-  cameraFocus?: { x: number; z: number } | null;
+  cameraFocus?: { x: number; z: number; zoom?: number } | null;
   cameraReset?: number;
   onCameraMoved?: () => void;
   onViewportChange?: (snapshot: {
@@ -29,6 +29,7 @@ export interface WebGPUCityCanvasProps {
     zoom: number;
     width: number;
     height: number;
+    headingRadians: number;
   }) => void;
 }
 
@@ -159,7 +160,7 @@ export default function WebGPUCityCanvas({
      immediately since the move itself is animated inside MapCamera. */
   useEffect(() => {
     if (!cameraFocus) return;
-    cameraRigRef.current?.focusOn([cameraFocus.x, cameraFocus.z]);
+    cameraRigRef.current?.focusOn([cameraFocus.x, cameraFocus.z], undefined, cameraFocus.zoom);
     onCameraMoved?.();
   }, [cameraFocus, onCameraMoved]);
 
@@ -186,7 +187,7 @@ export default function WebGPUCityCanvas({
       >
         <CameraRig
           ref={cameraRigRef}
-          communeBounds={sceneBounds}
+          territoryBounds={sceneBounds}
           cameraHeight={CAMERA_HEIGHT}
           onViewportChange={onViewportChange}
         />

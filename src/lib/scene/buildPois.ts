@@ -1,21 +1,6 @@
-// @ts-nocheck
 /**
- * @file POI marker geometry builder.
- *
- * Converts PoiFeature records into batched Three.js geometry for
- * the flat map.  Two strategies are exported:
- *
- *   1. `buildPoiInstances()` – InstancedMesh with CircleGeometry base,
- *      per-instance colour and transformation.  Supports raycast picking
- *      via `instanceId`.
- *
- *   2. `buildPoiPoints()`  – Lightweight Points geometry using poiMat
- *      (accent #ff7d27).  No per-instance interaction, minimal GPU cost.
- *
- * @see THEME: poiMat (PointsMaterial, accent colour)
- * @see PLAN §6: "Use batched marker geometry or InstancedMesh for POIs"
+ * Build batched flat POI and business markers.
  */
-
 import {
   BufferGeometry,
   CircleGeometry,
@@ -27,50 +12,24 @@ import {
   Points,
   Quaternion,
   Vector3,
-} from 'three';
+} from "three";
+import type { BusinessFeature, PoiFeature } from "@/lib/data/schema";
 
-// ─── Local types ────────────────────────────────────────────────────────────
+type PointGeometry = Extract<PoiFeature["geometry"], { type: "Point" }>;
+type BusinessPointGeometry = Extract<BusinessFeature["geometry"], { type: "Point" }>;
 
-type CoordPair = [number, number]; // [x, z]
-
-interface PointRep {
-  type: 'Point';
-  coordinates: CoordPair;
-}
-
-export interface PoiFeatureShape {
-  kind: 'poi';
-  stableId: string;
-  geometry: PointRep;
-  name?: string;
-  category?: string;
-  /** Optional icon key (future use). */
+export type PoiFeatureShape = Pick<PoiFeature, "kind" | "stableId" | "name" | "category"> & {
+  geometry: PointGeometry;
   icon?: string;
-  /** Optional override colour (CSS hex, e.g. "#e74c3c"). */
   color?: string;
-  /** Marker size in metres (default 4). */
   size?: number;
-}
-export interface BusinessFeatureShape {
-  kind: 'business';
-  stableId: string;
-  geometry: PointRep;
-  name?: string;
-  businessName?: string;
-  legalName?: string;
-  brand?: string;
-  category?: string;
-  nafLabel?: string;
-  nafCode?: string;
-  address?: string;
-  siret?: string;
-  phone?: string;
-  website?: string;
+};
+
+export type BusinessFeatureShape = Pick<BusinessFeature, "kind" | "stableId" | "name" | "businessName" | "legalName" | "brand" | "category" | "nafLabel" | "nafCode" | "address" | "siret" | "phone" | "website" | "openingHours" | "operator" | "wheelchair"> & {
+  geometry: BusinessPointGeometry;
   size?: number;
-  openingHours?: string;
-  operator?: string;
-  wheelchair?: string;
-}
+};
+
 
 // ─── Builder result types ───────────────────────────────────────────────────
 
@@ -153,7 +112,7 @@ export function buildPoiInstances(features: PoiFeatureShape[]): InstancedResult 
   const featureIdByInstance: number[] = [];
 
   for (let i = 0; i < count; i++) {
-    const feat = features[i];
+    const feat = features[i]!;
     const size = feat.size ?? DEFAULT_POI_SIZE;
     const [x, z] = feat.geometry.coordinates;
 
@@ -166,7 +125,7 @@ export function buildPoiInstances(features: PoiFeatureShape[]): InstancedResult 
     mesh.setMatrixAt(i, _matrix);
 
     // Per-instance colour (defaults to accent).
-    _color.set(feat.color ?? '#ff7d27');
+    _color.setStyle(feat.color ?? "#ff7d27");
     mesh.setColorAt(i, _color);
 
     featureIdByInstance.push(i);
@@ -202,14 +161,14 @@ export function buildBusinessInstances(
   const baseColors = features.map(() => BUSINESS_COLOR);
 
   for (let i = 0; i < count; i += 1) {
-    const feature = features[i];
+    const feature = features[i]!;
     const [x, z] = feature.geometry.coordinates;
     _position.set(x, 0, z);
     _scale.set((feature.size ?? DEFAULT_BUSINESS_SIZE) / 2, (feature.size ?? DEFAULT_BUSINESS_SIZE) / 2, 1);
     _quat.identity();
     _matrix.compose(_position, _quat, _scale);
     mesh.setMatrixAt(i, _matrix);
-    _color.set(baseColors[i]);
+    _color.setStyle(baseColors[i]!);
     mesh.setColorAt(i, _color);
     featureIdByInstance.push(i);
   }
@@ -218,11 +177,11 @@ export function buildBusinessInstances(
   const setHighlight = (instanceId: number | null): void => {
     if (!mesh.instanceColor) return;
     if (highlightedInstance >= 0 && highlightedInstance < count) {
-      _color.set(baseColors[highlightedInstance]);
+      _color.setStyle(baseColors[highlightedInstance]!);
       mesh.setColorAt(highlightedInstance, _color);
     }
     if (instanceId !== null && instanceId >= 0 && instanceId < count) {
-      _color.set(BUSINESS_HOVER_COLOR);
+      _color.setStyle(BUSINESS_HOVER_COLOR);
       mesh.setColorAt(instanceId, _color);
       highlightedInstance = instanceId;
     } else {
@@ -266,7 +225,7 @@ export function buildPoiPoints(features: PoiFeatureShape[]): PointsResult {
   const positions: number[] = [];
 
   for (let i = 0; i < count; i++) {
-    const feat = features[i];
+    const feat = features[i]!;
     const [x, z] = feat.geometry.coordinates;
     positions.push(x, 0, z);
   }
@@ -293,7 +252,7 @@ export function buildPoiPoints(features: PoiFeatureShape[]): PointsResult {
 // ─── Default export (prefer InstancedMesh) ──────────────────────────────────
 
 /**
- * Default POI builder – uses InstancedMesh for clickable markers.
+ * Default POI builder, using InstancedMesh for clickable markers.
  *
  * @see buildPoiInstances
  */

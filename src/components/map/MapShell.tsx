@@ -1,271 +1,61 @@
-// @ts-nocheck
- "use client";
+"use client";
 
-import {
-  useCallback,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-  type ReactNode,
-} from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import dynamic from "next/dynamic";
-
-// ---------------------------------------------------------------------------
-// Dynamic imports for heavy canvas components (WebGPU + Three.js)
-// ---------------------------------------------------------------------------
-const WebGPUCityCanvas = dynamic(
-  () => import("@/components/map/WebGPUCityCanvas"),
-  { ssr: false, loading: () => null },
-);
-
-const CityScene = dynamic(
-  () => import("@/components/map/CityScene"),
-  { ssr: false, loading: () => null },
-);
-
-// ---------------------------------------------------------------------------
-// Direct imports for UI overlay components (lightweight, server-compatible)
-// ---------------------------------------------------------------------------
 import MapHud from "@/components/map/MapHud";
 import FeatureInspector from "@/components/map/FeatureInspector";
-import LayerControls from "@/components/map/LayerControls";
+import LayerControls, { DEFAULT_LAYERS as BASE_LAYERS, type LayerId, type LayerState } from "@/components/map/LayerControls";
 import SourceAttribution from "@/components/map/SourceAttribution";
 import LoadingState from "@/components/map/LoadingState";
 import WebGPUUnsupported from "@/components/map/WebGPUUnsupported";
 import { publishSceneDiagnostics, sceneMetrics } from "@/lib/scene/sceneMetrics";
-import { searchIndex as runSearchIndex, type SearchRecord as SearchIndexRecord } from "@/lib/data/search";
-import { computeLocalFocus, type LocalGeometry as FocusLocalGeometry } from "@/lib/geo/focus";
+import { searchIndex as runSearchIndex } from "@/lib/data/search";
+import { computeLocalFocus, type LocalGeometry } from "@/lib/geo/focus";
+import {
+  DatasetManifestSchema,
+  SearchRecordSchema,
+  TileDataSchema,
+  type DatasetManifest,
+  type FeatureKind,
+  type MapFeature,
+  type SearchRecord,
+  type TileData,
+} from "@/lib/data/schema";
 import { loadTile } from "@/lib/data/loadTile";
+import type { SceneFeature } from "./CityScene";
 
-// ---------------------------------------------------------------------------
-// Local type definitions — match the schema contracts expected from
-// src/lib/data/schema.ts (will converge during typecheck phase).
-// ---------------------------------------------------------------------------
+const WebGPUCityCanvas = dynamic(() => import("@/components/map/WebGPUCityCanvas"), { ssr: false, loading: () => null });
+const CityScene = dynamic(() => import("@/components/map/CityScene"), { ssr: false, loading: () => null });
 
-/** Source metadata for a data record. */
-interface SourceReference {
-  source: string;
-  url?: string;
-  timestamp: string;
-  license?: string;
-  sha256?: string;
-  recordCount?: number;
-}
-
-/** A resolved provenance record for a property. */
-interface ProvenanceRecord {
-  featureId: string;
-  property: string;
-  winner: string;
-  contenders: string[];
-  priority: number;
-  timestamp: string;
-}
-
-/** Discriminated geographic feature. */
-type FeatureKind =
-  | "building"
-  | "road"
-  | "water"
-  | "landuse"
-  | "poi"
-  | "business"
-  | "address"
-  | "transport"
-  | "boundary";
-
-interface MapFeatureGeometry {
-  type: "Point" | "LineString" | "MultiLineString" | "Polygon" | "MultiPolygon";
-  coordinates: unknown;
-}
-
-interface MapFeatureBase {
-  id: string;
-  kind: FeatureKind;
-  name?: string;
-  geometry?: MapFeatureGeometry;
-  /** WGS84 [lng, lat] focus coordinate. */
-  coord?: [number, number];
-  /** Local projection [x, z] position. */
-  localCoord?: [number, number];
-  provenance?: ProvenanceRecord[];
-  status: "active" | "uncertain" | "inferred" | "unresolved";
-  sourceRefs?: SourceReference[];
-  /** Additional typed metadata. */
-  metadata?: Record<string, unknown>;
-  /** Search key for accent-insensitive lookup. */
-  searchKey?: string;
-  /** Nocibé-specific BAN identifier. */
-  banId?: string;
-}
-
-interface BuildingFeature extends MapFeatureBase {
-  kind: "building";
-  height?: number;
-  levels?: number;
-  heightSource?: "explicit" | "inferred-from-levels" | "inferred-category";
-}
-
-interface RoadFeature extends MapFeatureBase {
-  kind: "road";
-  width?: number;
-  roadClass?:
-    | "motorway"
-    | "trunk"
-    | "primary"
-    | "secondary"
-    | "tertiary"
-    | "residential"
-    | "service"
-    | "pedestrian"
-    | "footway"
-    | "cycleway"
-    | "path"
-    | "track";
-  bridge?: boolean;
-  tunnel?: boolean;
-}
-
-interface WaterFeature extends MapFeatureBase {
-  kind: "water";
-  waterType?: string;
-  width?: number;
-  widthInferred?: boolean;
-}
-
-interface LanduseFeature extends MapFeatureBase {
-  kind: "landuse";
-  landuseType?: string;
-}
-
-interface PoiFeature extends MapFeatureBase {
-  kind: "poi";
-  category?: string;
-}
-
-interface BusinessFeature extends MapFeatureBase {
-  kind: "business";
-  businessName?: string;
-  legalName?: string;
-  brand?: string;
-  category?: string;
-  nafCode?: string;
-  nafLabel?: string;
-  siret?: string;
-  siren?: string;
-  phone?: string;
-  website?: string;
-  openingHours?: string;
-  operator?: string;
-  wheelchair?: string;
-}
-
-interface AddressFeature extends MapFeatureBase {
-  kind: "address";
-  street?: string;
-  housenumber?: string;
-  postcode?: string;
-}
-
-interface TransportFeature extends MapFeatureBase {
-  kind: "transport";
-  transportType?: "bus" | "rail" | "tram" | "stop" | "station";
-}
-
-type MapFeature =
-  | BuildingFeature
-  | RoadFeature
-  | WaterFeature
-  | LanduseFeature
-  | PoiFeature
-  | BusinessFeature
-  | AddressFeature
-  | TransportFeature
-  | MapFeatureBase;
-interface TileManifestEntry {
-  tileId: string;
-  lod?: number;
-  bounds: [number, number, number, number];
-  featureCount: number;
-  byteSize: number;
-  features: string[];
-}
-
-interface ManifestData {
-  datasetVersion: string;
-  acquisitionTime: string;
-  version?: string;
-  pipeline?: string[];
-  boundary: {
-    west: number;
-    east: number;
-    south: number;
-    north: number;
-  };
-  projectionOrigin: {
-    lng: number;
-    lat: number;
-  };
-  tileSize?: number;
-  tileCount?: number;
-  tileIds?: string[];
-  tiles?: TileManifestEntry[];
-  featureCounts: Record<string, number>;
-  layerAvailability: Record<string, boolean>;
-  bounds?: [number, number, number, number];
-  nocibeFocus?: NocibeFocusData;
-}
-
-interface NocibeFocusData {
-  name: string;
-  searchKey: string;
-  banId: string;
-  address: string;
-  coord: [number, number];
-  sourceRefs: SourceReference[];
-  confidence: string;
-  status: string;
-  anchors: { name: string; coord: [number, number] }[];
-}
-type LocalGeometry =
-  | { type: "Point"; coordinates: LocalCoordinate }
-  | { type: "LineString"; coordinates: LocalCoordinate[] }
-  | { type: "MultiLineString"; coordinates: LocalCoordinate[][] }
-  | { type: "Polygon"; coordinates: LocalCoordinate[][] }
-  | { type: "MultiPolygon"; coordinates: LocalCoordinate[][][] };
-
-interface RawMapFeature {
-  kind: FeatureKind;
-  stableId: string;
-  localGeometry?: LocalGeometry;
-  x?: number;
-  z?: number;
-  lon?: number;
-  lat?: number;
-  name?: string;
-  displayName?: string;
-  [key: string]: unknown;
-}
-
-interface TileEnvelope {
-  manifest: TileManifestEntry;
-  features: RawMapFeature[];
-  metadata?: Record<string, unknown>;
-}
-
-interface TileData {
-  tileId: string;
-  features: RawMapFeature[];
-  bounds: [number, number, number, number];
-}
 interface ViewportSnapshot {
   target: [number, number];
   zoom: number;
   width: number;
   height: number;
+  headingRadians: number;
 }
-const renderableKinds: Record<FeatureKind, boolean> = {
+interface TileRuntimeDiagnostics {
+  requested: string[];
+  aborted: string[];
+  failed: string[];
+  loaded: string[];
+}
+
+declare global {
+  interface Window {
+    __masterMapsTileDiagnostics?: TileRuntimeDiagnostics;
+  }
+}
+
+function tileRuntimeDiagnostics(): TileRuntimeDiagnostics {
+  if (!window.__masterMapsTileDiagnostics) {
+    window.__masterMapsTileDiagnostics = { requested: [], aborted: [], failed: [], loaded: [] };
+  }
+  return window.__masterMapsTileDiagnostics;
+}
+
+const RENDERABLE_KINDS: Record<FeatureKind, boolean> = {
+  boundary: true,
   building: true,
   road: true,
   water: true,
@@ -274,661 +64,323 @@ const renderableKinds: Record<FeatureKind, boolean> = {
   business: true,
   address: false,
   transport: false,
-  boundary: true,
 };
 
-interface SearchRecord {
-  featureId: string;
-  canonicalName: string;
-  normalizedName: string;
-  aliases: string[];
-  kind: FeatureKind;
-  tileId: string;
-  focusLon: number;
-  focusLat: number;
+const TILE_LOAD_CONCURRENCY = 8;
+const DEFAULT_LAYERS: LayerState = { ...BASE_LAYERS, commercialAudit: false };
+const LS_THEME_KEY = "map-theme";
+
+function manifestBounds(manifest: DatasetManifest): [number, number, number, number] {
+  if (manifest.bounds) return manifest.bounds;
+  const tiles = manifest.tiles ?? [];
+  if (tiles.length === 0) return [0, 0, 0, 0];
+  return tiles.reduce<[number, number, number, number]>((bounds, tile) => [
+    Math.min(bounds[0], tile.bounds[0]),
+    Math.min(bounds[1], tile.bounds[1]),
+    Math.max(bounds[2], tile.bounds[2]),
+    Math.max(bounds[3], tile.bounds[3]),
+  ], tiles[0]!.bounds);
 }
 
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
+function lodForSpan(span: number): 0 | 1 | 2 {
+  if (span <= 12_000) return 0;
+  if (span <= 60_000) return 1;
+  return 2;
+}
 
-const DEFAULT_LAYERS: Record<string, boolean> = {
-  buildings: true,
-  roads: true,
-  water: true,
-  landuse: true,
-  pois: true,
-  addresses: false,
-  transport: false,
-  boundary: true,
-  "nocibe-commercial-audit": false,
-  labels: true,
-};
+function enclosingBounds(viewport: ViewportSnapshot | null, bounds: [number, number, number, number]): [number, number, number, number] {
+  const target = viewport?.target ?? [(bounds[0] + bounds[2]) / 2, (bounds[1] + bounds[3]) / 2];
+  const zoom = Math.max(viewport?.zoom ?? 1, 1e-6);
+  const halfWidth = (viewport?.width ?? bounds[2] - bounds[0]) / zoom / 2;
+  const halfHeight = (viewport?.height ?? bounds[3] - bounds[1]) / zoom / 2;
+  const heading = viewport?.headingRadians ?? 0;
+  const cosine = Math.abs(Math.cos(heading));
+  const sine = Math.abs(Math.sin(heading));
+  const halfX = cosine * halfWidth + sine * halfHeight;
+  const halfZ = sine * halfWidth + cosine * halfHeight;
+  return [target[0] - halfX, target[1] - halfZ, target[0] + halfX, target[1] + halfZ];
+}
 
-const LS_THEME_KEY = "map-theme";
-const TILE_LOAD_CONCURRENCY = 8;
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/** Count loaded features across all tiles. */
-function visibleTileIds(
-  manifest: ManifestData,
-  viewport: ViewportSnapshot | null,
-): string[] {
+function visibleTileIds(manifest: DatasetManifest, viewport: ViewportSnapshot | null): string[] {
   const entries = manifest.tiles ?? [];
   if (entries.length === 0) return [];
-  const manifestBounds = manifest.bounds ?? [
-    entries[0].bounds[0],
-    entries[0].bounds[1],
-    entries[entries.length - 1].bounds[2],
-    entries[entries.length - 1].bounds[3],
-  ];
-  const target = viewport?.target ?? [
-    (manifestBounds[0] + manifestBounds[2]) / 2,
-    (manifestBounds[1] + manifestBounds[3]) / 2,
-  ];
-  const width = viewport?.width ?? manifestBounds[2] - manifestBounds[0];
-  const height = viewport?.height ?? manifestBounds[3] - manifestBounds[1];
-  const zoom = Math.max(viewport?.zoom ?? 1, 0.001);
-  const visibleWidth = width / zoom;
-  const visibleHeight = height / zoom;
-  const span = Math.max(visibleWidth, visibleHeight);
-  const lod = span <= 12000 ? 0 : span <= 60000 ? 1 : 2;
-  const candidates = entries.filter((entry) => (entry.lod ?? 0) === lod);
-  const tileSize = candidates[0] ? candidates[0].bounds[2] - candidates[0].bounds[0] : span;
-  const viewBounds: [number, number, number, number] = [
-    target[0] - visibleWidth / 2 - tileSize,
-    target[1] - visibleHeight / 2 - tileSize,
-    target[0] + visibleWidth / 2 + tileSize,
-    target[1] + visibleHeight / 2 + tileSize,
-  ];
-  return candidates.filter((entry) =>
-    entry.bounds[0] <= viewBounds[2] && entry.bounds[2] >= viewBounds[0]
-    && entry.bounds[1] <= viewBounds[3] && entry.bounds[3] >= viewBounds[1],
-  ).map((entry) => entry.tileId);
+  const datasetBounds = manifestBounds(manifest);
+  const view = enclosingBounds(viewport, datasetBounds);
+  const span = Math.max(view[2] - view[0], view[3] - view[1]);
+  const lod = viewport ? lodForSpan(span) : 2;
+  const candidates = entries.filter((entry) => entry.lod === lod);
+  const tileSize = candidates[0]?.bounds[2] !== undefined ? candidates[0].bounds[2] - candidates[0].bounds[0] : span;
+  const margin = tileSize;
+  const expanded: [number, number, number, number] = [view[0] - margin, view[1] - margin, view[2] + margin, view[3] + margin];
+  return candidates.filter((entry) => entry.bounds[0] <= expanded[2] && entry.bounds[2] >= expanded[0] && entry.bounds[1] <= expanded[3] && entry.bounds[3] >= expanded[1]).map((entry) => entry.tileId).sort();
 }
 
-function countFeatures(tileMap: Map<string, TileData>): number {
+function countTileFeatures(tiles: Map<string, TileData>): number {
   let count = 0;
-  for (const tile of tileMap.values()) {
-    count += tile.features.length;
-  }
+  for (const tile of tiles.values()) count += tile.features.length;
   return count;
 }
 
-/** Compute a focus [x, z] from a MapFeature's local geometry, falling back
- *  to its stored anchor coordinate when no local geometry is available. */
 function focusFromFeature(feature: MapFeature): { x: number; z: number } | null {
-  if ("localGeometry" in feature && feature.localGeometry) {
-    const localGeometry = feature.localGeometry as FocusLocalGeometry;
-    const [x, z] = computeLocalFocus(localGeometry);
-    return { x, z };
+  if (feature.localGeometry) {
+    const [x, z] = computeLocalFocus(feature.localGeometry as LocalGeometry);
+    return Number.isFinite(x) && Number.isFinite(z) ? { x, z } : null;
   }
-  if (feature.localCoord) {
-    const [x, z] = feature.localCoord;
-    if (x !== undefined && z !== undefined) {
-      return { x, z };
-    }
-  }
-  if (feature.coord) {
-    const [lng, lat] = feature.coord;
-    if (lng !== undefined && lat !== undefined) {
-      // If only WGS84 available, assume it will be projected by the canvas.
-      return { x: lng, z: lat };
-    }
-  }
+  if (feature.x !== undefined && feature.z !== undefined) return { x: feature.x, z: feature.z };
   return null;
 }
 
-// ---------------------------------------------------------------------------
-// MapShell — top-level client component
-// ---------------------------------------------------------------------------
+function sceneFeature(feature: MapFeature): SceneFeature | null {
+  if (!RENDERABLE_KINDS[feature.kind] || !feature.localGeometry) return null;
+  const geometry = feature.localGeometry;
+  if (feature.kind === "building" && (geometry.type === "Polygon" || geometry.type === "MultiPolygon")) return { ...feature, geometry } as SceneFeature;
+  if (feature.kind === "road" && (geometry.type === "LineString" || geometry.type === "MultiLineString")) return { ...feature, geometry } as SceneFeature;
+  if (feature.kind === "water" && geometry.type !== "Point") return { ...feature, geometry } as SceneFeature;
+  if (feature.kind === "landuse" && (geometry.type === "Polygon" || geometry.type === "MultiPolygon")) return { ...feature, geometry } as SceneFeature;
+  if ((feature.kind === "poi" || feature.kind === "business") && geometry.type === "Point") return { ...feature, geometry } as SceneFeature;
+  if (feature.kind === "boundary" && (geometry.type === "Polygon" || geometry.type === "MultiPolygon")) return { ...feature, geometry } as SceneFeature;
+  return null;
+}
+
+function sceneFeatureKey(feature: MapFeature): string {
+  return feature.fragmentId ?? feature.stableId;
+}
+
+function deduplicateSceneFeatures(tiles: Map<string, TileData>): SceneFeature[] {
+  const minimumLod = new Map<string, number>();
+  for (const tile of tiles.values()) {
+    for (const feature of tile.features) {
+      const lod = tile.manifest.lod;
+      const previous = minimumLod.get(feature.stableId);
+      if (previous === undefined || lod < previous) minimumLod.set(feature.stableId, lod);
+    }
+  }
+  const selected = new Map<string, SceneFeature>();
+  for (const tile of tiles.values()) {
+    for (const feature of tile.features) {
+      if (tile.manifest.lod !== minimumLod.get(feature.stableId)) continue;
+      const renderable = sceneFeature(feature);
+      if (renderable) selected.set(sceneFeatureKey(feature), renderable);
+    }
+  }
+  return [...selected.values()];
+}
 
 export default function MapShell() {
-  // ---- State ----
-  const [theme, setTheme] = useState<"light" | "dark">(() => {
-    const stored = localStorage.getItem(LS_THEME_KEY);
+  const [theme] = useState<"light" | "dark">(() => {
+    if (typeof window === "undefined") return "light";
+    const stored = window.localStorage.getItem(LS_THEME_KEY);
     if (stored === "dark" || stored === "light") return stored;
     return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
   });
-  const [selectedFeature, setSelectedFeature] = useState<MapFeature | null>(
-    null,
-  );
-  const [cameraFocus, setCameraFocus] = useState<{
-    x: number;
-    z: number;
-  } | null>(null);
-  const [cameraResetCounter, setCameraResetCounter] = useState(0);
-  const [layers, setLayers] =
-    useState<Record<string, boolean>>(DEFAULT_LAYERS);
-  const [manifest, setManifest] = useState<ManifestData | null>(null);
+  const [selectedFeature, setSelectedFeature] = useState<MapFeature | null>(null);
+  const [cameraFocus, setCameraFocus] = useState<{ x: number; z: number; zoom: number } | null>(null);
+  const [cameraReset, setCameraReset] = useState(0);
+  const [layers, setLayers] = useState<LayerState>(DEFAULT_LAYERS);
+  const [manifest, setManifest] = useState<DatasetManifest | null>(null);
   const [tiles, setTiles] = useState<Map<string, TileData>>(new Map());
   const [viewport, setViewport] = useState<ViewportSnapshot | null>(null);
-  const [searchIndex, setSearchIndex] = useState<SearchRecord[]>([]);
+  const [searchRecords, setSearchRecords] = useState<SearchRecord[]>([]);
   const [searchQuery, setSearchQuery] = useState("");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [webGpuStatus, setWebGpuStatus] = useState<
-    "unknown" | "supported" | "unsupported"
-  >("unknown");
+  const [webGpuStatus, setWebGpuStatus] = useState<"unknown" | "supported" | "unsupported">("unknown");
   const [mobileInspectorOpen, setMobileInspectorOpen] = useState(false);
+  const tilesRef = useRef<Map<string, TileData>>(new Map());
+  const inFlightRef = useRef<Map<string, AbortController>>(new Map());
+  const desiredIdsRef = useRef<string[]>([]);
+  const desiredGenerationRef = useRef(0);
 
-  // Refs
-  const shellRef = useRef<HTMLDivElement>(null);
-  const diagnosticsRef = useRef<HTMLDivElement>(null);
-
-  // ---- Theme: track OS preference changes when no explicit choice is stored ----
-  useEffect(() => {
-    if (localStorage.getItem(LS_THEME_KEY) === "dark" || localStorage.getItem(LS_THEME_KEY) === "light") {
-      return undefined;
-    }
-    const mq = window.matchMedia("(prefers-color-scheme: dark)");
-    const handler = (e: MediaQueryListEvent): void => {
-      setTheme(e.matches ? "dark" : "light");
-    };
-    mq.addEventListener("change", handler);
-    return () => mq.removeEventListener("change", handler);
-  }, []);
-
-  // Apply theme
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
-    try {
-      localStorage.setItem(LS_THEME_KEY, theme);
-    } catch {
-      // localStorage may be unavailable (private browsing, permissions)
-    }
+    try { window.localStorage.setItem(LS_THEME_KEY, theme); } catch { /* storage is optional */ }
   }, [theme]);
 
-  // ---- Manifest and search metadata load ----
   useEffect(() => {
     const controller = new AbortController();
-    async function loadMetadata(): Promise<void> {
+    const loadMetadata = async (): Promise<void> => {
       try {
         setLoading(true);
-        setError(null);
-        const gpuSupported = typeof navigator !== "undefined" && navigator.gpu !== undefined;
-        setWebGpuStatus(gpuSupported ? "supported" : "unsupported");
-        const manifestRes = await fetch("/api/map/manifest", { signal: controller.signal, headers: { Accept: "application/json" } });
-        if (!manifestRes.ok) throw new Error(`Manifest load failed: ${manifestRes.status}`);
-        const manifestData = await manifestRes.json() as ManifestData;
-        if (controller.signal.aborted) return;
-        setManifest(manifestData);
-        const searchRes = await fetch("/api/map/search", { signal: controller.signal, headers: { Accept: "application/json" } });
-        if (!searchRes.ok) throw new Error(`Search index load failed: ${searchRes.status}`);
-        const searchBody = await searchRes.json() as SearchRecord[] | { records?: SearchRecord[] };
-        setSearchIndex(Array.isArray(searchBody) ? searchBody : searchBody.records ?? []);
+        const manifestResponse = await fetch("/api/map/manifest", { signal: controller.signal, headers: { Accept: "application/json" } });
+        if (!manifestResponse.ok) throw new Error(`Manifest load failed: ${manifestResponse.status}`);
+        const parsedManifest = DatasetManifestSchema.parse(await manifestResponse.json() as unknown);
+        const searchResponse = await fetch("/api/map/search", { signal: controller.signal, headers: { Accept: "application/json" } });
+        if (!searchResponse.ok) throw new Error(`Search index load failed: ${searchResponse.status}`);
+        const body = await searchResponse.json() as unknown;
+        if (!Array.isArray(body)) throw new Error("Search index response is not an array");
+        const records = body.map((entry) => SearchRecordSchema.parse(entry));
+        setManifest(parsedManifest);
+        setSearchRecords(records);
+        setWebGpuStatus(typeof navigator !== "undefined" && navigator.gpu ? "supported" : "unsupported");
         setLoading(false);
       } catch (cause) {
-        if (!controller.signal.aborted) {
-          setError(cause instanceof Error ? cause.message : "Failed to load map metadata");
-          setLoading(false);
-        }
+        if (controller.signal.aborted) return;
+        setError(cause instanceof Error ? cause.message : String(cause));
+        setLoading(false);
       }
-    }
+    };
     void loadMetadata();
     return () => controller.abort();
   }, []);
 
-  // ---- Viewport tile streaming ----
+  const desiredIds = useMemo(() => manifest ? visibleTileIds(manifest, viewport) : [], [manifest, viewport]);
+  const desiredKey = desiredIds.join("|");
   useEffect(() => {
-    if (!manifest) return undefined;
-    const controller = new AbortController();
-    const desiredIds = visibleTileIds(manifest, viewport);
-    const desired = new Set(desiredIds);
-    const pending = desiredIds.filter((tileId) => !tiles.has(tileId));
-    async function streamTiles(): Promise<void> {
-      await Promise.resolve();
-      if (controller.signal.aborted) return;
-      setTiles((previous) => {
-        const retained = new Map<string, TileData>();
-        for (const [tileId, tile] of previous) if (desired.has(tileId)) retained.set(tileId, tile);
-        if (retained.size === previous.size && [...retained.keys()].every((tileId) => previous.has(tileId))) return previous;
-        return retained;
-      });
-      for (let offset = 0; offset < pending.length; offset += TILE_LOAD_CONCURRENCY) {
-        if (controller.signal.aborted) return;
-        const batch = pending.slice(offset, offset + TILE_LOAD_CONCURRENCY);
-        const results = await Promise.all(batch.map(async (tileId) => {
-          try {
-            const envelope = await loadTile(tileId, controller.signal);
-            return {
-              tileId,
-              data: {
-                tileId,
-                features: envelope.features as RawMapFeature[],
-                bounds: envelope.manifest.bounds,
-              },
-            };
-          } catch (cause) {
-            if (!controller.signal.aborted) console.warn(`Tile ${tileId} fetch error`, cause);
-            return null;
-          }
-        }));
-        if (controller.signal.aborted) return;
-        setTiles((previous) => {
-          const next = new Map(previous);
-          for (const result of results) if (result && desired.has(result.tileId)) next.set(result.tileId, result.data);
-          return next;
-        });
+    desiredIdsRef.current = desiredIds;
+  }, [desiredIds]);
+
+  useEffect(() => {
+    if (!manifest) return;
+    const desired = new Set(desiredIdsRef.current);
+    const generation = desiredGenerationRef.current + 1;
+    desiredGenerationRef.current = generation;
+    for (const [tileId, controller] of inFlightRef.current) {
+      if (!desired.has(tileId)) {
+        controller.abort();
+        inFlightRef.current.delete(tileId);
       }
     }
-    void streamTiles();
-    return () => controller.abort();
-  }, [manifest, viewport, tiles]);
+    const pending = desiredIdsRef.current.filter((tileId) => !tilesRef.current.has(tileId) && !inFlightRef.current.has(tileId));
+    let cursor = 0;
+    const loadWorker = async (): Promise<void> => {
+      while (cursor < pending.length && desiredGenerationRef.current === generation) {
+        const tileId = pending[cursor++]!;
+        const controller = new AbortController();
+        inFlightRef.current.set(tileId, controller);
+        tileRuntimeDiagnostics().requested.push(tileId);
+        controller.signal.addEventListener("abort", () => {
+          tileRuntimeDiagnostics().aborted.push(tileId);
+        }, { once: true });
+        try {
+          const tile = TileDataSchema.parse(await loadTile(tileId, controller.signal));
+          if (desiredGenerationRef.current === generation && desiredIdsRef.current.includes(tileId)) {
+            setTiles((previous) => {
+              const next = new Map(previous);
+              next.set(tileId, tile);
+              tileRuntimeDiagnostics().loaded.push(tileId);
+              const replacementReady = desiredIdsRef.current.some((id) => next.has(id));
+              if (replacementReady) for (const loadedId of next.keys()) if (!desired.has(loadedId)) next.delete(loadedId);
+              tilesRef.current = next;
+              return next;
+            });
+          }
+        } catch (cause) {
+          if (!isAbortError(cause)) {
+            tileRuntimeDiagnostics().failed.push(tileId);
+            console.warn(`Tile ${tileId} fetch failed`, cause);
+          }
+        } finally {
+          inFlightRef.current.delete(tileId);
+        }
+      }
+    };
+    void Promise.all(Array.from({ length: Math.min(TILE_LOAD_CONCURRENCY, pending.length) }, () => loadWorker()));
+  }, [manifest, desiredKey]);
 
-  // ---- Scene diagnostics ----
+  useEffect(() => () => {
+    for (const controller of inFlightRef.current.values()) controller.abort();
+    inFlightRef.current.clear();
+  }, []);
+
   useEffect(() => {
     sceneMetrics.loadedTileCount = tiles.size;
-    sceneMetrics.loadedFeatureCount = countFeatures(tiles);
+    sceneMetrics.loadedFeatureCount = countTileFeatures(tiles);
     if (error) {
       sceneMetrics.rendererStatus = "errored";
-      sceneMetrics.backend = "unknown";
       sceneMetrics.rendererError = error;
-    } else if (webGpuStatus === "unsupported" && sceneMetrics.rendererError === "none") {
+    } else if (webGpuStatus === "unsupported") {
       sceneMetrics.rendererStatus = "unsupported";
-      sceneMetrics.backend = "unknown";
       sceneMetrics.rendererError = "WebGPU unavailable in this browser";
     }
     publishSceneDiagnostics(true);
-  }, [webGpuStatus, tiles, cameraFocus, error]);
+  }, [tiles, error, webGpuStatus]);
 
-  // ---- Event handlers ----
-  const handleSearchSelect = useCallback((feature: MapFeature): void => {
-    setSelectedFeature(feature);
-
-    const focus = focusFromFeature(feature);
-    if (focus) {
-      setCameraFocus(focus);
+  const handleSearchResultSelect = useCallback(async (featureId: string): Promise<void> => {
+    const indexed = searchRecords.find((record) => record.featureId === featureId);
+    if (!indexed) return;
+    let raw: MapFeature | undefined;
+    for (const tile of tilesRef.current.values()) {
+      raw = tile.features.find((feature) => feature.stableId === featureId);
+      if (raw) break;
     }
-
-    // Auto-open Nocibé commercial audit layer
-    if (feature.banId || feature.searchKey === "nocibe") {
-      setLayers((prev) => ({ ...prev, "nocibe-commercial-audit": true }));
-    }
-  }, []);
-  const handleSearchQueryChange = useCallback((query: string): void => {
-    setSearchQuery(query);
-  }, []);
-
-  const handleSearchResultSelect = useCallback(
-    async (featureId: string): Promise<void> => {
-      const indexed = searchIndex.find((record) => record.featureId === featureId);
-      let raw = Array.from(tiles.values()).flatMap((tile) => tile.features)
-        .find((feature) => feature.stableId === featureId);
-      if (!raw && indexed) {
-        try {
-          const envelope = await loadTile(indexed.tileId);
-          const tile: TileData = {
-            tileId: indexed.tileId,
-            features: envelope.features as RawMapFeature[],
-            bounds: envelope.manifest.bounds,
-          };
-          setTiles((previous) => new Map(previous).set(tile.tileId, tile));
-          raw = tile.features.find((feature) => feature.stableId === featureId);
-        } catch (cause) {
-          console.warn(`Search tile ${indexed.tileId} load failed`, cause);
-        }
+    if (!raw) {
+      tileRuntimeDiagnostics().requested.push(indexed.tileId);
+      try {
+        const tile = TileDataSchema.parse(await loadTile(indexed.tileId));
+        tileRuntimeDiagnostics().loaded.push(indexed.tileId);
+        setTiles((previous) => {
+          const next = new Map(previous).set(tile.manifest.tileId, tile);
+          tilesRef.current = next;
+          return next;
+        });
+        raw = tile.features.find((feature) => feature.stableId === featureId);
+      } catch (cause) {
+        tileRuntimeDiagnostics().failed.push(indexed.tileId);
+        console.warn(`Search tile ${indexed.tileId} load failed`, cause);
       }
-      if (!raw) return;
-      const selected = {
-        ...raw,
-        id: raw.stableId,
-        name: raw.name ?? raw.displayName,
-        localCoord: raw.x !== undefined && raw.z !== undefined ? [raw.x, raw.z] : undefined,
-      } as unknown as MapFeature;
-      handleSearchSelect(selected);
-      setSearchQuery("");
-    },
-    [searchIndex, tiles, handleSearchSelect],
-  );
-
-
-  const handleLayerToggle = useCallback(
-    (layerId: string, visible: boolean): void => {
-      setLayers((prev) => ({ ...prev, [layerId]: visible }));
-    },
-    [],
-  );
-
-  const handleResetView = useCallback((): void => {
-    setCameraFocus(null);
-    setCameraResetCounter((c) => c + 1);
-  }, []);
-
-  const handleFeatureSelect = useCallback(
-    (feature: MapFeature | null): void => {
-      setSelectedFeature(feature);
-    },
-    [],
-  );
-
-  const handleCameraMoved = useCallback((): void => {
-    setCameraFocus(null);
-  }, []);
-
-  const handleInspectorClose = useCallback((): void => {
-    setSelectedFeature(null);
-    setMobileInspectorOpen(false);
-  }, []);
-
-  const handleInspectorMobileToggle = useCallback((): void => {
-    setMobileInspectorOpen((o) => !o);
-  }, []);
-
-  // ---- Derived data ----
-  const tileDataArray = useMemo(() => Array.from(tiles.values()), [tiles]);
-  const sceneFeatures = useMemo(
-    () =>
-      tileDataArray.flatMap((tile) =>
-        tile.features
-          .filter((feature) => renderableKinds[feature.kind] && feature.localGeometry)
-          .map((feature) => ({
-            ...feature,
-            geometry: feature.localGeometry,
-            name: feature.name ?? feature.displayName,
-          })),
-      ),
-    [tileDataArray],
-  );
-  const searchResults = useMemo(
-    () => (searchQuery.trim() ? runSearchIndex(searchQuery, searchIndex as SearchIndexRecord[]) : []),
-    [searchQuery, searchIndex],
-  );
-  const hasCriticalError = !!error && !manifest;
-
-  // ---- Nocibé focus enrichment ----
-  const enrichedInspectorFeature = useMemo<MapFeature | null>(() => {
-    if (!selectedFeature) return null;
-    if (selectedFeature.banId && manifest?.nocibeFocus) {
-      return {
-        ...selectedFeature,
-        metadata: {
-          ...(selectedFeature.metadata ?? {}),
-          nocibeFocus: manifest.nocibeFocus,
-          commercialAuditRadius: 750,
-          anchors: manifest.nocibeFocus.anchors,
-        },
-      };
     }
-    return selectedFeature;
-  }, [selectedFeature, manifest]);
+    if (!raw) return;
+    const focus = focusFromFeature(raw);
+    if (!focus) return;
+    setSelectedFeature(raw);
+    setCameraFocus({ ...focus, zoom: 80 });
+    if (raw.kind === "business" && /nocibe/i.test(raw.businessName)) setLayers((previous) => ({ ...previous, commercialAudit: true }));
+    setSearchQuery("");
+  }, [searchRecords]);
 
-  /** Derive attribution data from the dataset manifest pipeline. */
-  const attributionData = useMemo(() => {
-    if (!manifest) return null;
+  const searchResults = useMemo(() => searchQuery.trim() ? runSearchIndex(searchQuery, searchRecords) : [], [searchQuery, searchRecords]);
+  const sceneFeatures = useMemo(() => deduplicateSceneFeatures(tiles), [tiles]);
+  const hasCriticalError = error !== null && manifest === null;
+  const attributionData = useMemo(() => manifest ? {
+    datasetVersion: manifest.datasetVersion,
+    acquisitionTime: manifest.acquisitionTime,
+    sources: (manifest.sources ?? []).flatMap((source) => {
+      const sourceName = typeof source.source === "string" ? source.source : undefined;
+      return sourceName ? [{ source: sourceName, url: typeof source.url === "string" ? source.url : undefined, timestamp: typeof source.timestamp === "string" ? source.timestamp : manifest.acquisitionTime, license: typeof source.license === "string" ? source.license : undefined }] : [];
+    }),
+    osmAttribution: "OpenStreetMap contributors",
+  } : null, [manifest]);
 
-    const pipelineSources: Record<string, { source: string; url: string }> = {
-      "fetch-osm": {
-        source: "OpenStreetMap",
-        url: "https://www.openstreetmap.org",
-      },
-      "fetch-addresses": {
-        source: "Base Adresse Nationale",
-        url: "https://adresse.data.gouv.fr",
-      },
-      "fetch-businesses": {
+  const handleLayerToggle = useCallback((layer: LayerId, visible: boolean): void => {
+    setLayers((previous) => ({ ...previous, [layer]: visible }));
+  }, []);
+  const resetView = useCallback((): void => {
+    setCameraFocus(null);
+    setCameraReset((counter) => counter + 1);
+  }, []);
+  const handleCameraMoved = useCallback((): void => setCameraFocus(null), []);
+  const searchResultsNode: ReactNode = searchResults.length > 0 ? (
+    <div role="listbox" aria-label="Résultats de recherche">
+      {searchResults.map(({ record }, index) => (
+        <button key={record.featureId} type="button" role="option" data-testid={`search-result-${record.featureId}`} data-feature-kind={record.kind} aria-selected={index === 0} onClick={() => void handleSearchResultSelect(record.featureId)}>
+          <span>{record.canonicalName}</span>
+          <span>{record.kind}</span>
+        </button>
+      ))}
+    </div>
+  ) : null;
 
-        source: "Annuaire des Entreprises",
-        url: "https://annuaire-entreprises.data.gouv.fr",
-      },
-      "fetch-ign": {
-        source: "IGN",
-        url: "https://geoservices.ign.fr",
-      },
-    };
-
-    const sources: SourceReference[] = (manifest.pipeline ?? [])
-      .filter((step) => step in pipelineSources)
-      .map((step) => ({
-        source: pipelineSources[step].source,
-        url: pipelineSources[step].url,
-        timestamp: manifest.acquisitionTime,
-      }));
-
-    return {
-      datasetVersion: manifest.version ?? manifest.datasetVersion ?? "unknown",
-      acquisitionTime: manifest.acquisitionTime,
-      sources,
-      osmAttribution: "Contributeurs d\u2019OpenStreetMap",
-    };
-  }, [manifest]);
-  const searchResultsNode: ReactNode =
-    searchResults.length > 0 ? (
-      <div role="listbox" aria-label="Résultats de recherche">
-        {searchResults.map(({ record }, index) => (
-          <button
-            key={record.featureId}
-            type="button"
-            role="option"
-            data-testid={`search-result-${record.featureId}`}
-            data-feature-kind={record.kind}
-            aria-selected={index === 0}
-            onClick={() => handleSearchResultSelect(record.featureId)}
-            style={{
-              display: "flex",
-              justifyContent: "space-between",
-              width: "100%",
-              padding: "0.65rem 0.8rem",
-              border: 0,
-              background: "transparent",
-              color: "var(--color-ink)",
-              cursor: "pointer",
-            }}
-          >
-            <span>{record.canonicalName}</span>
-            <span>{record.kind}</span>
-          </button>
-        ))}
-      </div>
-    ) : null;
-
-  // ---- Render ----
   return (
-    <div
-      className="map-shell"
-      ref={shellRef}
-      data-theme={theme}
-      style={{
-        position: "fixed",
-        inset: 0,
-        overflow: "hidden",
-        display: "flex",
-        flexDirection: "column",
-        background: "var(--color-paper, #ffffff)",
-        color: "var(--color-ink, #000000)",
-      }}
-    >
-      {/* Loading state */}
-      {loading && (
-        <div
-          className="map-shell__loading"
-          style={{
-            position: "absolute",
-            inset: 0,
-            zIndex: 1000,
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-          }}
-        >
-          <LoadingState />
-        </div>
-      )}
-
-      {/* Critical error (no manifest loaded) */}
-      {hasCriticalError && !loading && (
-        <div
-          className="map-shell__error"
-          style={{
-            position: "absolute",
-            inset: 0,
-            zIndex: 1000,
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            padding: "2rem",
-          }}
-        >
-          <div
-            className="map-shell__error-panel"
-            style={{
-              maxWidth: "480px",
-              padding: "2rem",
-              borderRadius: "8px",
-              background: "var(--color-paper, #fff)",
-              border: "1px solid color-mix(in srgb, var(--color-ink, #000) 20%, transparent)",
-              textAlign: "center",
-            }}
-          >
-            <h2
-              style={{
-                fontSize: "1.25rem",
-                fontWeight: 600,
-                margin: "0 0 0.75rem",
-              }}
-            >
-              Impossible de charger la carte
-            </h2>
-            <p style={{ margin: "0 0 1rem", lineHeight: 1.5 }}>
-              {error}
-            </p>
-            <p
-              style={{
-                fontSize: "0.875rem",
-                color: "color-mix(in srgb, var(--color-ink, #000) 60%, transparent)",
-              }}
-            >
-              Vérifiez que les données sont générées avec{" "}
-              <code style={{ fontSize: "0.875rem" }}>npm run data:refresh</code>
-              .
-            </p>
-          </div>
-        </div>
-      )}
-
-      {/* WebGPU canvas with scene children */}
-      <div
-        className="map-shell__canvas"
-        style={{
-          flex: 1,
-          position: "relative",
-          overflow: "hidden",
-        }}
-      >
-        {!hasCriticalError && (
-          <>
-            {webGpuStatus === "supported" && manifest ? (
-              <WebGPUCityCanvas
-                bounds={manifest.bounds}
-                cameraFocus={cameraFocus}
-                cameraReset={cameraResetCounter}
-                onCameraMoved={handleCameraMoved}
-                onViewportChange={setViewport}
-              >
-                <CityScene
-                  features={sceneFeatures}
-                  layers={layers}
-                  selectedFeature={selectedFeature}
-                  onFeatureSelect={handleFeatureSelect}
-                />
-              </WebGPUCityCanvas>
-            ) : webGpuStatus === "unsupported" ? (
-              <WebGPUUnsupported error={sceneMetrics.rendererError} />
-            ) : null}
-          </>
-        )}
+    <div className="map-shell" data-theme={theme} style={{ position: "fixed", inset: 0, overflow: "hidden", display: "flex", flexDirection: "column", background: "var(--color-paper, #ffffff)", color: "var(--color-ink, #000000)" }}>
+      {loading ? <div className="map-shell__loading" style={{ position: "absolute", inset: 0, zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center" }}><LoadingState /></div> : null}
+      {hasCriticalError && !loading ? <div className="map-shell__error"><h2>Impossible de charger la carte</h2><p>{error}</p><code>npm run data:refresh</code></div> : null}
+      <div className="map-shell__canvas" style={{ flex: 1, position: "relative", overflow: "hidden" }}>
+        {!hasCriticalError && manifest && webGpuStatus === "supported" ? (
+          <WebGPUCityCanvas bounds={manifestBounds(manifest)} cameraFocus={cameraFocus} cameraReset={cameraReset} onCameraMoved={handleCameraMoved} onViewportChange={setViewport}>
+            <CityScene features={sceneFeatures} layers={layers} />
+          </WebGPUCityCanvas>
+        ) : !hasCriticalError && webGpuStatus === "unsupported" ? <WebGPUUnsupported error={sceneMetrics.rendererError} /> : null}
       </div>
-
-      {/* HUD overlay */}
-      {!hasCriticalError && !loading && (
-        <MapHud
-          query={searchQuery}
-          onQueryChange={handleSearchQueryChange}
-          onSearch={handleSearchQueryChange}
-          onResetView={handleResetView}
-          results={searchResultsNode}
-        />
-      )}
-
-      {/* Layer controls */}
-      {!hasCriticalError && !loading && (
-        <LayerControls
-          layers={layers}
-          onToggle={handleLayerToggle}
-          onResetView={handleResetView}
-        />
-      )}
-
-      {/* Feature inspector */}
-      {!hasCriticalError && !loading && (
-        <FeatureInspector
-          feature={enrichedInspectorFeature}
-          onClose={handleInspectorClose}
-          mobileOpen={mobileInspectorOpen}
-          onMobileToggle={handleInspectorMobileToggle}
-        />
-      )}
-
-      {/* Source attribution */}
-      {!hasCriticalError && !loading && (
-        <SourceAttribution data={attributionData} />
-      )}
-
-      {/* Scene diagnostics element */}
-      <div
-        id="scene-diagnostics"
-        ref={diagnosticsRef}
-        className="map-shell__diagnostics"
-        aria-hidden="true"
-        style={{
-          position: "absolute",
-          bottom: "2rem",
-          left: "0.5rem",
-          fontSize: "10px",
-          fontFamily: "monospace",
-          color: "color-mix(in srgb, var(--color-ink, #000) 40%, transparent)",
-          whiteSpace: "pre",
-          pointerEvents: "none",
-          userSelect: "none",
-          opacity: 0.6,
-        }}
-      />
-
-      {/* Responsive mobile inspector toggle button */}
-      {!hasCriticalError &&
-        !loading &&
-        selectedFeature && (
-          <button
-            type="button"
-            className="map-shell__inspector-toggle"
-            onClick={handleInspectorMobileToggle}
-            aria-label={
-              mobileInspectorOpen
-                ? "Fermer les détails"
-                : "Ouvrir les détails"
-            }
-            style={{
-              position: "absolute",
-              right: "0.5rem",
-              bottom: "4rem",
-              zIndex: 100,
-              display: "none",
-              padding: "0.5rem 0.75rem",
-              borderRadius: "4px",
-              fontSize: "0.8125rem",
-              fontWeight: 500,
-              border: "none",
-              cursor: "pointer",
-              background: "var(--color-accent, #ff7d27)",
-              color: "#000000",
-            }}
-          >
-            {mobileInspectorOpen ? "Fermer" : "Détails"}
-          </button>
-        )}
+      {!hasCriticalError && !loading ? <MapHud query={searchQuery} onQueryChange={setSearchQuery} onSearch={setSearchQuery} onResetView={resetView} results={searchResultsNode} /> : null}
+      {!hasCriticalError && !loading ? <LayerControls layers={layers} onToggle={handleLayerToggle} onReset={resetView} /> : null}
+      {!hasCriticalError && !loading ? <FeatureInspector feature={selectedFeature} onClose={() => setSelectedFeature(null)} /> : null}
+      {!hasCriticalError && !loading && attributionData ? <SourceAttribution data={attributionData} /> : null}
+      <div id="scene-diagnostics" aria-hidden="true" style={{ position: "absolute", bottom: "2rem", left: "0.5rem", fontSize: "10px", fontFamily: "monospace", color: "color-mix(in srgb, var(--color-ink, #000) 40%, transparent)", whiteSpace: "pre", pointerEvents: "none", userSelect: "none", opacity: 0.6 }} />
+      {selectedFeature && !hasCriticalError && !loading ? <button type="button" className="map-shell__inspector-toggle" onClick={() => setMobileInspectorOpen((open) => !open)} aria-label={mobileInspectorOpen ? "Fermer les détails" : "Ouvrir les détails"}>{mobileInspectorOpen ? "Fermer" : "Détails"}</button> : null}
     </div>
   );
+}
+
+function isAbortError(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "name" in error && error.name === "AbortError";
 }

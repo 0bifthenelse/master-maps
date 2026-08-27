@@ -1,7 +1,7 @@
 #!/usr/bin/env tsx
 /// <reference lib="es2024.promise" />
 /**
- * fetch-osm.ts — bulk OpenStreetMap enrichment acquisition for Gers department.
+ * fetch-osm.ts - bulk OpenStreetMap enrichment acquisition for Gers department.
  *
  * The preferred path downloads the current Geofabrik Midi-Pyrenees extract and
  * clips it with osmium. Overpass remains an explicit spot/enrichment fallback.
@@ -14,11 +14,11 @@
  *   1  one or more themes failed after retries
  */
 
-import { readFile, writeFile, mkdir } from 'node:fs/promises';
-import path from 'node:path';
-import crypto from 'node:crypto';
-import { createWriteStream } from 'node:fs';
-import { Readable } from 'node:stream';
+import { readFile, writeFile, mkdir, rename, unlink } from "node:fs/promises";
+import path from "node:path";
+import crypto from "node:crypto";
+import { createReadStream, createWriteStream } from "node:fs";
+import { Readable } from "node:stream";
 import { pipeline } from 'node:stream/promises';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -240,14 +240,6 @@ out body; >; out skel qt;`,
 // Boundary polygon helpers
 // ---------------------------------------------------------------------------
 
-/**
- * Convert a GeoJSON ring (array of [lng, lat] pairs) to an Overpass poly
- * string (space-separated "lat lon" pairs).  Overpass requires the poly
- * filter to receive latitude first, then longitude.
- */
-function coordsToPoly(ring: number[][]): string {
-  return ring.map(([lng, lat]) => `${lat} ${lng}`).join(' ');
-}
 
 /**
  * Type guards for GeoJSON coordinate nesting.  A ring must be a closed loop
@@ -277,37 +269,6 @@ function isMultiPolygonCoordinates(value: unknown): value is number[][][][] {
   return Array.isArray(value) && value.every((polygon) => isPolygonCoordinates(polygon));
 }
 
-/**
- * Derive an Overpass poly string from a GeoJSON geometry object.
- * For MultiPolygon the largest ring (by area) is used.
- * Returns null for unsupported geometry types or malformed coordinates.
- */
-function geometryToPoly(geometry: { type: string; coordinates: unknown }): string | null {
-  if (geometry.type === 'Polygon' && isPolygonCoordinates(geometry.coordinates)) {
-    return coordsToPoly(geometry.coordinates[0]);
-  }
-  if (geometry.type === 'MultiPolygon' && isMultiPolygonCoordinates(geometry.coordinates)) {
-    let largestRing = geometry.coordinates[0][0];
-    let largestArea = 0;
-    for (const polygon of geometry.coordinates) {
-      const ring = polygon[0];
-      const n = ring.length - 1;
-      if (n < 3) continue;
-      // Shoelace formula
-      let area = 0;
-      for (let i = 0; i < n; i++) {
-        area += ring[i][0] * ring[i + 1][1] - ring[i + 1][0] * ring[i][1];
-      }
-      area = Math.abs(area) / 2;
-      if (area > largestArea) {
-        largestArea = area;
-        largestRing = ring;
-      }
-    }
-    return coordsToPoly(largestRing);
-  }
-  return null;
-}
 
 // ---------------------------------------------------------------------------
 // Overpass fetch with retry and fallback
@@ -423,30 +384,29 @@ interface OsmManifest {
 }
 
 // ---------------------------------------------------------------------------
-// Safeguard: validate the poly string before it is embedded in a query
-// ---------------------------------------------------------------------------
+// The Overpass fallback uses the complete department bounding box. The exact
+// Admin Express geometry is still applied during normalization, so a
+// MultiPolygon is never reduced to one component by the query.
 
-/**
- * Validate that the poly string contains only finite floats and spaces.
- */
-function validatePolyString(poly: string): void {
-  if (!/^[\d. eE+\-]+$/.test(poly)) {
-    throw new Error(`Invalid poly string: contains unexpected characters`);
-  }
-  const parts = poly.split(/\s+/);
-  if (parts.length < 8) {
-    throw new Error(`Poly string too short (${parts.length} tokens; need ≥8 for a polygon)`);
-  }
-  if (parts.length % 2 !== 0) {
-    throw new Error(`Poly string has odd number of tokens (${parts.length})`);
-  }
-  // Verify every token is a parseable finite number
-  for (const token of parts) {
-    const n = Number.parseFloat(token);
-    if (!Number.isFinite(n)) {
-      throw new Error(`Invalid poly coordinate: ${token}`);
+function geometryBbox(geometry: { coordinates: unknown }): [number, number, number, number] {
+  let west = Infinity;
+  let south = Infinity;
+  let east = -Infinity;
+  let north = -Infinity;
+  const visit = (value: unknown): void => {
+    if (!Array.isArray(value)) return;
+    if (value.length >= 2 && typeof value[0] === "number" && typeof value[1] === "number") {
+      west = Math.min(west, value[0]);
+      south = Math.min(south, value[1]);
+      east = Math.max(east, value[0]);
+      north = Math.max(north, value[1]);
+      return;
     }
-  }
+    for (const child of value) visit(child);
+  };
+  visit(geometry.coordinates);
+  if (![west, south, east, north].every(Number.isFinite)) throw new Error("Gers boundary has no finite coordinates");
+  return [west, south, east, north];
 }
 
 /**
@@ -512,16 +472,24 @@ function parseBoundaryRecord(raw: unknown): ParsedBoundaryRecord | null {
 const execFileAsync = promisify(execFile);
 const OSM_BULK_URL = "https://download.geofabrik.de/europe/france/midi-pyrenees-latest.osm.pbf";
 
+async function hashFile(filePath: string): Promise<string> {
+  const hash = crypto.createHash("sha256");
+  const stream = createReadStream(filePath);
+  for await (const chunk of stream) hash.update(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  return hash.digest("hex");
+}
+
 async function fetchBulkOsm(): Promise<void> {
   const pbfPath = path.join(RAW_DIR, "midi-pyrenees-latest.osm.pbf");
-  try {
-    await readFile(pbfPath);
-  } catch {
+  if (process.env.OSM_USE_CACHE !== "1") {
+    const partialPath = `${pbfPath}.part`;
+    try { await unlink(partialPath); } catch { /* no stale partial */ }
     const response = await fetch(OSM_BULK_URL, { headers: { Accept: "application/octet-stream" } });
     if (!response.ok || !response.body) throw new Error(`Geofabrik bulk extract failed: HTTP ${response.status}`);
-    await pipeline(Readable.fromWeb(response.body as Parameters<typeof Readable.fromWeb>[0]), createWriteStream(pbfPath));
+    await pipeline(Readable.fromWeb(response.body as Parameters<typeof Readable.fromWeb>[0]), createWriteStream(partialPath));
+    await rename(partialPath, pbfPath);
   }
-  const sourceHash = crypto.createHash("sha256").update(await readFile(pbfPath)).digest("hex");
+  const sourceHash = await hashFile(pbfPath);
   const boundaryPath = path.join(RAW_DIR, "gers-boundary.geojson");
   const extractPath = path.join(RAW_DIR, "gers-osm.osm.pbf");
   const filteredPath = path.join(RAW_DIR, "gers-osm-enrichment.osm.pbf");
@@ -561,7 +529,6 @@ async function fetchBulkOsm(): Promise<void> {
 async function main(): Promise<void> {
   console.log('=== OSM enrichment acquisition for Gers department 32 ===\n');
 
-  // Ensure output directories exist
   await mkdir(RAW_DIR, { recursive: true });
   await mkdir(INTERMEDIATE_DIR, { recursive: true });
   if (process.env.OSM_USE_OVERPASS !== "1") {
@@ -569,17 +536,16 @@ async function main(): Promise<void> {
     return;
   }
 
-  console.log('Loading Gers boundary...');
+  console.log("Loading the complete Gers boundary...");
   let boundaryGeometry: { type: string; coordinates: unknown } | null = null;
   let bbox: [number, number, number, number] | null = null;
   const candidatePaths = [
-    path.join(RAW_DIR, 'gers-boundary.geojson'),
-    path.join(INTERMEDIATE_DIR, 'boundary-source.json'),
+    path.join(RAW_DIR, "gers-boundary.geojson"),
+    path.join(INTERMEDIATE_DIR, "boundary-source.json"),
   ];
   for (const filePath of candidatePaths) {
     try {
-      const content = await readFile(filePath, 'utf-8');
-      const parsed: unknown = JSON.parse(content);
+      const parsed: unknown = JSON.parse(await readFile(filePath, "utf8"));
       const record = parseBoundaryRecord(parsed);
       if (record) {
         boundaryGeometry = record.geometry;
@@ -591,26 +557,16 @@ async function main(): Promise<void> {
       continue;
     }
   }
-  if (!boundaryGeometry) {
-    throw new Error(`Cannot find Gers boundary. Searched: ${candidatePaths.join(', ')}`);
-  }
+  if (!boundaryGeometry) throw new Error(`Cannot find Gers boundary. Searched: ${candidatePaths.join(", ")}`);
+  const boundaryBbox = bbox ?? geometryBbox(boundaryGeometry);
+  const [west, south, east, north] = boundaryBbox;
+  const bboxSelector = `bbox:${south},${west},${north},${east}`;
+  console.log(`  Overpass fallback selector: ${bboxSelector}`);
 
-  const polyStr = geometryToPoly(boundaryGeometry);
-  if (!polyStr) {
-    throw new Error(
-      `Unsupported boundary geometry type: ${boundaryGeometry.type}. Expected Polygon or MultiPolygon.`,
-    );
-  }
-  validatePolyString(polyStr);
-  console.log(
-    `  Poly string: ${polyStr.slice(0, 120)}... (${polyStr.split(/\s+/).length / 2} vertices)`,
-  );
-
-  // ---- Fetch each theme ----
   const manifest: OsmManifest = {
-    dataset: 'osm-gers',
+    dataset: "osm-gers",
     acquisitionTime: new Date().toISOString(),
-    boundaryBbox: bbox,
+    boundaryBbox,
     themeCount: THEMES.length,
     themes: {},
     totalQueries: THEMES.length,
@@ -620,89 +576,51 @@ async function main(): Promise<void> {
 
   for (const theme of THEMES) {
     console.log(`\n[${theme.name}]`);
-
-    const query = theme.queryTemplate(polyStr);
+    const query = theme.queryTemplate("").replace(/\(poly:""\)/g, `(${bboxSelector})`);
+    if (query.includes('poly:"')) throw new Error(`Overpass theme ${theme.name} did not use the bbox selector`);
     const rawPath = path.join(RAW_DIR, `osm-${theme.name}.json`);
-
     const result: ThemeResult = {
       query,
       endpointUrl: null,
-      timestamp: '',
+      timestamp: "",
       recordCount: 0,
       byteSize: 0,
-      sha256: '',
+      sha256: "",
       retryCount: -1,
       success: false,
       error: null,
     };
-
     try {
-      console.log(`  Query (${query.length} chars)...`);
       const { response, endpointUrl, retryCount } = await fetchOverpass(query);
-
       result.endpointUrl = endpointUrl;
       result.retryCount = retryCount;
       result.timestamp = new Date().toISOString();
-
       const rawJson = JSON.stringify(response);
-      result.sha256 = crypto.createHash('sha256').update(rawJson, 'utf-8').digest('hex');
-      result.byteSize = rawJson.length;
-
-      const elements =
-        typeof response === 'object' && response !== null && 'elements' in response
-          ? response.elements
-          : undefined;
+      result.sha256 = crypto.createHash("sha256").update(rawJson, "utf8").digest("hex");
+      result.byteSize = Buffer.byteLength(rawJson);
+      const elements = typeof response === "object" && response !== null && "elements" in response ? response.elements : undefined;
       result.recordCount = Array.isArray(elements) ? elements.length : 0;
-
-      // Write raw response
-      await writeFile(rawPath, rawJson, 'utf-8');
-
+      await writeFile(rawPath, rawJson, "utf8");
       result.success = true;
-      manifest.successfulQueries++;
-
-      console.log(
-        `  OK  ${result.recordCount} elements  ` +
-          `${(result.byteSize / 1024).toFixed(1)} KiB  ` +
-          `${endpointUrl}  retry=${retryCount}  sha256=${result.sha256.slice(0, 12)}`,
-      );
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      result.error = message;
-      manifest.failedQueries++;
-      console.error(`  FAIL  ${message}`);
+      manifest.successfulQueries += 1;
+      console.log(`  OK  ${result.recordCount} elements  ${(result.byteSize / 1024).toFixed(1)} KiB  ${endpointUrl}`);
+    } catch (error) {
+      result.error = error instanceof Error ? error.message : String(error);
+      manifest.failedQueries += 1;
+      console.error(`  FAIL  ${result.error}`);
     }
-
     manifest.themes[theme.name] = result;
-
-    // Inter-request delay to avoid rate limiting
-    if (THEMES.indexOf(theme) < THEMES.length - 1) {
-      await sleep(INTER_REQUEST_DELAY_MS);
-    }
+    if (THEMES.indexOf(theme) < THEMES.length - 1) await sleep(INTER_REQUEST_DELAY_MS);
   }
 
-  // ---- Write manifest ----
   manifest.acquisitionTime = new Date().toISOString();
-  const manifestPath = path.join(INTERMEDIATE_DIR, 'osm-manifest.json');
-  await writeFile(manifestPath, JSON.stringify(manifest, null, 2) + '\n', 'utf-8');
-  console.log(`\n  Manifest written to ${manifestPath}`);
-
-  // ---- Summary ----
+  await writeFile(path.join(INTERMEDIATE_DIR, "osm-manifest.json"), JSON.stringify(manifest, null, 2) + "\n", "utf8");
   console.log(`\n=== OSM Acquisition Complete ===`);
   console.log(`  Successful: ${manifest.successfulQueries} / ${manifest.totalQueries}`);
   console.log(`  Failed:     ${manifest.failedQueries}`);
-
-  if (manifest.failedQueries > 0) {
-    console.error(`\n  Failed themes:`);
-    for (const [name, themeResult] of Object.entries(manifest.themes)) {
-      if (!themeResult.success) {
-        console.error(`    - ${name}: ${themeResult.error}`);
-      }
-    }
-    process.exit(1);
-  }
+  if (manifest.failedQueries > 0) process.exit(1);
 }
-
-main().catch((err) => {
-  console.error(`\nFATAL: ${err instanceof Error ? err.message : String(err)}`);
+main().catch((error: unknown) => {
+  console.error(`[fetch-osm] Fatal: ${error instanceof Error ? error.message : String(error)}`);
   process.exit(1);
 });

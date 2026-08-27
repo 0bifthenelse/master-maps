@@ -27,6 +27,8 @@ export interface BoundaryIndex {
   lineOutside(points: Point[]): boolean;
   polygonInside(rings: PolygonRings): boolean;
   polygonOutside(rings: PolygonRings): boolean;
+  /** True when any vertex is inside or any segment touches the boundary. */
+  touches(points: Point[]): boolean;
 }
 
 export function createBoundaryIndex(polygons: PolygonRings[]): BoundaryIndex {
@@ -135,7 +137,11 @@ export function createBoundaryIndex(polygons: PolygonRings[]): BoundaryIndex {
       return !segmentIntersectsBoundary(point, next);
     }));
 
-  return { contains, lineInside, lineOutside, polygonInside, polygonOutside };
+  const touches = (points: Point[]): boolean =>
+    points.some(contains)
+    || points.slice(0, -1).some((point, index) => segmentIntersectsBoundary(point, points[index + 1]!));
+
+  return { contains, lineInside, lineOutside, polygonInside, polygonOutside, touches };
 }
 
 function createRingIndex(ring: Ring, globalMinY: number, globalSpan: number): IndexedRing {

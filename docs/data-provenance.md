@@ -1,127 +1,49 @@
-# Data Provenance — Conflict Resolution & Source Priority
+# Data provenance
 
-Every feature in the Auch map may carry values from multiple sources that disagree on a property (e.g., name spelling, coordinates, address, height). The provenance system resolves each property independently, preserves every contender, and records the rationale in a `ProvenanceRecord` attached to the feature. These records are surfaced in the `FeatureInspector` component so users can evaluate data confidence.
+Every canonical feature retains its source references and any conflict records produced during normalization or conservative deduplication. The Feature Inspector exposes these fields for the selected feature. The generated source and coverage manifests record acquisition time, licenses, hashes, counts, and failed optional sources.
 
----
+## Source priority
 
-## Source Priority Hierarchy
+The pipeline uses this default order when scalar values from comparable records disagree:
 
-Sources are ordered by authority. A higher-priority source wins on every property where it provides a value, except where a specific property rule (see below) overrides the general priority.
+1. Official administrative boundary data
+2. IGN geometry and surveyed data
+3. OpenStreetMap geometry and semantic tags
+4. Base Adresse Nationale address data
+5. SIRENE and Annuaire des Entreprises identity data
+6. Verified public business pages
 
-| Priority | Source Family                | Rationale                                            |
-|----------|------------------------------|------------------------------------------------------|
-| 1 (highest) | Administrative boundaries  | Official government GIS (geo.api.gouv.fr) — authoritative commune contour |
-| 2         | IGN Géoplateforme            | National mapping agency (Institut National de l'Information Géographique et Forestière) |
-| 3         | OpenStreetMap / Overpass     | Volunteer-contributed but current, detailed geometry |
-| 4         | Base Adresse Nationale (BAN) | Official French address repository (Etalab)          |
-| 5         | SIRENE / Annuaire des Entreprises | Official legal establishment registry (INSEE)   |
-| 6         | Official business websites   | Current public branding (verified via Moli fetch)    |
-| 7 (lowest)| Google Maps / directories    | Corroboration only — never source of geometry or bulk data |
+This order does not make a source authoritative for every field. Boundary geometry comes from Admin Express. BD TOPO supplies canonical buildings, roads, and hydrography. BAN supplies address points and address text. SIRENE supplies legal business identity. OSM supplies current enrichment, names, paths, and semantic POIs.
 
-Every conflict becomes a `ProvenanceRecord` entry visible to the inspector.
+## Geometry
 
----
+The canonical `geometry` field preserves WGS84 source geometry. `sourceGeometry` preserves the source geometry when a transformed or clipped representation is also needed. `localGeometry` is EPSG:2154 Lambert-93 easting and northing relative to the configured render origin. All polygon rings are closed, finite, non-degenerate, and validated before serialization. Features are clipped against the complete Gers department boundary, including MultiPolygon components.
 
-## Property-Specific Rules
+Geometry deduplication is conservative:
 
-Some properties override the general source priority when a specific source is known to be more authoritative for that property.
+- Durable source IDs merge exact identities.
+- Polygon candidates require meaningful intersection-over-union and centroid agreement.
+- Line candidates require sampled metric agreement and compatible semantic class.
+- Nearby parallel roads are not merged solely because their bounding boxes overlap.
+- BD TOPO geometry has priority when an accepted merge contains both BD TOPO and enrichment geometry.
 
-### Geometry (coordinates, polygon shape)
+Every accepted merge retains unique source references. Losing scalar values create a `ProvenanceRecord` with the feature ID, property, winning value, contenders, priority, and source timestamp.
 
-- **Winner**: Administrative boundary geometry > IGN > OSM > BAN point > SIRENE > website.
-- **Rationale**: Official or surveyed geometry outranks crowd-sourced or approximate points.
-- **Retained**: All source coordinates are stored in the feature's `sourceReferences` for inspector display.
+## Field rules
 
-### Name (canonical name, display name)
+- Names are retained only when supplied by a source. Search is accent-insensitive and uses canonical feature IDs.
+- Addresses prefer BAN text and identifiers. SIRENE and OSM values remain available through source references and provenance.
+- Road widths use an explicit finite source width when available. Otherwise the renderer uses a class default and marks the width as inferred.
+- BD TOPO bridge and tunnel position is preserved as explicit road stratum metadata. OSM bridge and tunnel tags are preserved when present.
+- Water surface and water-line geometry are distinct. Fictive hydrographic axes are retained as metadata but are not rendered as visible water lines.
+- Building height and levels are retained as metadata only. Buildings are rendered as flat footprints at `y=0`.
 
-- **Winner**: Official business website (if verified) > SIRENE legal name > OSM `name` tag > directory listing.
-- **Rule**: For Nocibé, the verified PagesJaunes and SIRENE records set the canonical display name (`Nocibé`). Accent-insensitive search (via NFD normalization) resolves both `nocibe` and `nocibé` to the same record.
-- **No fictional aliases**: Only source-backed names enter the search index and feature data.
+## Stable IDs
 
-### Address
+A durable source identifier is preferred. Canonical IDs include the source family and source identifier, for example `ign-bdtopo:building/<cleabs>`, `osm-bulk:way/<id>`, `ban:<id>`, and `sirene:<siret>`. A deterministic content hash is used only when no durable identifier exists. Tile fragments append `@<tile-id>` to the fragment identity while retaining the canonical stable ID as the parent identity.
 
-- **Winner**: BAN > OSM `addr:*` tags > SIRENE > website.
-- **Rationale**: BAN is the official French address repository and provides the validated housenumber, street name, and INSEE code.
-- **Corrected name**: The verified street is `Avenue d'Alsace`. The map uses this spelling; there is no `Rue d'Alsace` or other invented street name.
+## Evidence and limits
 
-### Building Height
+The current generated volume is authoritative only for the acquisition recorded in `data/manifests/sources.json` and `data/generated/manifest.json`. Optional sources can be unavailable without implying zero data. The coverage report and spatial QA report are the evidence for feature counts, tile budgets, source failures, CRS residuals, and scene-input checks.
 
-- **Winner**: IGN > OSM `height` tag > OSM `building:levels` (derived) > category default.
-- **Marking**: Explicit finite values are marked `active`. Values derived from `building:levels` are marked `inferred:levels`. Category defaults are marked `inferred:default`.
-- **Rejection**: Negative values are rejected. Inferred values above `18.0` meters are rejected unless an explicit source value exists.
-- **Height defaults by category** (used only when no explicit or levels-derived value exists):
-
-| Category       | Default height |
-|----------------|---------------|
-| House          | 3.5 m         |
-| Apartments     | 6.0 m         |
-| Garage / shed  | 2.7 m         |
-| Retail         | 5.0 m         |
-| Industrial     | 6.0 m         |
-| Church         | 12.0 m        |
-| Generic building | 3.5 m        |
-
-**Important**: Height metadata exists for the inspector and coverage report only. The map renders all building footprints at `y=0` — no extrusion.
-
-### Road Width
-
-- **Winner**: OSM `width` tag > class default.
-- **Defaults by class** (used when no explicit `width` tag is present):
-
-| Class       | Default width |
-|-------------|---------------|
-| Motorway    | 12.0 m        |
-| Trunk       | 9.0 m         |
-| Primary     | 9.0 m         |
-| Secondary   | 7.0 m         |
-| Tertiary    | 6.0 m         |
-| Residential | 5.0 m         |
-| Service     | 3.5 m         |
-| Pedestrian  | 2.0 m         |
-| Cycleway    | 2.0 m         |
-| Path        | 1.5 m         |
-| Track       | 2.5 m         |
-
-- Explicit finite `width` values are marked `active`. Defaults are marked `inferred:class`.
-
-### Business Status (active / closed)
-
-- **Winner**: SIRENE `etatAdministratif` (official registry) > website current presence > OSM `disused:*` tag > directory confirmation.
-- **Note**: A business with an active SIRENE registration but a website that returns a "page not found" error is marked `uncertain` and both sources are recorded in provenance.
-
----
-
-## Stable ID Policy
-
-Every feature receives a stable internal ID that is independent of acquisition order, array position, or random values. The ID policy is implemented in `src/lib/data/normalize.ts`.
-
-- **Source-provided durable ID**: When the source gives a durable identifier (BAN ID, SIRET, OSM element ID), the stable ID preserves it as `sourceType:sourceId` (e.g., `ban:32013_0050_00028`, `sirene:12345678900012`, `osm:way/123456789`).
-- **Hashed ID**: When no durable source ID exists, the stable ID is a SHA-256 prefix of: feature kind + normalized canonical name + normalized address + rounded WGS84 coordinate + normalized geometry hash.
-- **Deduplication**: Two features with the same stable ID are merged via provenance rules. The merge preserves all source references and property disagreements.
-
----
-
-## Retained Disagreements
-
-Provenance does not discard losing values. Every `ProvenanceRecord` stores:
-
-- `featureId` — the feature's stable ID
-- `property` — the conflicting property name (e.g., `name`, `height`, `address`)
-- `winner` — the winning value
-- `winningSource` — the source family that provided the winner
-- `contenders` — array of `{ value, source, timestamp }` for all participating sources
-- `rationale` — the rule applied (e.g., "priority: BAN > OSM" or "property-specific: BAN address")
-
-This data is serialised into the tile files and rendered by `FeatureInspector.tsx` in the UI.
-
----
-
-## Implementation
-
-Provenance logic lives in:
-
-- **`src/lib/data/provenance.ts`** — `resolvePropertyConflict()`, `buildProvenanceRecord()`, `mergeFeatures()`, source priority constants.
-- **`src/lib/data/normalize.ts`** — applies provenance during raw-to-typed transformation.
-- **`src/lib/data/deduplicate.ts`** — stable-ID deduplication (distinct from property conflict resolution).
-
-The `ProvenanceRecord` type is defined in `src/lib/data/schema.ts` alongside `SourceReference` and `MapFeature`.
+Google geometry, tiles, imagery, and bulk Places data are not used as map sources. OpenStreetMap is the external visual comparison reference, not a redistributed dependency.

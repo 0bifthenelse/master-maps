@@ -36,10 +36,8 @@ describe("LocalProjection", () => {
     }
   });
 
-  it("meters scale is reasonable (1 degree ~ 111km at equator)", () => {
-    // 0.1 degree longitude at 43.65N
-    const [x, _z] = proj.forward(origin[0] + 0.1, origin[1]);
-    // cos(43.65°) ≈ 0.723, so 0.1° * 111319.9 * 0.723 ≈ 8048 meters
+  it("keeps Lambert-93 longitude scale in a metric range", () => {
+    const [x] = proj.forward(origin[0] + 0.1, origin[1]);
     expect(x).toBeGreaterThan(7000);
     expect(x).toBeLessThan(9000);
   });
@@ -58,20 +56,22 @@ describe("LocalProjection", () => {
 });
 
 describe("computeCenter", () => {
-  it("computes a source boundary centroid without changing axis semantics", () => {
+  it("computes a metric centroid for a WGS84 polygon", () => {
     const center = computeCenter({
       type: "Polygon",
       coordinates: [[
-        [0, 0],
-        [10, 0],
-        [10, 10],
-        [0, 10],
-        [0, 0],
+        [0.5, 43.5],
+        [0.51, 43.5],
+        [0.51, 43.51],
+        [0.5, 43.51],
+        [0.5, 43.5],
       ]],
     });
-    expect(center[0]).toBeCloseTo(5, 6);
-    expect(center[1]).toBeCloseTo(5, 6);
+    expect(center[0]).toBeCloseTo(0.505, 5);
+    expect(center[1]).toBeCloseTo(43.505, 5);
+  });
 
+  it("keeps local axes east and north positive", () => {
     const local = new LocalProjection([0, 0]);
     expect(local.forward(0, 1)[1]).toBeGreaterThan(0);
     expect(local.forward(1, 0)[0]).toBeGreaterThan(0);

@@ -1,42 +1,12 @@
-// ---------------------------------------------------------------------------
-// Master Maps — Provenance & source-priority conflict resolution
-//
-// Every feature property that could carry conflicting values from multiple
-// sources is resolved through this module.  The result is always a
-// ProvenanceRecord that preserves every contender, the winning source, the
-// rationale (priority ordering), and a UTC timestamp.
-//
-// Stable-ID and geometry-deduplication strategies live in deduplicate.ts;
-// this module handles per-property value conflicts within a known feature.
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// Local type declarations — match the expected schema.ts contract
-// These will be replaced by imports once src/lib/data/schema.ts exists.
-// ---------------------------------------------------------------------------
-
-/** Represents a single source contributing to a feature property. */
-export interface SourceReference {
-  source: string;
-  url?: string;
-  timestamp: string; // ISO 8601 UTC
-  license?: string;
-  sha256?: string;
-  recordCount?: number;
-}
-
 /**
- * Records the resolution of one property where multiple sources disagreed.
- * Stored per feature and made visible in the inspector.
+ * Source-priority conflict resolution for canonical feature metadata.
+ *
+ * Geometry identity and deduplication live in the data pipeline. This module
+ * resolves scalar property conflicts and retains every source contender.
  */
-export interface ProvenanceRecord {
-  featureId: string;
-  property: string;
-  winner: string; // winning source name
-  contenders: string[]; // all source names that supplied a value
-  priority: number; // the winning source's ordinal (1 = highest)
-  timestamp: string; // ISO 8601 UTC — when the conflict was resolved
-}
+import type { ProvenanceRecord } from "./schema";
+
+export type { ProvenanceRecord } from "./schema";
 
 // ---------------------------------------------------------------------------
 // Source priority constants
@@ -45,7 +15,7 @@ export interface ProvenanceRecord {
 /**
  * Ordinal priority of each source family.
  * Lower number = higher priority.
- * 1 is the most authoritative; 7 is corroboration-only.
+ * 1 is the most authoritative; unknown optional sources are not geometry sources.
  */
 export const SOURCE_PRIORITY = {
   OFFICIAL_ADMIN: 1,
@@ -54,7 +24,6 @@ export const SOURCE_PRIORITY = {
   BAN: 4,
   SIRENE: 5,
   BUSINESS_WEBSITE: 6,
-  GOOGLE_MAPS: 7,
 } as const;
 
 export type SourcePriorityKey =
@@ -67,9 +36,8 @@ export const PRIORITY_ORDER: readonly string[] = Object.entries(SOURCE_PRIORITY)
 
 /**
  * Map a source-name string to its ordinal priority.
- * Accepts common forms: "OSM", "osm", "OpenStreetMap", "IGN", "BAN",
- * "official admin", "SIRENE", "business website", "Google Maps".
- * Unknown sources get priority 99.
+ * Accepts common forms such as OSM, OpenStreetMap, IGN, BAN, SIRENE, and
+ * business website. Unknown sources get priority 99.
  */
 export function priorityForSource(source: string): number {
   const normalized = source.toLowerCase().trim();
@@ -81,8 +49,7 @@ export function priorityForSource(source: string): number {
   if (normalized === "openstreetmap" || normalized === "overpass") return SOURCE_PRIORITY.OSM;
   if (normalized === "ban" || normalized === "base adresse nationale") return SOURCE_PRIORITY.BAN;
   if (normalized === "annuaire des entreprises" || normalized === "insee") return SOURCE_PRIORITY.SIRENE;
-  if (normalized.startsWith("google")) return SOURCE_PRIORITY.GOOGLE_MAPS;
-  if (normalized.includes("admin") || normalized === "geo.api.gouv.fr") return SOURCE_PRIORITY.OFFICIAL_ADMIN;
+  if (normalized.includes("admin")) return SOURCE_PRIORITY.OFFICIAL_ADMIN;
   if (normalized === "ign" || normalized === "géoplateforme" || normalized.includes("geoplateforme")) return SOURCE_PRIORITY.IGN;
   if (normalized.includes("sirene")) return SOURCE_PRIORITY.SIRENE;
   if (normalized.includes("website") || normalized.includes("site web")) return SOURCE_PRIORITY.BUSINESS_WEBSITE;
@@ -163,7 +130,7 @@ export function resolvePropertyConflict(
     const pb = effectivePriority(b.source);
     if (pa !== pb) return pa - pb;
 
-    // Same priority — earliest timestamp wins.
+    // Same priority: earliest timestamp wins.
     if (timestamps) {
       const ta = timestamps[a.source] ?? "";
       const tb = timestamps[b.source] ?? "";
@@ -226,11 +193,11 @@ export function buildProvenanceRecord(
 }
 
 // ---------------------------------------------------------------------------
-// Feature merge — source-priority aware
+// Feature merge, source-priority aware
 // ---------------------------------------------------------------------------
 
 /**
- * Shape of a MapFeature — matches the expected discriminated union contract.
+ * Shape of a MapFeature that accepts legacy `id` metadata.
  * Imported projects should use MapFeature from schema.ts directly.
  */
 export interface MapFeatureLike {
@@ -270,7 +237,7 @@ export function mergeFeatures(
 ): MapFeatureLike {
   if (existing.kind !== incoming.kind) {
     throw new TypeError(
-      `mergeFeatures: kind mismatch — existing="${existing.kind}" ` +
+      `mergeFeatures: kind mismatch: existing="${existing.kind}" ` +
         `incoming="${incoming.kind}" (id=${existing.id})`,
     );
   }
@@ -317,13 +284,13 @@ export function mergeFeatures(
     const hasIncoming = key in incoming;
 
     if (!hasExisting) {
-      // Only incoming has this property — keep it.
+      // Only incoming has this property.
       merged[key] = incoming[key];
       continue;
     }
 
     if (!hasIncoming) {
-      // Only existing has this property — keep it.
+      // Only existing has this property.
       merged[key] = existing[key];
       continue;
     }

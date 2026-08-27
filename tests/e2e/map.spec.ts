@@ -1,6 +1,6 @@
 import { test, expect, checkPngNotBlank, ARTIFACTS_DIR, type BrowserErrors } from "./fixtures";
 import type { Page } from "@playwright/test";
-
+import { wgs84ToRender } from "../../src/lib/geo/crs";
 async function waitForScene(page: Page): Promise<void> {
   await page.waitForFunction(() => {
     const diagnostics = document.querySelector("#scene-diagnostics");
@@ -55,32 +55,26 @@ async function moveToSourceCoordinate(
 ): Promise<void> {
   const manifest = await page.evaluate(async () => {
     const response = await fetch("/api/map/manifest");
-    return await response.json() as {
-      bounds: [number, number, number, number];
-      projectionOrigin: [number, number];
-    };
+    return await response.json() as { bounds: [number, number, number, number] };
   });
   const camera = await readFullCameraState(page);
   const canvas = page.locator("canvas");
   const box = await canvas.boundingBox();
   if (!box) throw new Error("canvas has no bounding box");
-  const [originLon, originLat] = manifest.projectionOrigin;
-  const metersPerDegree = 111_319.9;
-  const originCosine = Math.cos(originLat * Math.PI / 180);
-  const localX = (coordinate[0] - originLon) * metersPerDegree * originCosine;
-  const localZ = (coordinate[1] - originLat) * metersPerDegree;
+  const [localX, localZ] = wgs84ToRender(coordinate);
   const worldWidth = manifest.bounds[2] - manifest.bounds[0];
   const worldHeight = manifest.bounds[3] - manifest.bounds[1];
   const aspect = box.width / box.height;
-  const frustumWidth = worldWidth / worldHeight > aspect
-    ? worldWidth * 1.15
-    : worldHeight * aspect * 1.15;
-  const frustumHeight = worldWidth / worldHeight > aspect
-    ? worldWidth / aspect * 1.15
-    : worldHeight * 1.15;
+  const frustumWidth = worldWidth / worldHeight > aspect ? worldWidth * 1.15 : worldHeight * aspect * 1.15;
+  const frustumHeight = worldWidth / worldHeight > aspect ? worldWidth / aspect * 1.15 : worldHeight * 1.15;
+  const deltaX = localX - camera.target[0];
+  const deltaZ = localZ - camera.target[2];
+  const heading = camera.headingRadians ?? camera.rotationZ ?? camera.azimuthalAngle;
+  const cosine = Math.cos(heading);
+  const sine = Math.sin(heading);
   await page.mouse.move(
-    box.x + box.width / 2 + (localX - camera.target[0]) * camera.zoom / frustumWidth * box.width,
-    box.y + box.height / 2 - (localZ - camera.target[2]) * camera.zoom / frustumHeight * box.height,
+    box.x + box.width / 2 + (deltaX * cosine + deltaZ * sine) * camera.zoom / frustumWidth * box.width,
+    box.y + box.height / 2 - (-deltaX * sine + deltaZ * cosine) * camera.zoom / frustumHeight * box.height,
   );
 }
 

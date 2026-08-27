@@ -1,69 +1,27 @@
 #!/usr/bin/env tsx
-/**
- * validate.ts — Validates the generated data volume.
- *
- * Checks:
- *   - Finite coordinates within Auch bounds
- *   - Polygon renderability (minimum vertices, ring closure)
- *   - No negative or absurd height metadata
- *   - Nonempty road geometry
- *   - Stable-ID uniqueness across the dataset
- *   - Tile references resolve
- *   - Provenance presence
- *   - Documented licenses
- *   - Required layers present (boundary, roads, buildings, businesses, Nocibé, search)
- *
- * Fails with source, tile, or feature context.
- *
- * Usage: tsx scripts/data/validate.ts [--generated-dir <path>]
- *        tsx scripts/data/validate.ts --coverage-only
- */
-
+import type { Dirent } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import {
+  DatasetManifestSchema,
+  MapFeatureSchema,
+  SearchRecordSchema,
+  TileManifestSchema,
+  type MapFeature,
+  type TileManifest,
+} from "../../src/lib/data/schema";
 import { GERS_TERRITORY } from "../../src/lib/data/territory";
+import { createBoundaryIndex, type BoundaryIndex } from "./boundaryIndex";
 
-const TERRITORY_BBOX = {
-  west: GERS_TERRITORY.bootstrapBbox[0],
-  east: GERS_TERRITORY.bootstrapBbox[2],
-  south: GERS_TERRITORY.bootstrapBbox[1],
-  north: GERS_TERRITORY.bootstrapBbox[3],
-};
-
-const MAX_HEIGHT_M = 100;
-const MIN_BUILDING_POLYGON_VERTICES = 4;
-const VALID_KINDS = new Set([
-  "boundary", "building", "road", "water", "landuse",
-  "poi", "business", "address", "transport",
-]);
-
-// ---------------------------------------------------------------------------
-// Validation error container
-// ---------------------------------------------------------------------------
+const MAX_HEIGHT_METRES = 100;
+const MAX_TILE_BYTES = 2 * 1024 * 1024;
+const REQUIRED_KINDS = ["boundary", "building", "road", "water", "business", "address"] as const;
 
 interface ValidationIssue {
   severity: "error" | "warning";
   message: string;
-  source?: string;
   featureId?: string;
   tileId?: string;
-}
-
-class ValidationErrors extends Error {
-  issues: ValidationIssue[];
-  constructor(issues: ValidationIssue[]) {
-    super(`Validation failed with ${issues.filter((i) => i.severity === "error").length} error(s)`);
-    this.name = "ValidationErrors";
-    this.issues = issues;
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-function dataRoot(): string {
-  return process.env.MASTER_MAPS_DATA_DIR ?? "data";
 }
 
 interface ValidateOptions {
@@ -71,15 +29,26 @@ interface ValidateOptions {
   coverageOnly: boolean;
 }
 
+class ValidationErrors extends Error {
+  constructor(readonly issues: ValidationIssue[]) {
+    super(`Validation failed with ${issues.filter((issue) => issue.severity === "error").length} error(s)`);
+    this.name = "ValidationErrors";
+  }
+}
+
+function dataRoot(): string {
+  return process.env.MASTER_MAPS_DATA_DIR ?? "data";
+}
+
 function parseArgs(args: string[]): ValidateOptions {
   const root = dataRoot();
   let generatedDir = path.join(root, "generated");
   let coverageOnly = false;
-  for (let i = 0; i < args.length; i++) {
-    const a = args[i]!;
-    if (a === "--generated-dir" && args[i + 1]) { generatedDir = args[++i]!; }
-    else if (a === "--coverage-only") { coverageOnly = true; }
-    else if (a === "--help" || a === "-h") {
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index];
+    if (argument === "--generated-dir" && args[index + 1]) generatedDir = args[++index]!;
+    else if (argument === "--coverage-only") coverageOnly = true;
+    else if (argument === "--help" || argument === "-h") {
       console.log("Usage: tsx scripts/data/validate.ts [--generated-dir <path>] [--coverage-only]");
       process.exit(0);
     }
@@ -87,310 +56,185 @@ function parseArgs(args: string[]): ValidateOptions {
   return { generatedDir, coverageOnly };
 }
 
-// ---------------------------------------------------------------------------
-// Individual validators
-// ---------------------------------------------------------------------------
 
-type MapFeature = Record<string, unknown>;
-
-function validateCoords(f: MapFeature): ValidationIssue[] {
-  const issues: ValidationIssue[] = [];
-  const lon = f.lon as number | undefined;
-  const lat = f.lat as number | undefined;
-  const fId = f.stableId as string ?? f.sourceId as string ?? "?";
-
-  if (lon === undefined || !isFinite(lon)) {
-    issues.push({ severity: "error", message: `Non-finite longitude: ${lon}`, featureId: fId });
-  } else if (lon < TERRITORY_BBOX.west - 0.05 || lon > TERRITORY_BBOX.east + 0.05) {
-    issues.push({ severity: "warning", message: `Longitude ${lon} outside Gers bootstrap envelope`, featureId: fId });
-  }
-
-  if (lat === undefined || !isFinite(lat)) {
-    issues.push({ severity: "error", message: `Non-finite latitude: ${lat}`, featureId: fId });
-  } else if (lat < TERRITORY_BBOX.south - 0.05 || lat > TERRITORY_BBOX.north + 0.05) {
-    issues.push({ severity: "warning", message: `Latitude ${lat} outside Gers bootstrap envelope`, featureId: fId });
-  }
-
-  return issues;
-}
-
-function validateHeight(f: MapFeature): ValidationIssue[] {
-  const issues: ValidationIssue[] = [];
-  const fId = f.stableId as string ?? "?";
-  if (f.kind !== "building") return issues;
-
-  const h = f.height as number | undefined;
-  if (h !== undefined) {
-    if (!isFinite(h)) {
-      issues.push({ severity: "error", message: `Non-finite building height: ${h}`, featureId: fId });
-    } else if (h < 0) {
-      issues.push({ severity: "error", message: `Negative building height: ${h}m`, featureId: fId });
-    } else if (h > MAX_HEIGHT_M) {
-      const inferred = f.heightInferred as boolean;
-      if (inferred) {
-        issues.push({ severity: "error", message: `Inferred height ${h}m exceeds ${MAX_HEIGHT_M}m limit`, featureId: fId });
-      } else {
-        issues.push({ severity: "warning", message: `Source height ${h}m > ${MAX_HEIGHT_M}m — verify`, featureId: fId });
-      }
+function geometryVertices(geometry: MapFeature["geometry"]): Array<[number, number]> {
+  const vertices: Array<[number, number]> = [];
+  const visit = (value: unknown): void => {
+    if (!Array.isArray(value)) return;
+    if (value.length >= 2 && typeof value[0] === "number" && typeof value[1] === "number") {
+      vertices.push([value[0], value[1]]);
+      return;
     }
-  }
-  return issues;
+    for (const child of value) visit(child);
+  };
+  visit(geometry.coordinates);
+  return vertices;
 }
 
-function validatePolygonGeometry(f: MapFeature): ValidationIssue[] {
+function coordinateIssues(feature: MapFeature, boundaryIndex: BoundaryIndex): ValidationIssue[] {
   const issues: ValidationIssue[] = [];
-  const fId = f.stableId as string ?? "?";
-  const kind = f.kind as string;
-
-  if (kind !== "building" && kind !== "boundary" && kind !== "landuse" && kind !== "water") return issues;
-
-  const rings = (f as Record<string, unknown>).rings as number[][][] | undefined;
-  if (!rings || rings.length === 0) {
-    // May be stored differently — skip if no rings field
-    return issues;
+  const featureId = feature.stableId;
+  if (feature.lon === undefined || feature.lat === undefined || !Number.isFinite(feature.lon) || !Number.isFinite(feature.lat)) {
+    issues.push({ severity: "error", message: "feature has no finite WGS84 anchor", featureId });
+  } else if (!boundaryIndex.contains([feature.lon, feature.lat]) && feature.kind !== "boundary") {
+    const vertexInside = boundaryIndex.touches(geometryVertices(feature.geometry));
+    if (!vertexInside) issues.push({ severity: "error", message: "feature anchor lies outside the Gers boundary", featureId });
   }
-
-  for (let ri = 0; ri < rings.length; ri++) {
-    const ring = rings[ri]!;
-    if (ring.length < MIN_BUILDING_POLYGON_VERTICES) {
-      issues.push({
-        severity: "error",
-        message: `Ring ${ri} has ${ring.length} vertices (min ${MIN_BUILDING_POLYGON_VERTICES})`,
-        featureId: fId,
-      });
-    }
-    // Check closure: first vertex ≈ last vertex
-    if (ring.length >= 2) {
-      const first = ring[0]!;
-      const last = ring[ring.length - 1]!;
-      const dx = (first[0] as number) - (last[0] as number);
-      const dy = (first[1] as number) - (last[1] as number);
-      if (Math.abs(dx) > 0.001 || Math.abs(dy) > 0.001) {
-        issues.push({
-          severity: "warning",
-          message: `Ring ${ri} not closed (first ${first}, last ${last})`,
-          featureId: fId,
-        });
-      }
-    }
+  if (feature.x === undefined || feature.z === undefined || !Number.isFinite(feature.x) || !Number.isFinite(feature.z)) {
+    issues.push({ severity: "error", message: "feature has no finite local anchor", featureId });
+  }
+  if (feature.kind === "building" && feature.height !== undefined && feature.height > MAX_HEIGHT_METRES && feature.heightInferred) {
+    issues.push({ severity: "error", message: `inferred height exceeds ${MAX_HEIGHT_METRES} metres`, featureId });
   }
   return issues;
 }
 
-function validateRoads(f: MapFeature): ValidationIssue[] {
+function sourceIssues(feature: MapFeature): ValidationIssue[] {
   const issues: ValidationIssue[] = [];
-  const fId = f.stableId as string ?? "?";
-  if (f.kind !== "road") return issues;
-  const geometry = f.geometry as Record<string, unknown> | undefined;
-  if (!geometry || (geometry.type as string) === undefined) {
-    issues.push({ severity: "error", message: "Road feature missing geometry", featureId: fId });
-  }
+  if (feature.sourceRefs.length === 0) issues.push({ severity: "error", message: "feature has no source reference", featureId: feature.stableId });
+  if (feature.provenance.length === 0) issues.push({ severity: "error", message: "feature has no provenance", featureId: feature.stableId });
   return issues;
 }
 
-function validateSourceRefs(f: MapFeature): ValidationIssue[] {
+function requiredSourceIssues(features: MapFeature[]): ValidationIssue[] {
   const issues: ValidationIssue[] = [];
-  const fId = f.stableId as string ?? "?";
-  const refs = f.sourceRefs as Array<Record<string, unknown>> | undefined;
-  if (!refs || refs.length === 0) {
-    issues.push({ severity: "warning", message: "No source references", featureId: fId });
-  } else {
-    for (const r of refs) {
-      if (!r.source) {
-        issues.push({ severity: "error", message: "Source reference missing 'source' field", featureId: fId });
-      }
-      if (!r.timestamp) {
-        issues.push({ severity: "warning", message: "Source reference missing 'timestamp'", source: r.source as string, featureId: fId });
-      }
-    }
+  const kinds = new Set(features.map((feature) => feature.kind));
+  for (const kind of REQUIRED_KINDS) if (!kinds.has(kind)) issues.push({ severity: "error", message: `required layer ${kind} is absent` });
+  for (const kind of ["building", "road", "water"] as const) {
+    const canonical = features.some((feature) => feature.kind === kind && feature.sourceRefs.some((reference) => reference.source === "IGN BD TOPO"));
+    if (!canonical) issues.push({ severity: "error", message: `${kind} has no IGN BD TOPO geometry` });
   }
   return issues;
 }
 
-function validateProvenance(f: MapFeature): ValidationIssue[] {
+function tileIdentityIssues(tile: TileManifest, features: MapFeature[]): ValidationIssue[] {
   const issues: ValidationIssue[] = [];
-  const fId = f.stableId as string ?? "?";
-  const prov = f.provenance as Array<Record<string, unknown>> | undefined;
-  if (!prov || prov.length === 0) {
-    issues.push({ severity: "warning", message: "No provenance records", featureId: fId });
-  }
+  if (tile.featureCount !== features.length) issues.push({ severity: "error", message: "manifest featureCount does not match payload", tileId: tile.tileId });
+  const fragmentIds = features.map((feature) => feature.fragmentId ?? feature.stableId);
+  if (new Set(fragmentIds).size !== fragmentIds.length) issues.push({ severity: "error", message: "duplicate fragment identity inside tile", tileId: tile.tileId });
+  const manifestIds = new Set(tile.features);
+  for (const feature of features) if (!manifestIds.has(feature.stableId)) issues.push({ severity: "error", message: `tile omits ${feature.stableId} from manifest identity list`, tileId: tile.tileId });
   return issues;
 }
 
-// ---------------------------------------------------------------------------
-// Dataset-level validators
-// ---------------------------------------------------------------------------
-
-function checkFeatureIdentity(features: MapFeature[]): ValidationIssue[] {
+async function loadTiles(generatedDir: string): Promise<{ features: MapFeature[]; manifests: TileManifest[]; issues: ValidationIssue[] }> {
+  const tilesDir = path.join(generatedDir, "tiles");
   const issues: ValidationIssue[] = [];
-  for (const feature of features) {
-    if (typeof feature.stableId !== "string" || feature.stableId.length === 0) {
-      issues.push({ severity: "error", message: "Feature is missing stableId" });
-    }
-  }
-  return issues;
-}
-
-function checkRequiredLayers(features: MapFeature[]): ValidationIssue[] {
-  const present = new Set(features.map((f) => f.kind as string));
-  const required = ["boundary", "building", "road", "business", "address"];
-  const issues: ValidationIssue[] = [];
-  for (const layer of required) {
-    if (!present.has(layer)) {
-      const severity = layer === "address" ? "warning" as const : "error" as const;
-      issues.push({ severity, message: `Required layer "${layer}" is missing` });
-    }
-  }
-  return issues;
-}
-
-/** Department-level spatial invariant: roads and buildings must be present
- * across multiple coarse cells, not merely concentrated in Auch. */
-function checkDepartmentCoverage(features: MapFeature[]): ValidationIssue[] {
-  const roads = features.filter((feature) => feature.kind === "road");
-  const buildings = features.filter((feature) => feature.kind === "building");
-  const issues: ValidationIssue[] = [];
-  if (roads.length === 0) issues.push({ severity: "error", message: "No road features in Gers dataset" });
-  if (buildings.length === 0) issues.push({ severity: "error", message: "No building features in Gers dataset" });
-  const cells = new Set<string>();
-  for (const feature of [...roads, ...buildings]) {
-    const col = Math.floor((feature.lon - TERRITORY_BBOX.west) / 0.2);
-    const row = Math.floor((feature.lat - TERRITORY_BBOX.south) / 0.2);
-    cells.add(`${col}:${row}`);
-  }
-  if (cells.size < 5) {
-    issues.push({ severity: "error", message: `Features occupy only ${cells.size} Gers spatial cells; department coverage is incomplete` });
-  }
-  return issues;
-}
-function checkNocibePresent(features: MapFeature[]): ValidationIssue[] {
-  const nocibe = features.find((f) => {
-    const name = ((f.name as string) ?? "").toLowerCase();
-    return name.includes("nocibé") || name.includes("nocibe");
-  });
-  if (!nocibe) {
-    return [{ severity: "warning", message: "Nocibé feature not found in dataset. Add after acquisition." }];
-  }
-  return [];
-}
-
-async function checkSearchIndex(indexPath: string): Promise<ValidationIssue[]> {
+  const featuresById = new Map<string, { lod: number; feature: MapFeature }>();
+  const manifests: TileManifest[] = [];
+  let entries: Dirent[];
   try {
-    const content = await fs.readFile(indexPath, "utf8");
-    const records = JSON.parse(content) as Array<Record<string, unknown>>;
-    if (!Array.isArray(records)) {
-      return [{ severity: "error", message: "Search index is not an array" }];
-    }
-    if (records.length === 0) {
-      return [{ severity: "warning", message: "Search index is empty" }];
-    }
-    return [];
+    entries = await fs.readdir(tilesDir, { withFileTypes: true });
   } catch {
-    return [{ severity: "error", message: `Search index not found at ${indexPath}` }];
+    return { features: [], manifests, issues: [{ severity: "error", message: `cannot access ${tilesDir}` }] };
   }
+  const manifestValue = JSON.parse(await fs.readFile(path.join(generatedDir, "tile-manifest.json"), "utf8")) as unknown;
+  if (!Array.isArray(manifestValue)) issues.push({ severity: "error", message: "tile-manifest.json is not an array" });
+  else for (const value of manifestValue) manifests.push(TileManifestSchema.parse(value));
+  const manifestById = new Map(manifests.map((manifest) => [manifest.tileId, manifest]));
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+    const tileId = entry.name.slice(0, -5);
+    const tile = manifestById.get(tileId);
+    if (!tile) {
+      issues.push({ severity: "error", message: "tile file has no manifest entry", tileId });
+      continue;
+    }
+    const filePath = path.join(tilesDir, entry.name);
+    const stats = await fs.stat(filePath);
+    if (stats.size > MAX_TILE_BYTES) issues.push({ severity: "error", message: `tile exceeds ${MAX_TILE_BYTES} byte hard limit`, tileId });
+    const parsed = JSON.parse(await fs.readFile(filePath, "utf8")) as unknown;
+    if (!Array.isArray(parsed)) {
+      issues.push({ severity: "error", message: "tile payload is not an array", tileId });
+      continue;
+    }
+    const tileFeatures: MapFeature[] = [];
+    for (const value of parsed) {
+      try {
+        const feature = MapFeatureSchema.parse(value);
+        tileFeatures.push(feature);
+        const previous = featuresById.get(feature.stableId);
+        if (!previous || tile.lod < previous.lod) featuresById.set(feature.stableId, { lod: tile.lod, feature });
+      } catch (error) {
+        issues.push({ severity: "error", message: `invalid canonical feature: ${error instanceof Error ? error.message : String(error)}`, tileId });
+      }
+    }
+    issues.push(...tileIdentityIssues(tile, tileFeatures));
+  }
+  return { features: [...featuresById.values()].map((value) => value.feature), manifests, issues };
 }
 
-async function checkTileIntegrity(manifest: Array<{ tileId: string; featureCount: number; features: string[] }>): Promise<ValidationIssue[]> {
+async function validateSearch(root: string, manifests: TileManifest[]): Promise<ValidationIssue[]> {
   const issues: ValidationIssue[] = [];
-  for (const m of manifest) {
-    if (!m.tileId) issues.push({ severity: "error", message: "Tile manifest entry missing tileId" });
-    if (!Number.isFinite(m.featureCount) || m.featureCount < 0) {
-      issues.push({ severity: "error", message: `Tile ${m.tileId} invalid featureCount: ${m.featureCount}` });
+  try {
+    const parsed = JSON.parse(await fs.readFile(path.join(root, "search", "index.json"), "utf8")) as unknown;
+    if (!Array.isArray(parsed) || parsed.length === 0) return [{ severity: "error", message: "search index is empty or not an array" }];
+    const tileIds = new Set(manifests.map((manifest) => manifest.tileId));
+    for (const value of parsed) {
+      const record = SearchRecordSchema.parse(value);
+      if (!tileIds.has(record.tileId)) issues.push({ severity: "error", message: `search record points to missing tile ${record.tileId}`, featureId: record.featureId });
     }
-    if (!Array.isArray(m.features)) {
-      issues.push({ severity: "error", message: `Tile ${m.tileId} missing features array` });
-    }
+  } catch (error) {
+    issues.push({ severity: "error", message: `invalid search index: ${error instanceof Error ? error.message : String(error)}` });
   }
   return issues;
 }
 
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
+function lodIssues(manifests: TileManifest[]): ValidationIssue[] {
+  const issues: ValidationIssue[] = [];
+  const levels = new Set(manifests.map((manifest) => manifest.lod));
+  for (const level of [0, 1, 2]) if (!levels.has(level)) issues.push({ severity: "error", message: `LOD${level} is absent` });
+  const detailed = manifests.filter((manifest) => manifest.lod === 0).reduce((sum, manifest) => sum + manifest.featureCount, 0);
+  const regional = manifests.filter((manifest) => manifest.lod === 1).reduce((sum, manifest) => sum + manifest.featureCount, 0);
+  const overview = manifests.filter((manifest) => manifest.lod === 2).reduce((sum, manifest) => sum + manifest.featureCount, 0);
+  if (detailed > 0 && regional >= detailed) issues.push({ severity: "error", message: "LOD1 is not reduced from LOD0" });
+  if (regional > 0 && overview >= regional) issues.push({ severity: "error", message: "LOD2 is not reduced from LOD1" });
+  return issues;
+}
 
 export async function validate(generatedDir?: string): Promise<void> {
   const root = dataRoot();
-  const gd = generatedDir ?? path.join(root, "generated");
+  const outputDir = generatedDir ?? path.join(root, "generated");
   const issues: ValidationIssue[] = [];
-
-  // Load all generated feature files
-  const tilesDir = path.join(gd, "tiles");
-  const features: MapFeature[] = [];
-
-  try {
-    const tileFiles = await fs.readdir(tilesDir, { withFileTypes: true });
-    for (const entry of tileFiles) {
-      if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
-      const content = await fs.readFile(path.join(tilesDir, entry.name), "utf8");
-      const parsed = JSON.parse(content);
-      if (Array.isArray(parsed)) features.push(...parsed);
-    }
-  } catch {
-    issues.push({ severity: "error", message: `Cannot access tiles directory: ${tilesDir}` });
+  const manifest = DatasetManifestSchema.parse(JSON.parse(await fs.readFile(path.join(outputDir, "manifest.json"), "utf8")) as unknown);
+  if (manifest.territoryCode !== GERS_TERRITORY.code || manifest.processingCrs !== GERS_TERRITORY.processingCrs || manifest.interchangeCrs !== GERS_TERRITORY.interchangeCrs) {
+    issues.push({ severity: "error", message: "dataset manifest territory or CRS contract is incorrect" });
   }
-
-  // Per-feature checks
-  for (const f of features) {
-    issues.push(...validateCoords(f));
-    issues.push(...validateHeight(f));
-    issues.push(...validatePolygonGeometry(f));
-    issues.push(...validateRoads(f));
-    issues.push(...validateSourceRefs(f));
-    issues.push(...validateProvenance(f));
+  const boundaryGeometry = await readBoundaryGeometry(root);
+  const boundaryIndex = createBoundaryIndex(boundaryGeometry);
+  const loaded = await loadTiles(outputDir);
+  issues.push(...loaded.issues);
+  const uniqueFeatures = [...new Map(loaded.features.map((feature) => [feature.stableId, feature])).values()];
+  for (const feature of uniqueFeatures) {
+    issues.push(...coordinateIssues(feature, boundaryIndex));
+    issues.push(...sourceIssues(feature));
+    if (feature.kind === "road" && feature.localGeometry && ![ "LineString", "MultiLineString", "Polygon", "MultiPolygon" ].includes(feature.localGeometry.type)) issues.push({ severity: "error", message: "road geometry is neither linear nor areal", featureId: feature.stableId });
   }
-
-  // Dataset-level checks
-  issues.push(...checkFeatureIdentity(features));
-  issues.push(...checkRequiredLayers(features));
-  issues.push(...checkNocibePresent(features));
-  issues.push(...checkDepartmentCoverage(features));
-
-  // Tile manifest integrity
-  const manifestPath = path.join(gd, "tile-manifest.json");
-  try {
-    const manifestContent = await fs.readFile(manifestPath, "utf8");
-    const manifest = JSON.parse(manifestContent) as Array<{ tileId: string; featureCount: number; features: string[] }>;
-    issues.push(...await checkTileIntegrity(manifest));
-  } catch {
-    issues.push({ severity: "error", message: `Tile manifest not found: ${manifestPath}` });
-  }
-
-  // Search index check
-  const searchIndexPath = path.join(root, "search", "index.json");
-  issues.push(...await checkSearchIndex(searchIndexPath));
-
-  // Report
-  const errors = issues.filter((i) => i.severity === "error");
-  const warnings = issues.filter((i) => i.severity === "warning");
-
-  console.error(`[validate] ${errors.length} errors, ${warnings.length} warnings`);
-
-  for (const issue of issues) {
-    const tag = issue.severity === "error" ? "ERR" : "WRN";
-    const ctx = [issue.featureId && `feature=${issue.featureId}`, issue.tileId && `tile=${issue.tileId}`, issue.source && `source=${issue.source}`]
-      .filter(Boolean).join(" ");
-    console.error(`  [${tag}] ${issue.message}${ctx ? ` (${ctx})` : ""}`);
-  }
-
-  if (errors.length > 0) {
-    throw new ValidationErrors(issues);
-  }
+  issues.push(...requiredSourceIssues(uniqueFeatures));
+  issues.push(...await validateSearch(root, loaded.manifests));
+  issues.push(...lodIssues(loaded.manifests));
+  const report = { checkedAt: new Date().toISOString(), featureCount: uniqueFeatures.length, tileCount: loaded.manifests.length, issues };
+  await fs.mkdir(path.join(root, "qa"), { recursive: true });
+  await fs.writeFile(path.join(root, "qa", "validation-report.json"), JSON.stringify(report, null, 2) + "\n", "utf8");
+  const errors = issues.filter((issue) => issue.severity === "error");
+  console.error(`[validate] ${errors.length} errors, ${issues.length - errors.length} warnings`);
+  if (errors.length > 0) throw new ValidationErrors(issues);
 }
 
-// ---------------------------------------------------------------------------
-// CLI entry
-// ---------------------------------------------------------------------------
+async function readBoundaryGeometry(root: string): Promise<number[][][][]> {
+  const parsed = JSON.parse(await fs.readFile(path.join(root, "raw", GERS_TERRITORY.boundaryRawFile), "utf8")) as { features?: Array<{ geometry?: { type?: string; coordinates?: unknown } }> };
+  const geometry = parsed.features?.[0]?.geometry;
+  if (!geometry || !Array.isArray(geometry.coordinates)) throw new Error("raw Gers boundary is unavailable");
+  if (geometry.type === "Polygon") return [geometry.coordinates as number[][][]];
+  if (geometry.type === "MultiPolygon") return geometry.coordinates as number[][][][];
+  throw new Error(`unsupported boundary geometry ${geometry.type}`);
+}
+
 if (process.argv[1]?.endsWith("validate.ts")) {
-  const opts = parseArgs(process.argv.slice(2));
-  if (opts.coverageOnly) {
-    console.error("[validate] Coverage validation — checking manifest only.");
-    process.exit(0);
-  }
-  validate(opts.generatedDir).catch((err) => {
-    if (err instanceof ValidationErrors) {
-      process.exit(1);
-    }
-    console.error("[validate] Fatal:", err);
+  const options = parseArgs(process.argv.slice(2));
+  if (options.coverageOnly) process.exit(0);
+  validate(options.generatedDir).catch((error: unknown) => {
+    console.error("[validate] Fatal:", error);
     process.exit(1);
   });
 }

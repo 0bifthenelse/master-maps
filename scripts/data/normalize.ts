@@ -1,17 +1,27 @@
 #!/usr/bin/env tsx
-/**
- * normalize.ts converts source records into canonical WGS84 geometry plus
- * Lambert-93-relative render geometry. Metric operations remain in EPSG:2154.
- */
-
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import {
+  MapFeatureSchema,
+  type AddressFeature,
+  type BoundaryFeature,
+  type BusinessFeature,
+  type FeatureKind,
+  type Geometry,
+  type MapFeature,
+  type SourceReference,
+} from "../../src/lib/data/schema";
+import {
+  renderToWgs84,
+  wgs84ToRender,
+} from "../../src/lib/geo/crs";
+import { computeLocalFocus, type LocalGeometry } from "../../src/lib/geo/focus";
+import {
   clipLineStringToPolygon,
   clipPolygonToPolygon,
+  normalizePolygonGeometry,
   type PolygonGeometry,
 } from "../../src/lib/geo/polygon";
-import { wgs84ToRender } from "../../src/lib/geo/crs";
 import { GERS_TERRITORY } from "../../src/lib/data/territory";
 import {
   deduplicateOsmElements,
@@ -22,169 +32,44 @@ import {
   type OsmWayElement,
   type RelationIssue,
 } from "./osmRelations";
-import { createBoundaryIndex } from "./boundaryIndex";
-
+import { createBoundaryIndex, type BoundaryIndex } from "./boundaryIndex";
 import { normalizeBdtopo } from "./normalizeBdtopo";
-// ---------------------------------------------------------------------------
-// Type stubs — matches schema contracts from the plan §4
-// ---------------------------------------------------------------------------
 import { normalizeOsmBulk } from "./normalizeOsmBulk";
 
-interface SourceReference {
-  source: string;
-  url?: string;
+type Coordinate = [number, number];
+
+type RawOsm = {
+  elements: Record<string, unknown>[];
   timestamp: string;
-  license?: string;
-  sha256?: string;
-  recordCount?: number;
-}
+  query: string;
+};
 
-interface ProvenanceRecord {
-  featureId: string;
-  property: string;
-  winner: string;
-  contenders: string[];
-  priority: number;
-  timestamp: string;
-}
+type RawBoundary = {
+  features?: Array<{ geometry?: unknown; properties?: Record<string, unknown> }>;
+};
 
-type FeatureKind =
-  | "boundary" | "building" | "road" | "water" | "landuse"
-  | "poi" | "business" | "address" | "transport";
+type RawSources = {
+  boundary: RawBoundary;
+  osm: RawOsm;
+  osmBulk: { features?: Record<string, unknown>[] };
+  bdtopoFiles: string[];
+  addresses: { addresses?: Record<string, unknown>[]; license?: string };
+  businesses: { records?: Record<string, unknown>[]; sourceUrl?: string; license?: string; acquiredAt?: string };
+  businessesOsm: { status?: string; body?: unknown };
+  businessesWeb: { results?: Record<string, unknown>[] };
+  ign: { features: Record<string, unknown>[]; unavailable: boolean };
+};
 
-interface MapFeatureBase {
-  kind: FeatureKind;
-  stableId: string;
-  sourceId?: string;
-  name?: string;
-  address?: string;
-  /** WGS84 longitude */
-  lon: number;
-  /** WGS84 latitude */
-  lat: number;
-  /** Local easting (x) in metres */
-  x: number;
-  /** Local northing (z) in metres */
-  z: number;
-  /** Original WGS84 geometry as GeoJSON-like object */
-  geometry?: Record<string, unknown>;
-  /** Local coordinate geometry */
-  localGeometry?: Record<string, unknown>;
-  provenance: ProvenanceRecord[];
-  confidence: number;
-  status: "active" | "uncertain" | "inferred" | "unresolved";
-  sourceRefs: SourceReference[];
-}
+type OsmGeometry =
+  | { type: "Point"; coordinates: Coordinate }
+  | { type: "LineString"; coordinates: Coordinate[] }
+  | { type: "MultiLineString"; coordinates: Coordinate[][] }
+  | { type: "Polygon"; coordinates: Coordinate[][] }
+  | { type: "MultiPolygon"; coordinates: Coordinate[][][] };
 
-interface BoundaryFeature extends MapFeatureBase {
-  kind: "boundary";
-  rings: number[][][];
-  polygons?: number[][][][];
-  centroidZ: number;
-  territoryCode: string;
-}
-
-interface BuildingFeature extends MapFeatureBase {
-  kind: "building";
-  height?: number;
-  heightInferred?: boolean;
-  levels?: number;
-  buildingType?: string;
-}
-
-interface RoadFeature extends MapFeatureBase {
-  kind: "road";
-  roadClass: string;
-  width: number;
-  widthInferred?: boolean;
-  surface?: string;
-  oneway?: boolean;
-  bridge?: boolean;
-  tunnel?: boolean;
-}
-
-interface WaterFeature extends MapFeatureBase {
-  kind: "water";
-  waterType: string;
-  width?: number;
-  widthInferred?: boolean;
-}
-
-interface LanduseFeature extends MapFeatureBase {
-  kind: "landuse";
-  landuseType: string;
-}
-
-interface PoiFeature extends MapFeatureBase {
-  kind: "poi";
-  poiType: string;
-  category?: string;
-  website?: string;
-  phone?: string;
-  openingHours?: string;
-  operator?: string;
-  wheelchair?: string;
-}
-
-interface BusinessFeature extends MapFeatureBase {
-  kind: "business";
-  businessId?: string;
-  siren?: string;
-  siret?: string;
-  brand?: string;
-  businessName: string;
-  legalName?: string;
-  category?: string;
-  nafCode?: string;
-  nafLabel?: string;
-  website?: string;
-  phone?: string;
-  openingHours?: string;
-  operator?: string;
-  wheelchair?: string;
-  administrativeStatus?: string;
-  creationDate?: string;
-}
-
-interface AddressFeature extends MapFeatureBase {
-  kind: "address";
-  banId: string;
-  housenumber: string;
-  street: string;
-  postcode: string;
-  city: string;
-}
-
-interface TransportFeature extends MapFeatureBase {
-  kind: "transport";
-  transportType: string;
-  route?: string;
-  operator?: string;
-}
-
-type MapFeature =
-  | BoundaryFeature | BuildingFeature | RoadFeature | WaterFeature
-  | LanduseFeature | PoiFeature | BusinessFeature | AddressFeature | TransportFeature;
-
-const forward = (lon: number, lat: number): [number, number] => wgs84ToRender([lon, lat]);
-
-
-// ---------------------------------------------------------------------------
-// Point-in-polygon (ray casting, WGS84)
-// ---------------------------------------------------------------------------
-
-function boundaryPolygonComponents(boundary: BoundaryFeature): number[][][][] {
-  return boundary.polygons ?? [boundary.rings];
-}
-
-
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-function dataRoot(): string {
-  return process.env.MASTER_MAPS_DATA_DIR ?? "data";
+export interface OsmNormalizationResult {
+  features: MapFeature[];
+  relationIssues: RelationIssue[];
 }
 
 interface NormalizeOptions {
@@ -192,319 +77,8 @@ interface NormalizeOptions {
   outDir: string;
 }
 
-function parseArgs(args: string[]): NormalizeOptions {
-  const root = dataRoot();
-  let rawDir = path.join(root, "raw");
-  let outDir = path.join(root, "intermediate");
-  for (let i = 0; i < args.length; i++) {
-    const a = args[i];
-    if (a === "--raw-dir" && args[i + 1]) {
-      rawDir = args[++i];
-    } else if (a === "--out-dir" && args[i + 1]) {
-      outDir = args[++i];
-    } else if (a === "--help" || a === "-h") {
-      console.log("Usage: tsx scripts/data/normalize.ts [--raw-dir <path>] [--out-dir <path>]");
-      process.exit(0);
-    }
-  }
-  return { rawDir, outDir };
-}
-
-function buildStableId(
-  kind: FeatureKind,
-  name: string,
-  address: string,
-  lon: number,
-  lat: number,
-  geometryHash: string,
-): string {
-  const norm = (s: string) => s.toLowerCase().replace(/\s+/g, " ").trim();
-  const payload = `${kind}:${norm(name)}:${norm(address)}:${lon.toFixed(5)},${lat.toFixed(5)}:${geometryHash}`;
-  let hash = 0;
-  for (let i = 0; i < payload.length; i++) {
-    hash = ((hash << 5) - hash + payload.charCodeAt(i)) | 0;
-  }
-  return `hash:${Math.abs(hash).toString(16).padStart(8, "0")}`;
-}
-
-function coordHash(coords: unknown[], len: number): string {
-  const end = Math.min(len, 20);
-  let h = 0;
-  for (let i = 0; i < end; i++) {
-    const c = coords[i] as number[];
-    if (c && c.length >= 2) {
-      h = ((h << 5) - h + ~~(c[0] * 1e5)) | 0;
-      h = ((h << 5) - h + ~~(c[1] * 1e5)) | 0;
-    }
-  }
-  return Math.abs(h).toString(16).padStart(4, "0");
-}
-
-function inferHeight(tags: Record<string, string>): { height: number; inferred: boolean } | null {
-  const explicit = tags["height"];
-  if (explicit) {
-    const h = parseFloat(explicit);
-    if (isFinite(h) && h >= 0) return { height: h, inferred: false };
-  }
-  const levels = tags["building:levels"];
-  if (levels) {
-    const l = parseInt(levels, 10);
-    if (isFinite(l) && l > 0) return { height: l * 3.0, inferred: true };
-  }
-  return null;
-}
-
-function categoryDefaultHeight(category: string): number {
-  const map: Record<string, number> = {
-    house: 3.5, apartments: 6.0, garage: 2.7, shed: 2.7,
-    retail: 5.0, commercial: 5.0, industrial: 6.0,
-    warehouse: 6.0, church: 12.0,
-  };
-  return map[category] ?? 3.5;
-}
-
-function defaultRoadWidth(roadClass: string): number {
-  const map: Record<string, number> = {
-    motorway: 12.0, trunk: 9.0, primary: 9.0,
-    secondary: 7.0, tertiary: 6.0, residential: 5.0,
-    service: 3.5, pedestrian: 2.0, footway: 2.0,
-    cycleway: 2.0, path: 1.5, track: 2.5,
-  };
-  return map[roadClass] ?? 5.0;
-}
-
-function computePolygonCentroid(rings: number[][][]): [number, number] {
-  const ring = rings[0];
-  if (!ring || ring.length < 3) return [0, 0];
-  let cx = 0, cy = 0, area = 0;
-  const n = ring.length - 1;
-  for (let i = 0; i < n; i++) {
-    const x0 = ring[i][0], y0 = ring[i][1];
-    const x1 = ring[i + 1][0], y1 = ring[i + 1][1];
-    const a = x0 * y1 - x1 * y0;
-    area += a;
-    cx += (x0 + x1) * a;
-    cy += (y0 + y1) * a;
-  }
-  area /= 2;
-  if (Math.abs(area) < 1e-12) return [ring[0][0], ring[0][1]];
-  cx /= (6 * area);
-  cy /= (6 * area);
-  return [cx, cy];
-}
-
-// ---------------------------------------------------------------------------
-// Raw-source loaders
-// ---------------------------------------------------------------------------
-
-async function loadRawSources(rawDir: string) {
-  const readOpt = { encoding: "utf8" as const };
-
-  let boundaryRaw: string;
-  try {
-    boundaryRaw = await fs.readFile(path.join(rawDir, GERS_TERRITORY.boundaryRawFile), readOpt);
-  } catch {
-    boundaryRaw = '{"type":"FeatureCollection","features":[]}';
-  }
-
-  let osmRaw: string;
-  try {
-    osmRaw = await fs.readFile(path.join(rawDir, "osm.json"), readOpt);
-  } catch {
-    osmRaw = '{"elements":[],"timestamp":"","query":""}';
-  }
-
-  let osmBulkRaw: { type?: string; features?: Record<string, unknown>[] } = { features: [] };
-  try {
-    osmBulkRaw = JSON.parse(await fs.readFile(path.join(rawDir, "osm-bulk.geojson"), readOpt)) as typeof osmBulkRaw;
-  } catch {
-    // Bulk OSM is optional for offline fixture runs; source acquisition records failures.
-  }
-  if ((osmBulkRaw.features?.length ?? 0) > 0) {
-    osmRaw = '{"elements":[],"timestamp":"bulk","query":"geofabrik"}';
-  }
-
-  let addrRaw: string;
-  try {
-    addrRaw = await fs.readFile(path.join(rawDir, "ban-addresses.json"), readOpt);
-  } catch {
-    addrRaw = '{"addresses":[],"license":"etalab-2.0"}';
-  }
-
-  let bizSireneRaw: string;
-  try {
-    bizSireneRaw = await fs.readFile(path.join(rawDir, "businesses-sirene.json"), readOpt);
-  } catch {
-    bizSireneRaw = '{"records":[]}';
-  }
-  let bizOsmRaw: string;
-  try {
-    bizOsmRaw = await fs.readFile(path.join(rawDir, "businesses-osm.json"), readOpt);
-  } catch {
-    bizOsmRaw = '{"status":"missing","body":null}';
-  }
-
-  let bizWebRaw: string;
-  try {
-    bizWebRaw = await fs.readFile(path.join(rawDir, "businesses-web.json"), readOpt);
-  } catch {
-    bizWebRaw = '{"results":[]}';
-  }
-
-  let ignFeatures: Record<string, unknown>[] = [];
-  let ignUnavailable = true;
-  try {
-    const dir = await fs.readdir(rawDir, { withFileTypes: true });
-    for (const entry of dir) {
-      if (entry.isFile() && /^ign-[^/]+\.json$/.test(entry.name) && entry.name !== "ign-capabilities.json") {
-        const content = await fs.readFile(path.join(rawDir, entry.name), readOpt);
-        const parsed = JSON.parse(content) as { features?: Record<string, unknown>[]; type?: string };
-        if (Array.isArray(parsed.features)) {
-          for (const f of parsed.features) {
-            if (f?.geometry) ignFeatures.push(f);
-          }
-          ignUnavailable = false;
-        } else if (parsed.type === "FeatureCollection" && Array.isArray(parsed.features)) {
-          for (const f of parsed.features as Record<string, unknown>[]) {
-            if (f?.geometry) ignFeatures.push(f);
-          }
-          ignUnavailable = false;
-        }
-      }
-    }
-    try {
-      const intermediateDir = path.join(dataRoot(), "intermediate");
-      const unavailContent = await fs.readFile(path.join(intermediateDir, "ign-unavailable.json"), readOpt);
-      const unavail = JSON.parse(unavailContent) as { reason?: string };
-      if (unavail.reason) {
-        ignUnavailable = true;
-        ignFeatures = [];
-      }
-    } catch { /* no marker */ }
-  } catch { /* ign dir unreadable */ }
-
-  const bdtopoFeatures: Record<string, unknown>[] = [];
-  try {
-    const entries = await fs.readdir(rawDir, { withFileTypes: true });
-    for (const entry of entries) {
-      if (!entry.isFile() || !entry.name.startsWith("bdtopo-") || !entry.name.endsWith(".geojson")) continue;
-      const parsed = JSON.parse(await fs.readFile(path.join(rawDir, entry.name), readOpt)) as {
-        features?: Record<string, unknown>[];
-      };
-      for (const feature of parsed.features ?? []) {
-        bdtopoFeatures.push({ ...feature, sourceLayer: entry.name });
-      }
-    }
-  } catch {
-    // BD TOPO absence remains visible in validation and source manifests.
-  }
-
-  return {
-    boundary: JSON.parse(boundaryRaw) as Record<string, unknown>,
-    osm: JSON.parse(osmRaw) as { elements: Record<string, unknown>[]; timestamp: string; query: string },
-    osmBulk: osmBulkRaw,
-    bdtopo: bdtopoFeatures,
-    addresses: JSON.parse(addrRaw) as { addresses?: Record<string, unknown>[]; license?: string },
-    businesses: JSON.parse(bizSireneRaw) as { records?: Record<string, unknown>[] },
-    businessesOsm: JSON.parse(bizOsmRaw) as { status?: string; body?: unknown },
-    businessesWeb: JSON.parse(bizWebRaw) as { results?: Record<string, unknown>[] },
-    ign: { features: ignFeatures, unavailable: ignUnavailable },
-  };
-}
-
-// ---------------------------------------------------------------------------
-// Normalisation per source family
-// ---------------------------------------------------------------------------
-
-function normalizeBoundary(raw: Record<string, unknown>): BoundaryFeature {
-  const fc = raw as { features?: Array<{ geometry?: { type?: string; coordinates?: unknown } }> };
-  const feature = fc.features?.[0];
-  if (!feature?.geometry) throw new Error("normalizeBoundary: no valid geometry in Admin Express response");
-  const geom = feature.geometry;
-  let polygons: number[][][][] = [];
-  if (geom.type === "Polygon") {
-    polygons = [geom.coordinates as number[][][]];
-  } else if (geom.type === "MultiPolygon") {
-    polygons = geom.coordinates as number[][][][];
-  } else {
-    throw new Error(`normalizeBoundary: unsupported geometry type: ${geom.type}`);
-  }
-  if (polygons.length === 0 || !polygons.every((polygon) => polygon.length > 0)) {
-    throw new Error("normalizeBoundary: boundary contains no complete polygons");
-  }
-  const rings = polygons[0];
-  const centroid = computePolygonCentroid(rings);
-  const [cx, cy] = centroid;
-  const [lx, lz] = forward(cx, cy);
-  const now = new Date().toISOString();
-  const sourceGeometry = {
-    type: geom.type,
-    coordinates: geom.coordinates,
-  } as OsmNormalizedGeometry;
-  const sourceRefs: SourceReference[] = [{
-    source: "IGN ADMIN EXPRESS COG",
-    timestamp: now,
-    license: "Licence Ouverte / Open Licence 2.0",
-  }];
-  return {
-    kind: "boundary",
-    stableId: `boundary:department/${GERS_TERRITORY.code}`,
-    sourceId: `admin-express:${GERS_TERRITORY.code}`,
-    lon: cx,
-    lat: cy,
-    x: lx,
-    z: lz,
-    rings,
-    polygons,
-    territoryCode: GERS_TERRITORY.code,
-    geometry: sourceGeometry,
-    localGeometry: localizeBoundaryGeometry(sourceGeometry),
-    provenance: [{
-      featureId: `boundary:department/${GERS_TERRITORY.code}`,
-      property: "geometry",
-      winner: "IGN ADMIN EXPRESS COG",
-      contenders: ["IGN ADMIN EXPRESS COG"],
-      priority: 100,
-      timestamp: now,
-    }],
-    confidence: 1,
-    status: "active",
-    sourceRefs,
-  };
-}
-
-function localizeBoundaryGeometry(geometry: OsmNormalizedGeometry): Record<string, unknown> {
-  switch (geometry.type) {
-    case "Polygon":
-      return {
-        type: "Polygon",
-        coordinates: geometry.coordinates.map((ring) => ring.map(([lon, lat]) => forward(lon, lat))),
-      };
-    case "MultiPolygon":
-      return {
-        type: "MultiPolygon",
-        coordinates: geometry.coordinates.map((polygon) =>
-          polygon.map((ring) => ring.map(([lon, lat]) => forward(lon, lat)))),
-      };
-    default:
-      throw new Error(`normalizeBoundary: expected polygon geometry, got ${geometry.type}`);
-  }
-}
-
-export interface OsmNormalizationResult {
-  features: MapFeature[];
-  relationIssues: RelationIssue[];
-}
-
-type OsmNormalizedGeometry =
-  | { type: "Point"; coordinates: [number, number] }
-  | { type: "LineString"; coordinates: [number, number][] }
-  | { type: "MultiLineString"; coordinates: [number, number][][] }
-  | { type: "Polygon"; coordinates: [number, number][][] }
-  | { type: "MultiPolygon"; coordinates: [number, number][][][] };
-
-interface OsmTagClassification {
-  kind: FeatureKind;
+interface TagClassification {
+  kind: Exclude<FeatureKind, "boundary" | "business" | "address">;
   poiType?: string;
   roadClass?: string;
   waterType?: string;
@@ -512,849 +86,763 @@ interface OsmTagClassification {
   transportType?: string;
 }
 
-export function normalizeOsmWithReport(
-  raw: { elements: Record<string, unknown>[]; timestamp: string; query: string },
-  boundary: BoundaryFeature,
-): OsmNormalizationResult {
-  const boundaryPolygons: PolygonGeometry[] = boundaryPolygonComponents(boundary).map((rings) => ({
-    type: "Polygon",
-    coordinates: rings,
-  }));
-  const boundaryIndex = createBoundaryIndex(boundaryPolygons.map((polygon) => polygon.coordinates));
-  const now = new Date().toISOString();
-  const elements = deduplicateOsmElements(raw.elements.filter(isOsmElement));
-  const features: MapFeature[] = [];
-  const relationIssues: RelationIssue[] = [];
-  const nodeCoords = new Map<number, [number, number]>();
-  const ways = new Map<number, OsmWayElement>();
-  const relations: OsmRelationElement[] = [];
+const SOURCE_TIMESTAMP = new Date().toISOString();
+const OSM_URL = "https://www.openstreetmap.org";
+const BAN_URL = "https://adresse.data.gouv.fr";
+const BUSINESS_URL = "https://recherche-entreprises.api.gouv.fr";
 
-  for (const element of elements) {
-    if (element.type === "node") {
-      nodeCoords.set(element.id, [element.lon, element.lat]);
-    } else if (element.type === "way") {
-      ways.set(element.id, element);
-    } else {
-      relations.push(element);
+function dataRoot(): string {
+  return process.env.MASTER_MAPS_DATA_DIR ?? "data";
+}
+
+function parseArgs(args: string[]): NormalizeOptions {
+  const root = dataRoot();
+  let rawDir = path.join(root, "raw");
+  let outDir = path.join(root, "intermediate");
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index];
+    if (argument === "--raw-dir" && args[index + 1]) rawDir = args[++index]!;
+    if (argument === "--out-dir" && args[index + 1]) outDir = args[++index]!;
+    if (argument === "--help" || argument === "-h") {
+      console.log("Usage: tsx scripts/data/normalize.ts [--raw-dir <path>] [--out-dir <path>]");
+      process.exit(0);
     }
   }
+  return { rawDir, outDir };
+}
 
-  const classifyTags = (tags: Record<string, string>): OsmTagClassification | null => {
-    if (tags.building) return { kind: "building" };
-    if (
-      tags.waterway
-      || tags.natural === "water"
-      || tags.natural === "wetland"
-      || tags.landuse === "reservoir"
-    ) {
-      return {
-        kind: "water",
-        waterType: tags.waterway ?? (tags.natural === "water" ? "water" : tags.natural ?? "reservoir"),
-      };
+function text(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function numberValue(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function coordinate(value: unknown): Coordinate | null {
+  if (!Array.isArray(value) || value.length < 2) return null;
+  if (typeof value[0] !== "number" || typeof value[1] !== "number") return null;
+  return Number.isFinite(value[0]) && Number.isFinite(value[1]) ? [value[0], value[1]] : null;
+}
+
+function parseBoolean(value: unknown): boolean | undefined {
+  if (typeof value === "boolean") return value;
+  if (typeof value !== "string") return undefined;
+  const normalized = value.trim().toLowerCase();
+  if (["yes", "true", "1", "oui"].includes(normalized)) return true;
+  if (["no", "false", "0", "non"].includes(normalized)) return false;
+  return undefined;
+}
+
+function parseWidth(value: unknown): number | undefined {
+  const candidate = typeof value === "number"
+    ? value
+    : typeof value === "string" && /^\s*\d+(?:\.\d+)?\s*m?\s*$/i.test(value)
+      ? Number.parseFloat(value)
+      : NaN;
+  return Number.isFinite(candidate) && candidate > 0 ? candidate : undefined;
+}
+
+function metadata(values: Record<string, unknown>): Record<string, unknown> {
+  return Object.fromEntries(Object.entries(values).filter(([, value]) => value !== undefined && value !== null && value !== ""));
+}
+
+function toGeometry(value: unknown): Geometry | null {
+  if (typeof value !== "object" || value === null || !("type" in value) || !("coordinates" in value)) return null;
+  const type = (value as { type?: unknown }).type;
+  const coordinates = (value as { coordinates?: unknown }).coordinates;
+  if (type === "Point") {
+    const point = coordinate(coordinates);
+    return point ? { type: "Point", coordinates: point } : null;
+  }
+  if (type === "LineString" && Array.isArray(coordinates)) {
+    const points = coordinates.map(coordinate);
+    return points.length >= 2 && points.every((point): point is Coordinate => point !== null)
+      ? { type: "LineString", coordinates: points }
+      : null;
+  }
+  if (type === "MultiLineString" && Array.isArray(coordinates)) {
+    const lines = coordinates.map((line) => Array.isArray(line) ? line.map(coordinate) : []);
+    return lines.length > 0 && lines.every((candidate) => candidate.length >= 2 && candidate.every((point): point is Coordinate => point !== null))
+      ? { type: "MultiLineString", coordinates: lines as Coordinate[][] }
+      : null;
+  }
+  if (type === "Polygon" && Array.isArray(coordinates)) {
+    const rings = coordinates.map((ring) => Array.isArray(ring) ? ring.map(coordinate) : []);
+    if (!rings.length || !rings.every((ring) => ring.length >= 3 && ring.every((point): point is Coordinate => point !== null))) return null;
+    const closed = rings.map((ring) => {
+      const first = ring[0]!;
+      const last = ring[ring.length - 1]!;
+      return first[0] === last[0] && first[1] === last[1] ? ring : [...ring, [first[0], first[1]]];
+    });
+    return closed.every((ring) => ring.length >= 4) ? { type: "Polygon", coordinates: closed } : null;
+  }
+  if (type === "MultiPolygon" && Array.isArray(coordinates)) {
+    const polygons = coordinates.map((polygon) => toGeometry({ type: "Polygon", coordinates: polygon }));
+    return polygons.length > 0 && polygons.every((polygon): polygon is Extract<Geometry, { type: "Polygon" }> => polygon?.type === "Polygon")
+      ? { type: "MultiPolygon", coordinates: polygons.map((polygon) => polygon.coordinates) }
+      : null;
+  }
+  return null;
+}
+
+function localizeGeometry(geometry: Geometry): Geometry | null {
+  const mapPoint = (point: Coordinate): Coordinate => wgs84ToRender(point);
+  if (geometry.type === "Point") return { type: "Point", coordinates: mapPoint(geometry.coordinates) };
+  if (geometry.type === "LineString") return { type: "LineString", coordinates: geometry.coordinates.map(mapPoint) };
+  if (geometry.type === "MultiLineString") return { type: "MultiLineString", coordinates: geometry.coordinates.map((line) => line.map(mapPoint)) };
+  const local = geometry.type === "Polygon"
+    ? { type: "Polygon" as const, coordinates: geometry.coordinates.map((ring) => ring.map(mapPoint)) }
+    : { type: "MultiPolygon" as const, coordinates: geometry.coordinates.map((polygon) => polygon.map((ring) => ring.map(mapPoint))) };
+  return normalizePolygonGeometry(local);
+}
+
+function asLocalGeometry(geometry: Geometry): LocalGeometry {
+  const local = localizeGeometry(geometry);
+  if (!local) throw new Error(`Degenerate geometry cannot be localized: ${geometry.type}`);
+  return local as LocalGeometry;
+}
+
+function boundaryPolygons(boundary: BoundaryFeature | { geometry?: unknown; rings?: Coordinate[][]; polygons?: Coordinate[][][] }): PolygonGeometry[] {
+  const geometry = toGeometry(boundary.geometry);
+  if (geometry?.type === "Polygon") return [{ type: "Polygon", coordinates: geometry.coordinates }];
+  if (geometry?.type === "MultiPolygon") return geometry.coordinates.map((coordinates) => ({ type: "Polygon", coordinates }));
+  if (boundary.polygons) return boundary.polygons.map((coordinates) => ({ type: "Polygon", coordinates }));
+  if (boundary.rings) return [{ type: "Polygon", coordinates: boundary.rings }];
+  throw new Error("Boundary has no Polygon or MultiPolygon geometry");
+}
+
+function boundaryFromRaw(raw: RawBoundary): BoundaryFeature {
+  const rawFeature = raw.features?.find((candidate) => candidate.geometry !== undefined);
+  const geometry = toGeometry(rawFeature?.geometry);
+  if (!geometry || (geometry.type !== "Polygon" && geometry.type !== "MultiPolygon")) {
+    throw new Error("Admin Express boundary is missing a valid Polygon or MultiPolygon");
+  }
+  const localGeometry = localizeGeometry(geometry);
+  if (!localGeometry || (localGeometry.type !== "Polygon" && localGeometry.type !== "MultiPolygon")) {
+    throw new Error("Admin Express boundary could not be localized");
+  }
+  const localFocus = computeLocalFocus(localGeometry as LocalGeometry);
+  const [lon, lat] = renderToWgs84(localFocus);
+  const stableId = `boundary:department/${GERS_TERRITORY.code}`;
+  const feature = {
+    kind: "boundary",
+    stableId,
+    sourceId: `admin-express:${GERS_TERRITORY.code}`,
+    territoryCode: GERS_TERRITORY.code,
+    geometry,
+    localGeometry,
+    lon,
+    lat,
+    x: localFocus[0],
+    z: localFocus[1],
+    confidence: "high",
+    status: "active",
+    provenance: [{ featureId: stableId, property: "geometry", winner: "IGN ADMIN EXPRESS COG", contenders: ["IGN ADMIN EXPRESS COG"], priority: 100, timestamp: SOURCE_TIMESTAMP }],
+    sourceRefs: [{ source: "IGN ADMIN EXPRESS COG", url: "https://data.geopf.fr/wfs/ows", timestamp: SOURCE_TIMESTAMP, license: "Licence Ouverte / Open Licence 2.0" }],
+  };
+  return parseFeature(feature, stableId) as BoundaryFeature;
+}
+
+function parseFeature(value: unknown, stableId: string): MapFeature {
+  const result = MapFeatureSchema.safeParse(value);
+  if (!result.success) throw new Error(`Invalid normalized feature ${stableId}: ${result.error.message}`);
+  return result.data;
+}
+
+function buildStableId(kind: FeatureKind, name: string, address: string, coordinateValue: Coordinate): string {
+  const payload = `${kind}|${name.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase()}|${address.toLowerCase()}|${coordinateValue[0].toFixed(7)}|${coordinateValue[1].toFixed(7)}`;
+  let hash = 2166136261;
+  for (const character of payload) hash = Math.imul(hash ^ character.charCodeAt(0), 16777619);
+  return `hash:${(hash >>> 0).toString(16).padStart(8, "0")}`;
+}
+
+function addBaseFeature(
+  kind: Exclude<FeatureKind, "boundary" | "business" | "address">,
+  stableId: string,
+  name: string | undefined,
+  geometry: Geometry,
+  source: SourceReference,
+  extra: Record<string, unknown> = {},
+): MapFeature {
+  const localGeometry = localizeGeometry(geometry);
+  if (!localGeometry) throw new Error(`Feature ${stableId} has degenerate geometry`);
+  const localFocus = computeLocalFocus(localGeometry as LocalGeometry);
+  const [lon, lat] = renderToWgs84(localFocus);
+  return parseFeature({
+    kind,
+    stableId,
+    sourceId: stableId,
+    name,
+    geometry,
+    localGeometry,
+    lon,
+    lat,
+    x: localFocus[0],
+    z: localFocus[1],
+    confidence: "medium",
+    status: "active",
+    provenance: [{ featureId: stableId, property: "geometry", winner: source.source, contenders: [source.source], priority: 60, timestamp: source.timestamp }],
+    sourceRefs: [source],
+    ...extra,
+  }, stableId);
+}
+
+function classifyTags(tags: Record<string, string>): TagClassification | null {
+  if (tags.name && tags.place) return { kind: "poi", poiType: tags.place };
+  if (tags.building) return { kind: "building" };
+  if (tags.waterway || tags.natural === "water" || tags.natural === "wetland" || tags.landuse === "reservoir") {
+    return { kind: "water", waterType: tags.waterway ?? (tags.natural === "water" ? "water" : tags.natural ?? "reservoir") };
+  }
+  if (tags.landuse) return { kind: "landuse", landuseType: tags.landuse };
+  if (tags.leisure) return { kind: "landuse", landuseType: tags.leisure };
+  if (tags.highway) return { kind: "road", roadClass: tags.highway };
+  if (tags.railway || tags.public_transport) return { kind: "transport", transportType: tags.railway ?? tags.public_transport ?? "other" };
+  const poiType = tags.shop ?? tags.amenity ?? tags.tourism ?? tags.historic ?? tags.office ?? tags.craft;
+  if (tags.name && poiType) return { kind: "poi", poiType };
+  if (tags["addr:housenumber"]) return { kind: "address" };
+  return null;
+}
+
+function areaGeometry(geometry: Geometry): geometry is Extract<Geometry, { type: "Polygon" | "MultiPolygon" }> {
+  return geometry.type === "Polygon" || geometry.type === "MultiPolygon";
+}
+
+function clipAreaGeometry(
+  geometry: Extract<Geometry, { type: "Polygon" | "MultiPolygon" }>,
+  boundaries: PolygonGeometry[],
+  boundaryIndex: BoundaryIndex,
+): Extract<Geometry, { type: "Polygon" | "MultiPolygon" }> | null {
+  const sourcePolygons = geometry.type === "Polygon" ? [geometry.coordinates] : geometry.coordinates;
+  if (sourcePolygons.every((polygon) => boundaryIndex.polygonInside(polygon))) return geometry;
+  if (sourcePolygons.every((polygon) => boundaryIndex.polygonOutside(polygon))) return null;
+  const polygons: Coordinate[][][] = [];
+  for (const polygon of sourcePolygons) {
+    for (const boundary of boundaries) {
+      const clipped = clipPolygonToPolygon({ type: "Polygon", coordinates: polygon }, boundary);
+      if (!clipped) continue;
+      if (clipped.type === "Polygon") polygons.push(clipped.coordinates);
+      else polygons.push(...clipped.coordinates);
     }
-    if (tags.landuse) return { kind: "landuse", landuseType: tags.landuse };
-    if (tags.leisure) return { kind: "landuse", landuseType: tags.leisure };
-    if (tags.highway) return { kind: "road", roadClass: tags.highway };
-    if (tags.railway || tags.public_transport) {
-      return {
-        kind: "transport",
-        transportType: tags.railway ?? tags.public_transport ?? "other",
-      };
+  }
+  if (polygons.length === 0) return null;
+  return polygons.length === 1 ? { type: "Polygon", coordinates: polygons[0]! } : { type: "MultiPolygon", coordinates: polygons };
+}
+
+function clipLineGeometry(points: Coordinate[], boundaries: PolygonGeometry[], boundaryIndex: BoundaryIndex): Extract<Geometry, { type: "LineString" | "MultiLineString" }> | null {
+  if (boundaryIndex.lineInside(points)) return { type: "LineString", coordinates: points };
+  if (boundaryIndex.lineOutside(points)) return null;
+  const clipped = boundaries.flatMap((boundary) => clipLineStringToPolygon(points, boundary));
+  if (clipped.length === 0) return null;
+  return clipped.length === 1 ? { type: "LineString", coordinates: clipped[0]! } : { type: "MultiLineString", coordinates: clipped };
+}
+
+function normalizeOsmGeometry(
+  geometry: Geometry,
+  classification: TagClassification,
+  boundaries: PolygonGeometry[],
+  boundaryIndex: BoundaryIndex,
+): Geometry | null {
+  if (geometry.type === "Point") return boundaryIndex.contains(geometry.coordinates) ? geometry : null;
+  if (classification.kind === "building" || classification.kind === "landuse" || (classification.kind === "water" && geometry.type !== "LineString" && geometry.type !== "MultiLineString")) {
+    if (!areaGeometry(geometry)) return null;
+    return clipAreaGeometry(geometry, boundaries, boundaryIndex);
+  }
+  if (classification.kind === "road" || classification.kind === "water" || classification.kind === "transport") {
+    if (geometry.type === "LineString") return clipLineGeometry(geometry.coordinates, boundaries, boundaryIndex);
+    if (geometry.type === "MultiLineString") {
+      const lines = geometry.coordinates.flatMap((line) => {
+        const clipped = clipLineGeometry(line, boundaries, boundaryIndex);
+        return clipped?.type === "LineString" ? [clipped.coordinates] : clipped?.coordinates ?? [];
+      });
+      return lines.length === 0 ? null : lines.length === 1 ? { type: "LineString", coordinates: lines[0]! } : { type: "MultiLineString", coordinates: lines };
     }
-    const poiType =
-      tags.shop
-      ?? tags.amenity
-      ?? tags.tourism
-      ?? tags.historic
-      ?? tags.office
-      ?? tags.craft;
-    if (tags.name && poiType) {
-      return { kind: "poi", poiType };
-    }
-    if (tags["addr:housenumber"]) return { kind: "address" };
     return null;
+  }
+  const localFocus = computeLocalFocus(asLocalGeometry(geometry));
+  const focus = renderToWgs84(localFocus);
+  return boundaryIndex.contains(focus) ? { type: "Point", coordinates: focus } : null;
+}
+
+function osmFeature(
+  elementType: "way" | "relation" | "node",
+  elementId: number,
+  tags: Record<string, string>,
+  classification: TagClassification,
+  sourceGeometry: Geometry,
+  boundaryPolygons: PolygonGeometry[],
+  boundaryIndex: BoundaryIndex,
+  timestamp: string,
+): MapFeature | null {
+  const geometry = normalizeOsmGeometry(sourceGeometry, classification, boundaryPolygons, boundaryIndex);
+  if (!geometry) return null;
+  const localGeometry = localizeGeometry(geometry);
+  if (!localGeometry) return null;
+  const localFocus = computeLocalFocus(localGeometry as LocalGeometry);
+  const [lon, lat] = renderToWgs84(localFocus);
+  const stableId = `osm:${elementType}/${elementId}`;
+  const source: SourceReference = { source: "osm", url: `${OSM_URL}/${elementType}/${elementId}`, timestamp, license: "ODbL-1.0" };
+  const name = text(tags.name);
+  const address = [tags["addr:housenumber"], tags["addr:street"], tags["addr:postcode"]].filter(Boolean).join(", ");
+  const base = {
+    stableId,
+    sourceId: stableId,
+    name,
+    address: address || undefined,
+    geometry,
+    localGeometry,
+    lon,
+    lat,
+    x: localFocus[0],
+    z: localFocus[1],
+    confidence: "medium",
+    status: "active",
+    provenance: [{ featureId: stableId, property: "geometry", winner: "osm", contenders: ["osm"], priority: 60, timestamp }],
+    sourceRefs: [source],
+    sourceMetadata: { tags },
   };
-
-  const localizeGeometry = (geometry: OsmNormalizedGeometry): Record<string, unknown> => {
-    switch (geometry.type) {
-      case "Point":
-        return { type: "Point", coordinates: forward(geometry.coordinates[0], geometry.coordinates[1]) };
-      case "LineString":
-        return {
-          type: "LineString",
-          coordinates: geometry.coordinates.map(([lon, lat]) => forward(lon, lat)),
-        };
-      case "MultiLineString":
-        return {
-          type: "MultiLineString",
-          coordinates: geometry.coordinates.map((line) => line.map(([lon, lat]) => forward(lon, lat))),
-        };
-      case "Polygon":
-        return {
-          type: "Polygon",
-          coordinates: geometry.coordinates.map((ring) => ring.map(([lon, lat]) => forward(lon, lat))),
-        };
-      case "MultiPolygon":
-        return {
-          type: "MultiPolygon",
-          coordinates: geometry.coordinates.map((polygon) =>
-            polygon.map((ring) => ring.map(([lon, lat]) => forward(lon, lat)))),
-        };
-    }
-  };
-
-  const geometryAnchor = (geometry: OsmNormalizedGeometry): [number, number] => {
-    if (geometry.type === "Point") return geometry.coordinates;
-    const points: [number, number][] = [];
-    const collect = (value: unknown): void => {
-      if (!Array.isArray(value)) return;
-      if (value.length >= 2 && typeof value[0] === "number" && typeof value[1] === "number") {
-        points.push([value[0], value[1]]);
-        return;
-      }
-      for (const child of value) collect(child);
-    };
-    collect(geometry.coordinates);
-    if (points.length === 0) return [0, 0];
-    let lon = 0;
-    let lat = 0;
-    for (const point of points) {
-      lon += point[0];
-      lat += point[1];
-    }
-    return [lon / points.length, lat / points.length];
-  };
-
-  const clipAreaGeometry = (
-    geometry: Extract<OsmNormalizedGeometry, { type: "Polygon" | "MultiPolygon" }>,
-  ): Extract<OsmNormalizedGeometry, { type: "Polygon" | "MultiPolygon" }> | null => {
-    const polygons: [number, number][][][] = [];
-    const sourcePolygons = geometry.type === "Polygon" ? [geometry.coordinates] : geometry.coordinates;
-    if (sourcePolygons.every((polygon) => boundaryIndex.polygonInside(polygon))) return geometry;
-    if (sourcePolygons.every((polygon) => boundaryIndex.polygonOutside(polygon))) return null;
-    for (const sourcePolygon of sourcePolygons) {
-      for (const boundaryPolygon of boundaryPolygons) {
-        const clipped = clipPolygonToPolygon({ type: "Polygon", coordinates: sourcePolygon }, boundaryPolygon);
-        if (!clipped) continue;
-        if (clipped.type === "Polygon") polygons.push(clipped.coordinates);
-        else polygons.push(...clipped.coordinates);
-      }
-    }
-    if (polygons.length === 0) return null;
-    if (polygons.length === 1) return { type: "Polygon", coordinates: polygons[0] };
-    return { type: "MultiPolygon", coordinates: polygons };
-  };
-
-  const clipLineGeometry = (
-    coordinates: [number, number][],
-  ): Extract<OsmNormalizedGeometry, { type: "LineString" | "MultiLineString" }> | null => {
-    if (boundaryIndex.lineInside(coordinates)) return { type: "LineString", coordinates };
-    if (boundaryIndex.lineOutside(coordinates)) return null;
-    const clippedLines: [number, number][][] = [];
-    for (const boundaryPolygon of boundaryPolygons) clippedLines.push(...clipLineStringToPolygon(coordinates, boundaryPolygon));
-    if (clippedLines.length === 0) return null;
-    if (clippedLines.length === 1) return { type: "LineString", coordinates: clippedLines[0] };
-    return { type: "MultiLineString", coordinates: clippedLines };
-  };
-
-  const parseWidth = (tags: Record<string, string>): number | undefined => {
-    const value = Number.parseFloat(tags.width ?? tags["water:width"] ?? "");
-    return Number.isFinite(value) && value > 0 ? value : undefined;
-  };
-
-  const addNormalizedFeature = (
-    elementType: "way" | "relation",
-    elementId: number,
-    tags: Record<string, string>,
-    classification: OsmTagClassification,
-    sourceGeometry: OsmNormalizedGeometry,
-  ): void => {
-    const [lon, lat] = geometryAnchor(sourceGeometry);
-    if (!Number.isFinite(lon) || !Number.isFinite(lat)) return;
-    const name = tags.name ?? "";
-    const address = [
-      tags["addr:housenumber"] ?? "",
-      tags["addr:street"] ?? "",
-      tags["addr:postcode"] ?? "",
-    ].filter(Boolean).join(", ");
-    const featureGeometry: OsmNormalizedGeometry =
-      classification.kind === "poi"
-        || classification.kind === "address"
-        ? { type: "Point", coordinates: [lon, lat] }
-        : sourceGeometry;
-    const [x, z] = forward(lon, lat);
-    const sourceId = `osm:${elementType}/${elementId}`;
-    const sourceTimestamp = raw.timestamp || now;
-    const base = {
-      kind: classification.kind,
-      stableId: sourceId,
-      sourceId,
-      name: name || undefined,
-      address: address || undefined,
-      lon,
-      lat,
-      x,
-      z,
-      geometry: featureGeometry,
-      sourceGeometry: featureGeometry.type !== sourceGeometry.type ? sourceGeometry : undefined,
-      localGeometry: localizeGeometry(featureGeometry),
-      provenance: [{
-        featureId: sourceId,
-        property: "geometry",
-        winner: "osm",
-        contenders: ["osm"],
-        priority: 60,
-        timestamp: sourceTimestamp,
-      }],
-      confidence: 0.9,
-      status: "active" as const,
-      sourceRefs: [{
-        source: "osm",
-        url: `https://www.openstreetmap.org/${elementType}/${elementId}`,
-        timestamp: sourceTimestamp,
-        license: "ODbL-1.0",
-      }],
-    };
-
-    if (classification.kind === "building") {
-      const height = inferHeight(tags);
-      features.push({
-        ...base,
-        kind: "building",
-        height: height?.height ?? categoryDefaultHeight(tags.building ?? "house"),
-        heightInferred: height ? height.inferred : true,
-        levels: tags["building:levels"] ? Number.parseInt(tags["building:levels"], 10) : undefined,
-        buildingType: tags.building || undefined,
-      } as BuildingFeature);
-      return;
-    }
-    if (classification.kind === "road") {
-      const width = parseWidth(tags);
-      features.push({
-        ...base,
-        kind: "road",
-        roadClass: classification.roadClass ?? "unclassified",
-        highway: classification.roadClass ?? "unclassified",
-        width: width ?? defaultRoadWidth(classification.roadClass ?? "unclassified"),
-        widthInferred: width === undefined,
-        surface: tags.surface || undefined,
-        oneway: tags.oneway === "yes",
-        bridge: tags.bridge === "yes",
-        tunnel: tags.tunnel === "yes",
-      } as RoadFeature);
-      return;
-    }
-    if (classification.kind === "water") {
-      const width = parseWidth(tags);
-      features.push({
-        ...base,
-        kind: "water",
-        waterType: classification.waterType ?? "water",
-        width,
-        widthInferred: width === undefined,
-      } as WaterFeature);
-      return;
-    }
-    if (classification.kind === "landuse") {
-      features.push({
-        ...base,
-        kind: "landuse",
-        landuseType: classification.landuseType ?? "other",
-      } as LanduseFeature);
-      return;
-    }
-    if (classification.kind === "poi") {
-      features.push({
-        ...base,
-        kind: "poi",
-        poiType: classification.poiType ?? "other",
-        category: tags.shop ?? tags.amenity ?? tags.tourism ?? undefined,
-        website: tags.website ?? tags["contact:website"] ?? undefined,
-        phone: tags.phone ?? tags["contact:phone"] ?? undefined,
-        openingHours: tags.opening_hours ?? undefined,
-        operator: tags.operator ?? undefined,
-        wheelchair: tags.wheelchair ?? undefined,
-      } as PoiFeature);
-      return;
-    }
-    if (classification.kind === "transport") {
-      features.push({
-        ...base,
-        kind: "transport",
-        transportType: classification.transportType ?? "other",
-        route: tags.route ?? undefined,
-        operator: tags.operator ?? undefined,
-      } as TransportFeature);
-      return;
-    }
-    features.push({
+  if (classification.kind === "building") {
+    const explicitHeight = parseWidth(tags.height);
+    const levels = Number.parseInt(tags["building:levels"] ?? "", 10);
+    return parseFeature({
       ...base,
-      kind: "address",
-      banId: sourceId,
-      housenumber: tags["addr:housenumber"] ?? "",
-      street: tags["addr:street"] ?? "",
-      postcode: tags["addr:postcode"] ?? "",
-      city: tags["addr:city"] ?? GERS_TERRITORY.name,
-    } as AddressFeature);
-  };
+      kind: "building",
+      height: explicitHeight ?? (Number.isFinite(levels) && levels > 0 ? levels * 3 : undefined),
+      heightInferred: explicitHeight === undefined,
+      heightSource: explicitHeight !== undefined ? "explicit" : Number.isFinite(levels) && levels > 0 ? "inferred_from_levels" : undefined,
+      levels: Number.isFinite(levels) && levels >= 0 ? levels : undefined,
+      buildingType: tags.building,
+    }, stableId);
+  }
+  if (classification.kind === "road") {
+    const width = parseWidth(tags.width);
+    const bridge = parseBoolean(tags.bridge);
+    const tunnel = parseBoolean(tags.tunnel);
+    const layer = text(tags.layer);
+    return parseFeature({
+      ...base,
+      kind: "road",
+      highway: classification.roadClass,
+      roadClass: classification.roadClass,
+      width,
+      widthInferred: width === undefined,
+      widthSource: width === undefined ? "inferred_default" : "explicit",
+      bridge,
+      tunnel,
+      stratum: tunnel === true ? "tunnel" : bridge === true ? "bridge" : "normal",
+      layer,
+      oneway: parseBoolean(tags.oneway),
+    }, stableId);
+  }
+  if (classification.kind === "water") {
+    const width = parseWidth(tags.width ?? tags["water:width"]);
+    return parseFeature({ ...base, kind: "water", waterType: classification.waterType, width, widthInferred: width === undefined, sourceMetadata: { tags } }, stableId);
+  }
+  if (classification.kind === "landuse") return parseFeature({ ...base, kind: "landuse", landuseType: classification.landuseType ?? "other" }, stableId);
+  if (classification.kind === "poi") {
+    const isArea = geometry.type === "Polygon" || geometry.type === "MultiPolygon";
+    const pointGeometry: Geometry = { type: "Point", coordinates: [lon, lat] };
+    const pointLocal: Geometry = { type: "Point", coordinates: localFocus };
+    return parseFeature({
+      ...base,
+      kind: "poi",
+      geometry: isArea ? pointGeometry : geometry,
+      sourceGeometry: isArea ? geometry : undefined,
+      localGeometry: isArea ? pointLocal : localGeometry,
+      poiType: classification.poiType ?? "poi",
+      category: tags.shop ?? tags.amenity ?? tags.tourism,
+      website: tags.website ?? tags["contact:website"],
+      phone: tags.phone ?? tags["contact:phone"],
+      openingHours: tags.opening_hours,
+      operator: tags.operator,
+      wheelchair: tags.wheelchair,
+    }, stableId);
+  }
+  if (classification.kind === "transport") return parseFeature({ ...base, kind: "transport", transportType: classification.transportType ?? "other", route: tags.route, operator: tags.operator }, stableId);
+  return parseFeature({
+    ...base,
+    kind: "address",
+    banId: stableId,
+    housenumber: tags["addr:housenumber"] ?? "",
+    street: tags["addr:street"] ?? "unknown",
+    postcode: tags["addr:postcode"],
+    city: tags["addr:city"] ?? GERS_TERRITORY.name,
+  }, stableId);
+}
 
+export function normalizeOsmWithReport(raw: RawOsm, boundary: BoundaryFeature | { geometry?: unknown; rings?: Coordinate[][]; polygons?: Coordinate[][][] }): OsmNormalizationResult {
+  const boundaries = boundaryPolygons(boundary);
+  const boundaryIndex = createBoundaryIndex(boundaries.map((polygon) => polygon.coordinates));
+  const elements = deduplicateOsmElements(raw.elements.filter(isOsmElement));
+  const timestamp = raw.timestamp || SOURCE_TIMESTAMP;
+  const nodeCoordinates = new Map<number, Coordinate>();
+  const ways = new Map<number, OsmWayElement>();
+  const relations: OsmRelationElement[] = [];
+  for (const element of elements) {
+    if (element.type === "node") nodeCoordinates.set(element.id, [element.lon, element.lat]);
+    else if (element.type === "way") ways.set(element.id, element);
+    else relations.push(element);
+  }
+  const features: MapFeature[] = [];
+  const relationIssues: RelationIssue[] = [];
   const relationWayIds = new Set<number>();
   for (const relation of relations) {
     const tags = relation.tags ?? {};
     const classification = classifyTags(tags);
-    const isAreaRelation =
-      classification?.kind === "building"
-      || classification?.kind === "water"
-      || classification?.kind === "landuse";
-    const isNamedPoiRelation =
-      classification?.kind === "poi"
-      && relation.members.some((member) => member.role === "outer" || member.role === "inner");
-    if (!classification || (!isAreaRelation && !isNamedPoiRelation)) continue;
-
-    const reconstructed = reconstructMultipolygonRelation(relation, ways, nodeCoords);
+    const areaRelation = classification?.kind === "building" || classification?.kind === "water" || classification?.kind === "landuse";
+    const namedAreaPoi = classification?.kind === "poi" && relation.members.some((member) => member.role === "outer" || member.role === "inner");
+    if (!classification || (!areaRelation && !namedAreaPoi)) continue;
+    const reconstructed = reconstructMultipolygonRelation(relation, ways, nodeCoordinates);
     if ("reason" in reconstructed) {
       relationIssues.push(reconstructed);
       continue;
     }
-    const clipped = clipAreaGeometry(reconstructed.geometry);
-    if (!clipped) continue;
-    addNormalizedFeature("relation", relation.id, tags, classification, clipped);
-    if (isAreaRelation) {
-      for (const wayId of reconstructed.memberWayIds) relationWayIds.add(wayId);
-    }
-
+    const feature = osmFeature("relation", relation.id, tags, classification, reconstructed.geometry, boundaries, boundaryIndex, timestamp);
+    if (feature) features.push(feature);
+    if (feature && areaRelation) for (const wayId of reconstructed.memberWayIds) relationWayIds.add(wayId);
   }
-  const resolveWayNodes = (way: OsmWayElement): [number, number][] | null => {
-    const coordinates: [number, number][] = [];
-    for (const nodeId of way.nodes) {
-      const coordinate = nodeCoords.get(nodeId);
-      if (!coordinate) return null;
-      coordinates.push(coordinate);
-    }
-    return coordinates.length >= 2 ? coordinates : null;
-  };
-
   for (const element of elements) {
     if (element.type === "relation") continue;
     const tags = element.tags ?? {};
     const classification = classifyTags(tags);
     if (!classification) continue;
-
-    let coordinates: [number, number][];
+    let geometry: Geometry | null = null;
     if (element.type === "node") {
-      coordinates = [[element.lon, element.lat]];
+      geometry = { type: "Point", coordinates: [element.lon, element.lat] };
     } else {
-      if (
-        relationWayIds.has(element.id)
-        && (classification.kind === "building"
-          || classification.kind === "water"
-          || classification.kind === "landuse")
-      ) {
-        continue;
+      if (relationWayIds.has(element.id) && (classification.kind === "building" || classification.kind === "water" || classification.kind === "landuse")) continue;
+      const points: Coordinate[] = [];
+      let complete = true;
+      for (const nodeId of element.nodes) {
+        const point = nodeCoordinates.get(nodeId);
+        if (!point) {
+          complete = false;
+          break;
+        }
+        points.push(point);
       }
-      const resolved = resolveWayNodes(element);
-      if (!resolved) continue;
-      coordinates = resolved;
-    }
-
-    let geometry: OsmNormalizedGeometry | null = null;
-    if (coordinates.length === 1) {
-      const point = coordinates[0]!;
-      if (!boundaryIndex.contains(point)) continue;
-      geometry = { type: "Point", coordinates: point };
-    } else {
-      const first = coordinates[0]!;
-      const last = coordinates[coordinates.length - 1]!;
-      const isClosed = first[0] === last[0] && first[1] === last[1];
-      if (
-        isClosed
-        && (classification.kind === "building"
-          || classification.kind === "water"
-          || classification.kind === "landuse")
-      ) {
-        geometry = clipAreaGeometry({ type: "Polygon", coordinates: [coordinates] });
-      } else if (
-        classification.kind === "road"
-        || classification.kind === "water"
-        || classification.kind === "transport"
-      ) {
-        geometry = clipLineGeometry(coordinates);
-      } else {
-        const anchor = geometryAnchor({ type: "LineString", coordinates });
-        if (!boundaryIndex.contains(anchor)) continue;
-        geometry = { type: "Point", coordinates: anchor };
+      if (complete && points.length >= 2) {
+        const first = points[0]!;
+        const last = points[points.length - 1]!;
+        const closed = first[0] === last[0] && first[1] === last[1];
+        const areaKind = classification.kind === "building" || classification.kind === "water" || classification.kind === "landuse" || classification.kind === "poi";
+        geometry = closed && areaKind
+          ? { type: "Polygon", coordinates: [points] }
+          : { type: "LineString", coordinates: points };
       }
     }
-    if (geometry) addNormalizedFeature(element.type, element.id, tags, classification, geometry);
+    if (!geometry) continue;
+    const feature = osmFeature(element.type, element.id, tags, classification, geometry, boundaries, boundaryIndex, timestamp);
+    if (feature) features.push(feature);
   }
-
   return { features, relationIssues };
 }
 
-export function normalizeOsm(
-  raw: { elements: Record<string, unknown>[]; timestamp: string; query: string },
-  boundary: BoundaryFeature,
-): MapFeature[] {
+export function normalizeOsm(raw: RawOsm, boundary: BoundaryFeature): MapFeature[] {
   return normalizeOsmWithReport(raw, boundary).features;
 }
 
-function normalizeAddresses(
-  raw: { addresses?: Record<string, unknown>[]; license?: string },
-  boundary: BoundaryFeature,
-): AddressFeature[] {
-  if (!raw.addresses?.length) return [];
-  const boundaryPolygons = boundaryPolygonComponents(boundary);
-  const boundaryIndex = createBoundaryIndex(boundaryPolygons);
-  const now = new Date().toISOString();
+function normalizeAddresses(raw: { addresses?: Record<string, unknown>[]; license?: string }, boundary: BoundaryFeature): AddressFeature[] {
+  const boundaries = boundaryPolygons(boundary);
+  const boundaryIndex = createBoundaryIndex(boundaries.map((polygon) => polygon.coordinates));
   const features: AddressFeature[] = [];
-
-  for (const r of raw.addresses) {
-    const lon = r.lon as number;
-    const lat = r.lat as number;
-    if (!isFinite(lon) || !isFinite(lat)) continue;
-    if (!boundaryIndex.contains([lon, lat])) continue;
-
-    const [lx, lz] = forward(lon, lat);
-    const housenumber = String(r.numero ?? "");
-    const street = String(r.streetName ?? r.street ?? "");
-    const postcode = String(r.postalCode ?? "");
-    const city = String(r.city ?? GERS_TERRITORY.name);
-    const banId = String(r.banId ?? "");
-    const name = [housenumber, street].filter(Boolean).join(" ");
-    const geomHash = coordHash([[lon, lat]], 1);
-    const stableId = buildStableId("address", name, `${street} ${postcode}`, lon, lat, geomHash);
-
-    features.push({
+  for (const record of raw.addresses ?? []) {
+    const longitude = numberValue(record.lon);
+    const latitude = numberValue(record.lat);
+    if (longitude === undefined || latitude === undefined || !boundaryIndex.contains([longitude, latitude])) continue;
+    const housenumber = text(record.numero) ?? "";
+    const street = text(record.streetName ?? record.street) ?? "unknown street";
+    const postcode = text(record.postalCode) ?? "";
+    const city = text(record.city) ?? GERS_TERRITORY.name;
+    const banId = text(record.banId);
+    if (!banId) continue;
+    const name = `${housenumber} ${street}`.trim();
+    const stableId = `ban:${banId}`;
+    const local = wgs84ToRender([longitude, latitude]);
+    const feature = parseFeature({
       kind: "address",
       stableId,
+      sourceId: banId,
       banId,
       housenumber,
       street,
       postcode,
       city,
-      name: name || undefined,
-      lon,
-      lat,
-      x: lx,
-      z: lz,
-      geometry: { type: "Point", coordinates: [lon, lat] },
-      localGeometry: { type: "Point", coordinates: [lx, lz] },
-      provenance: [{
-        featureId: stableId,
-        property: "geometry",
-        winner: "ban",
-        contenders: ["ban"],
-        priority: 70,
-        timestamp: now,
-      }],
-      confidence: 0.95,
+      name,
+      lon: longitude,
+      lat: latitude,
+      x: local[0],
+      z: local[1],
+      geometry: { type: "Point", coordinates: [longitude, latitude] },
+      localGeometry: { type: "Point", coordinates: local },
+      confidence: "high",
       status: "active",
-      sourceRefs: [{ source: "ban", timestamp: now, license: raw.license ?? "etalab-2.0" }],
-    });
+      provenance: [{ featureId: stableId, property: "geometry", winner: "ban", contenders: ["ban"], priority: 70, timestamp: SOURCE_TIMESTAMP }],
+      sourceRefs: [{ source: "ban", url: BAN_URL, timestamp: SOURCE_TIMESTAMP, license: raw.license ?? "Etalab-2.0" }],
+    }, stableId);
+    features.push(feature as AddressFeature);
   }
-
   return features;
 }
 
+function normalizedText(value: string | undefined): string {
+  return (value ?? "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+}
+
+function metricDistance(first: Coordinate, second: Coordinate): number {
+  const a = wgs84ToRender(first);
+  const b = wgs84ToRender(second);
+  return Math.hypot(a[0] - b[0], a[1] - b[1]);
+}
+
+function addressEvidence(first: string | undefined, second: string | undefined): boolean {
+  const a = normalizedText(first);
+  const b = normalizedText(second);
+  if (!a || !b) return false;
+  if (a === b || a.includes(b) || b.includes(a)) return true;
+  const firstTokens = new Set(a.split(" ").filter((token) => token.length > 2));
+  return b.split(" ").filter((token) => token.length > 2).some((token) => firstTokens.has(token));
+}
+
+function cleanString(value: unknown): string | undefined {
+  return text(value);
+}
+
 export function normalizeBusinesses(
-  raw: {
-    records?: Record<string, unknown>[];
-    sourceUrl?: string;
-    license?: string;
-    acquiredAt?: string;
-  },
+  raw: { records?: Record<string, unknown>[]; sourceUrl?: string; license?: string; acquiredAt?: string },
   boundary: BoundaryFeature,
   osmRaw: { status?: string; body?: unknown },
   webRaw: { results?: Record<string, unknown>[] },
 ): BusinessFeature[] {
-  const boundaryPolygons = boundaryPolygonComponents(boundary);
-  const boundaryIndex = createBoundaryIndex(boundaryPolygons);
-  const now = new Date().toISOString();
+  const boundaries = boundaryPolygons(boundary);
+  const boundaryIndex = createBoundaryIndex(boundaries.map((polygon) => polygon.coordinates));
   const features: BusinessFeature[] = [];
-  const propertySources = new Map<string, Map<string, string>>();
-
-  const cleanString = (value: unknown): string | undefined => {
-    if (typeof value !== "string") return undefined;
-    const trimmed = value.trim();
-    return trimmed.length > 0 ? trimmed : undefined;
+  const propertySource = new Map<string, Map<string, string>>();
+  const now = raw.acquiredAt ?? SOURCE_TIMESTAMP;
+  const sourceRef = (source: string, url: string | undefined, timestamp: string, license: string | undefined): SourceReference => ({ source, url, timestamp, license });
+  const addSource = (feature: BusinessFeature, reference: SourceReference): void => {
+    if (!feature.sourceRefs.some((candidate) => candidate.source === reference.source && candidate.url === reference.url)) feature.sourceRefs.push(reference);
   };
-
-  const normalizedName = (value: string): string =>
-    value.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
-
-  const coordinateFrom = (value: unknown): [number, number] | null => {
-    if (typeof value !== "object" || value === null) return null;
-    const record = value as Record<string, unknown>;
-    const lon = typeof record.lon === "number" ? record.lon : null;
-    const lat = typeof record.lat === "number" ? record.lat : null;
-    return lon !== null && lat !== null && Number.isFinite(lon) && Number.isFinite(lat)
-      ? [lon, lat]
-      : null;
-  };
-
-  const sourcePriority = (source: string): number => {
-    if (source === "official-website") return 90;
-    if (source === "sirene") return 80;
-    if (source === "annuaire-entreprises") return 75;
-    if (source === "osm") return 60;
-    if (source === "pagesjaunes") return 40;
-    return 50;
-  };
-
-  const sourceReference = (
-    source: string,
-    url: string | undefined,
-    timestamp: string,
-    license: string | undefined,
-  ): SourceReference => ({
-    source,
-    url,
-    timestamp,
-    license,
-  });
-
-  const addSourceReference = (feature: BusinessFeature, reference: SourceReference): void => {
-    if (
-      !feature.sourceRefs.some((existing) =>
-        existing.source === reference.source && existing.url === reference.url)
-    ) {
-      feature.sourceRefs.push(reference);
-    }
-  };
-
-  const addPropertySource = (feature: BusinessFeature, property: string, source: string): void => {
-    const sources = propertySources.get(feature.stableId) ?? new Map<string, string>();
-    sources.set(property, source);
-    propertySources.set(feature.stableId, sources);
-  };
-
-  const mergeField = (
-    feature: BusinessFeature,
-    property: keyof BusinessFeature,
-    value: string | undefined,
-    source: string,
-    timestamp: string,
-  ): void => {
+  const priority = (source: string): number => source === "official-website" ? 90 : source === "sirene" ? 80 : source === "annuaire-entreprises" ? 75 : source === "osm" ? 60 : 40;
+  const mergeField = (feature: BusinessFeature, property: keyof BusinessFeature, value: string | undefined, source: string, timestamp: string): void => {
     if (!value) return;
-    const key = String(property);
+    const sources = propertySource.get(feature.stableId) ?? new Map<string, string>();
     const current = feature[property];
-    const currentSource = propertySources.get(feature.stableId)?.get(key) ?? "unknown";
-    if (current === undefined || current === null || current === "") {
-      (feature as Record<string, unknown>)[key] = value;
-      addPropertySource(feature, key, source);
-      return;
+    const currentSource = sources.get(String(property)) ?? "unknown";
+    if (typeof current !== "string" || priority(source) > priority(currentSource)) {
+      (feature as unknown as Record<string, unknown>)[String(property)] = value;
+      sources.set(String(property), source);
+      propertySource.set(feature.stableId, sources);
     }
-    if (current === value) return;
-    if (sourcePriority(source) <= sourcePriority(currentSource)) return;
-    (feature as Record<string, unknown>)[key] = value;
-    addPropertySource(feature, key, source);
-    feature.provenance.push({
-      featureId: feature.stableId,
-      property: key,
-      winner: `${source}=${value}`,
-      contenders: [`${currentSource}=${String(current)}`, `${source}=${value}`],
-      priority: sourcePriority(source),
-      timestamp,
-    });
   };
-
-  const insideBoundary = (lon: number, lat: number): boolean =>
-    boundaryIndex.contains([lon, lat]);
-
-  const distanceMetres = (
-    first: [number, number],
-    second: [number, number],
-  ): number => {
-    const dx = (first[0] - second[0]) * 111_319.9 * Math.cos(43.65 * Math.PI / 180);
-    const dz = (first[1] - second[1]) * 111_319.9;
-    return Math.sqrt(dx * dx + dz * dz);
-  };
-
-  const findMatch = (candidate: BusinessFeature): BusinessFeature | undefined => {
-    const candidateName = normalizedName(candidate.businessName);
-    return features.find((feature) => {
-      if (candidate.siret && feature.siret && candidate.siret === feature.siret) return true;
-      if (candidateName && candidateName === normalizedName(feature.businessName)) {
-        return distanceMetres([candidate.lon, candidate.lat], [feature.lon, feature.lat]) <= 150;
-      }
-      return false;
-    });
-  };
-
-  const mergeCandidate = (candidate: BusinessFeature): void => {
-    const match = findMatch(candidate);
-    if (!match) {
+  const match = (candidate: BusinessFeature): BusinessFeature | undefined => features.find((feature) => {
+    if (candidate.siret) return feature.siret === candidate.siret;
+    return !feature.siret
+      && normalizedText(candidate.businessName) === normalizedText(feature.businessName)
+      && addressEvidence(candidate.address, feature.address)
+      && metricDistance([candidate.lon!, candidate.lat!], [feature.lon!, feature.lat!]) <= 150;
+  });
+  const merge = (candidate: BusinessFeature): void => {
+    const existing = match(candidate);
+    if (!existing) {
       features.push(candidate);
       const sources = new Map<string, string>();
-      for (const property of [
-        "businessName", "legalName", "brand", "category", "nafCode", "nafLabel",
-        "address", "website", "phone", "openingHours", "operator", "wheelchair",
-      ]) {
-        if ((candidate as Record<string, unknown>)[property] !== undefined) {
-          sources.set(property, candidate.sourceRefs[0]?.source ?? "unknown");
-        }
+      const source = candidate.sourceRefs[0]?.source ?? "unknown";
+      for (const property of ["businessName", "legalName", "brand", "category", "nafCode", "nafLabel", "address", "website", "phone", "openingHours", "operator", "wheelchair"] as const) {
+        if (candidate[property]) sources.set(property, source);
       }
-      propertySources.set(candidate.stableId, sources);
+      propertySource.set(candidate.stableId, sources);
       return;
     }
-
-    const incomingSource = candidate.sourceRefs[0]?.source ?? "unknown";
-    addSourceReference(match, candidate.sourceRefs[0]);
-    for (const property of [
-      "address", "brand", "category", "nafCode", "nafLabel", "website",
-      "phone", "openingHours", "operator", "wheelchair",
-    ] as Array<keyof BusinessFeature>) {
-      mergeField(
-        match,
-        property,
-        candidate[property] as string | undefined,
-        incomingSource,
-        candidate.sourceRefs[0]?.timestamp ?? now,
-      );
+    const reference = candidate.sourceRefs[0];
+    if (reference) addSource(existing, reference);
+    const source = reference?.source ?? "unknown";
+    for (const property of ["address", "brand", "category", "nafCode", "nafLabel", "website", "phone", "openingHours", "operator", "wheelchair"] as const) {
+      mergeField(existing, property, candidate[property] as string | undefined, source, reference?.timestamp ?? now);
     }
   };
-
   for (const record of raw.records ?? []) {
-    const coordinate = coordinateFrom(record.coordinate);
+    const coordinateValue = record.coordinate;
+    const coordinateRecord = typeof coordinateValue === "object" && coordinateValue !== null ? coordinateValue as Record<string, unknown> : {};
+    const longitude = numberValue(coordinateRecord.lon);
+    const latitude = numberValue(coordinateRecord.lat);
     const businessName = cleanString(record.tradingName) ?? cleanString(record.legalName);
-    if (!coordinate || !businessName || !insideBoundary(coordinate[0], coordinate[1])) continue;
-
-    const [lon, lat] = coordinate;
+    if (longitude === undefined || latitude === undefined || !businessName || !boundaryIndex.contains([longitude, latitude])) continue;
     const siret = cleanString(record.siret);
-    const siren = cleanString(record.siren);
-    const legalName = cleanString(record.legalName);
-    const tradingName = cleanString(record.tradingName);
-    const address = cleanString(record.address);
-    const nafCode = cleanString(record.nafCode);
-    const nafLabel = cleanString(record.nafLabel);
-    const [x, z] = forward(lon, lat);
-    const stableId = siret
-      ? `business:siret/${siret}`
-      : buildStableId("business", businessName, address ?? "", lon, lat, coordHash([[lon, lat]], 1));
-    const timestamp = cleanString(record.acquiredAt) ?? raw.acquiredAt ?? now;
-    const feature: BusinessFeature = {
+    const stableId = siret ? `business:siret/${siret}` : buildStableId("business", businessName, cleanString(record.address) ?? "", [longitude, latitude]);
+    const local = wgs84ToRender([longitude, latitude]);
+    const source = sourceRef("sirene", raw.sourceUrl ?? BUSINESS_URL, cleanString(record.acquiredAt) ?? now, raw.license ?? "Licence Ouverte / Open Licence 2.0");
+    merge(parseFeature({
       kind: "business",
       stableId,
+      sourceId: siret,
       businessId: siret,
-      siren,
       siret,
-      brand: tradingName,
+      siren: cleanString(record.siren),
       businessName,
-      legalName,
-      category: nafLabel,
-      nafCode,
-      nafLabel,
+      legalName: cleanString(record.legalName),
+      brand: cleanString(record.tradingName),
+      category: cleanString(record.nafLabel),
+      nafCode: cleanString(record.nafCode),
+      nafLabel: cleanString(record.nafLabel),
       name: businessName,
-      address,
-      lon,
-      lat,
-      x,
-      z,
-      geometry: { type: "Point", coordinates: [lon, lat] },
-      localGeometry: { type: "Point", coordinates: [x, z] },
-      provenance: [{
-        featureId: stableId,
-        property: "identity",
-        winner: "sirene",
-        contenders: ["sirene"],
-        priority: 80,
-        timestamp,
-      }],
-      confidence: 0.95,
-      status: record.administrativeStatus === "A" || !record.administrativeStatus
-        ? "active"
-        : "uncertain",
-      sourceRefs: [
-        sourceReference(
-          "sirene",
-          raw.sourceUrl ?? "https://recherche-entreprises.api.gouv.fr",
-          timestamp,
-          raw.license ?? "Licence Ouverte / Open Licence 2.0",
-        ),
-      ],
+      address: cleanString(record.address),
+      lon: longitude,
+      lat: latitude,
+      x: local[0],
+      z: local[1],
+      geometry: { type: "Point", coordinates: [longitude, latitude] },
+      localGeometry: { type: "Point", coordinates: local },
+      confidence: "high",
+      status: cleanString(record.administrativeStatus) === "A" || !record.administrativeStatus ? "active" : "uncertain",
+      provenance: [{ featureId: stableId, property: "identity", winner: "sirene", contenders: ["sirene"], priority: 80, timestamp: source.timestamp }],
+      sourceRefs: [source],
       administrativeStatus: cleanString(record.administrativeStatus),
       creationDate: cleanString(record.creationDate),
-    };
-    mergeCandidate(feature);
+    }, stableId) as BusinessFeature);
   }
-
-  const osmBody = osmRaw.body;
-  const osmElements =
-    typeof osmBody === "object"
-    && osmBody !== null
-    && Array.isArray((osmBody as Record<string, unknown>).elements)
-      ? (osmBody as { elements: Record<string, unknown>[] }).elements
-      : [];
-  for (const element of osmElements) {
-    const tags = element.tags as Record<string, string> | undefined;
-    const businessName = cleanString(tags?.name);
-    if (!businessName) continue;
-    const coordinate =
-      element.type === "node"
-        ? coordinateFrom(element)
-        : coordinateFrom(element.center);
-    if (!coordinate || !insideBoundary(coordinate[0], coordinate[1])) continue;
-    const [lon, lat] = coordinate;
-    const [x, z] = forward(lon, lat);
+  const body = osmRaw.body;
+  const elements = typeof body === "object" && body !== null && Array.isArray((body as Record<string, unknown>).elements)
+    ? (body as { elements: Record<string, unknown>[] }).elements
+    : [];
+  for (const element of elements) {
+    const tags = typeof element.tags === "object" && element.tags !== null ? element.tags as Record<string, string> : {};
+    const businessName = cleanString(tags.name);
+    const pointValue = element.type === "node" ? element : element.center;
+    const pointRecord = typeof pointValue === "object" && pointValue !== null ? pointValue as Record<string, unknown> : {};
+    const longitude = numberValue(pointRecord.lon);
+    const latitude = numberValue(pointRecord.lat);
+    if (!businessName || longitude === undefined || latitude === undefined || !boundaryIndex.contains([longitude, latitude])) continue;
+    const local = wgs84ToRender([longitude, latitude]);
     const elementType = cleanString(element.type) ?? "element";
-    const elementId = typeof element.id === "number" ? element.id : 0;
-    const timestamp = now;
-    const feature: BusinessFeature = {
+    const elementId = numberValue(element.id) ?? 0;
+    const stableId = `business:osm/${elementType}/${elementId}`;
+    const source = sourceRef("osm", `${OSM_URL}/${elementType}/${elementId}`, SOURCE_TIMESTAMP, "ODbL-1.0");
+    merge(parseFeature({
       kind: "business",
-      stableId: `business:${elementType}/${elementId}`,
-      businessId: undefined,
+      stableId,
+      sourceId: stableId,
+      businessId: stableId,
       businessName,
       name: businessName,
-      brand: cleanString(tags?.brand),
-      category: cleanString(tags?.shop) ?? cleanString(tags?.office) ?? cleanString(tags?.craft) ?? cleanString(tags?.amenity),
-      address: [
-        cleanString(tags?.["addr:housenumber"]),
-        cleanString(tags?.["addr:street"]),
-        cleanString(tags?.["addr:postcode"]),
-      ].filter((value): value is string => value !== undefined).join(", ") || undefined,
-      phone: cleanString(tags?.phone) ?? cleanString(tags?.["contact:phone"]),
-      website: cleanString(tags?.website) ?? cleanString(tags?.["contact:website"]),
-      openingHours: cleanString(tags?.opening_hours),
-      operator: cleanString(tags?.operator),
-      wheelchair: cleanString(tags?.wheelchair),
-      lon,
-      lat,
-      x,
-      z,
-      geometry: { type: "Point", coordinates: [lon, lat] },
-      localGeometry: { type: "Point", coordinates: [x, z] },
-      provenance: [{
-        featureId: `business:${elementType}/${elementId}`,
-        property: "identity",
-        winner: "osm",
-        contenders: ["osm"],
-        priority: 60,
-        timestamp,
-      }],
-      confidence: 0.85,
+      brand: cleanString(tags.brand),
+      category: cleanString(tags.shop) ?? cleanString(tags.office) ?? cleanString(tags.craft) ?? cleanString(tags.amenity),
+      address: [cleanString(tags["addr:housenumber"]), cleanString(tags["addr:street"]), cleanString(tags["addr:postcode"])].filter((value): value is string => value !== undefined).join(", ") || undefined,
+      phone: cleanString(tags.phone) ?? cleanString(tags["contact:phone"]),
+      website: cleanString(tags.website) ?? cleanString(tags["contact:website"]),
+      openingHours: cleanString(tags.opening_hours),
+      operator: cleanString(tags.operator),
+      wheelchair: cleanString(tags.wheelchair),
+      lon: longitude,
+      lat: latitude,
+      x: local[0],
+      z: local[1],
+      geometry: { type: "Point", coordinates: [longitude, latitude] },
+      localGeometry: { type: "Point", coordinates: local },
+      confidence: "medium",
       status: "active",
-      sourceRefs: [
-        sourceReference(
-          "osm",
-          `https://www.openstreetmap.org/${elementType}/${elementId}`,
-          timestamp,
-          "ODbL-1.0",
-        ),
-      ],
-    };
-    mergeCandidate(feature);
+      provenance: [{ featureId: stableId, property: "identity", winner: "osm", contenders: ["osm"], priority: 60, timestamp: source.timestamp }],
+      sourceRefs: [source],
+    }, stableId) as BusinessFeature);
   }
-
   for (const result of webRaw.results ?? []) {
     if (result.status !== "ok") continue;
-    const sourceId = cleanString(result.sourceId) ?? "web:business";
     const businessName = cleanString(result.name) ?? cleanString(result.title);
     if (!businessName) continue;
-    const coordinate = coordinateFrom(result.coordinate);
-    const match = features.find((feature) =>
-      normalizedName(feature.businessName) === normalizedName(businessName)
-      && (!coordinate || distanceMetres([feature.lon, feature.lat], coordinate) <= 150));
-    if (!match) continue;
+    const coordinateValue = result.coordinate;
+    const coordinateRecord = typeof coordinateValue === "object" && coordinateValue !== null ? coordinateValue as Record<string, unknown> : {};
+    const longitude = numberValue(coordinateRecord.lon);
+    const latitude = numberValue(coordinateRecord.lat);
+    const existing = features.find((feature) => normalizedText(feature.businessName) === normalizedText(businessName)
+      && (!longitude || !latitude || metricDistance([feature.lon!, feature.lat!], [longitude, latitude]) <= 150));
+    if (!existing) continue;
+    const sourceId = cleanString(result.sourceId) ?? "official-website";
     const source = sourceId.includes("pagesjaunes") ? "pagesjaunes" : "official-website";
-    const timestamp = cleanString(result.acquiredAt) ?? now;
-    const url = cleanString(result.url);
-    addSourceReference(match, sourceReference(source, url, timestamp, undefined));
-    mergeField(match, "address", cleanString(result.address), source, timestamp);
-    mergeField(match, "phone", cleanString(result.phone), source, timestamp);
-    if (source === "official-website" && url) {
-      mergeField(match, "website", url, source, timestamp);
+    const reference = sourceRef(source, cleanString(result.url), cleanString(result.acquiredAt) ?? now, undefined);
+    addSource(existing, reference);
+    mergeField(existing, "address", cleanString(result.address), source, reference.timestamp);
+    mergeField(existing, "phone", cleanString(result.phone), source, reference.timestamp);
+    mergeField(existing, "website", cleanString(result.url), source, reference.timestamp);
+  }
+  return features;
+}
+
+function normalizeIgn(raw: { features: Record<string, unknown>[]; unavailable: boolean }, boundary: BoundaryFeature): MapFeature[] {
+  if (raw.unavailable) return [];
+  const boundaries = boundaryPolygons(boundary);
+  const boundaryIndex = createBoundaryIndex(boundaries.map((polygon) => polygon.coordinates));
+  const result: MapFeature[] = [];
+  for (const item of raw.features) {
+    const geometry = toGeometry(item.geometry);
+    if (!geometry) continue;
+    const clipped = normalizeOsmGeometry(geometry, { kind: "building" }, boundaries, boundaryIndex);
+    if (!clipped || (clipped.type !== "Polygon" && clipped.type !== "MultiPolygon")) continue;
+    const feature = addBaseFeature("building", `ign:${text(item.id) ?? buildStableId("building", text(item.name) ?? "", "", computeLocalFocus(asLocalGeometry(clipped)))}`, text(item.name), clipped, { source: "ign-geoplateforme", timestamp: SOURCE_TIMESTAMP }, { buildingType: text(item.nature) });
+    result.push(feature);
+  }
+  return result;
+}
+
+async function readJson(filePath: string, required: boolean): Promise<unknown> {
+  try {
+    return JSON.parse(await fs.readFile(filePath, "utf8")) as unknown;
+  } catch (error) {
+    if (required) throw new Error(`Required source file missing or invalid: ${filePath}: ${error instanceof Error ? error.message : String(error)}`);
+    return null;
+  }
+}
+
+async function loadRawSources(rawDir: string): Promise<RawSources> {
+  const boundary = await readJson(path.join(rawDir, GERS_TERRITORY.boundaryRawFile), true);
+  if (typeof boundary !== "object" || boundary === null) throw new Error("Admin Express boundary is not an object");
+  const osmParsed = await readJson(path.join(rawDir, "osm.json"), false);
+  let osm: RawOsm = typeof osmParsed === "object" && osmParsed !== null && Array.isArray((osmParsed as Record<string, unknown>).elements)
+    ? osmParsed as unknown as RawOsm
+    : { elements: [], timestamp: "", query: "" };
+  const bulkParsed = await readJson(path.join(rawDir, "osm-bulk.geojson"), false);
+  const osmBulk = typeof bulkParsed === "object" && bulkParsed !== null && Array.isArray((bulkParsed as Record<string, unknown>).features)
+    ? bulkParsed as { features: Record<string, unknown>[] }
+    : { features: [] };
+  if ((osmBulk.features?.length ?? 0) > 0) osm = { elements: [], timestamp: "bulk", query: "geofabrik-enrichment" };
+  const files = await fs.readdir(rawDir, { withFileTypes: true });
+  const bdtopoFiles = files
+    .filter((entry) => entry.isFile() && /^bdtopo-(buildings|roads|water-surfaces|water-lines)\.geojson$/.test(entry.name))
+    .map((entry) => path.join(rawDir, entry.name));
+  if (bdtopoFiles.length === 0) throw new Error("No canonical BD TOPO exports found");
+  const addresses = (await readJson(path.join(rawDir, "ban-addresses.json"), true)) as { addresses?: Record<string, unknown>[]; license?: string };
+  const businesses = ((await readJson(path.join(rawDir, "businesses-sirene.json"), false)) ?? { records: [] }) as RawSources["businesses"];
+  const businessesOsm = ((await readJson(path.join(rawDir, "businesses-osm.json"), false)) ?? { status: "missing" }) as RawSources["businessesOsm"];
+  const businessesWeb = ((await readJson(path.join(rawDir, "businesses-web.json"), false)) ?? { results: [] }) as RawSources["businessesWeb"];
+  const ign: RawSources["ign"] = { features: [], unavailable: true };
+  const intermediateDir = path.join(dataRoot(), "intermediate");
+  const ignUnavailable = await readJson(path.join(intermediateDir, "ign-unavailable.json"), false);
+  for (const entry of files) {
+    if (!entry.isFile() || !/^ign-[^/]+\.json$/.test(entry.name) || entry.name === "ign-capabilities.json") continue;
+    const parsed = await readJson(path.join(rawDir, entry.name), false);
+    if (typeof parsed === "object" && parsed !== null && Array.isArray((parsed as Record<string, unknown>).features)) {
+      ign.features.push(...(parsed as { features: Record<string, unknown>[] }).features);
+      ign.unavailable = false;
     }
   }
-
-  return features;
-}
-
-function normalizeIgn(
-  raw: { features: Record<string, unknown>[]; unavailable: boolean },
-  boundary: BoundaryFeature,
-): MapFeature[] {
-  if (raw.unavailable || !raw.features?.length) return [];
-  const boundaryPolygons = boundaryPolygonComponents(boundary);
-  const boundaryIndex = createBoundaryIndex(boundaryPolygons);
-  const now = new Date().toISOString();
-
-  for (const f of raw.features) {
-    const geom = f.geometry as { type?: string; coordinates?: unknown } | undefined;
-    const props = f.properties as Record<string, unknown> ?? {};
-    if (!geom?.type) continue;
-
-    let coords: [number, number][] = [];
-    let lon = 0, lat = 0;
-
-    if (geom.type === "Point") {
-      const c = geom.coordinates as number[];
-      if (c.length >= 2 && isFinite(c[0]) && isFinite(c[1])) {
-        coords = [[c[0], c[1]]];
-        lon = c[0]; lat = c[1];
-      }
-    } else if (geom.type === "Polygon") {
-      const rings = geom.coordinates as number[][][];
-      if (rings[0]?.length) {
-        coords = rings[0];
-        let sx = 0, sy = 0;
-        for (const [x, y] of coords) { sx += x; sy += y; }
-        lon = sx / coords.length;
-        lat = sy / coords.length;
-      }
-    } else continue;
-
-    if (!isFinite(lon) || !isFinite(lat)) continue;
-    if (!boundaryIndex.contains([lon, lat])) continue;
-
-    const [lx, lz] = forward(lon, lat);
-    const name = String(props.name ?? "");
-    const geomHash = coordHash(coords, coords.length);
-    const stableId = buildStableId("building", name, "", lon, lat, geomHash);
-
-    features.push({
-      kind: "building",
-      stableId,
-      name: name || undefined,
-      lon,
-      lat,
-      x: lx,
-      z: lz,
-      geometry: geom as Record<string, unknown>,
-      localGeometry: coords.length >= 2 ? {
-        type: geom.type === "Point" ? "Point" as const : "Polygon" as const,
-        coordinates: geom.type === "Point" ? forward(lon, lat) : [coords.map(([x, y]) => forward(x, y))],
-      } : undefined,
-      provenance: [{
-        featureId: stableId,
-        property: "geometry",
-        winner: "ign-geoplateforme",
-        contenders: ["ign-geoplateforme"],
-        priority: 100,
-        timestamp: now,
-      }],
-      confidence: 0.85,
-      status: "active",
-      sourceRefs: [{ source: "ign-geoplateforme", timestamp: now }],
-    } as BuildingFeature);
+  if (typeof ignUnavailable === "object" && ignUnavailable !== null && text((ignUnavailable as Record<string, unknown>).reason)) {
+    ign.features = [];
+    ign.unavailable = true;
   }
-
-  return features;
+  return { boundary: boundary as RawBoundary, osm, osmBulk, bdtopoFiles, addresses, businesses, businessesOsm, businessesWeb, ign };
 }
-
-// ---------------------------------------------------------------------------
-// Writer
-// ---------------------------------------------------------------------------
 
 async function writeJsonArray(filePath: string, values: Iterable<unknown>): Promise<void> {
   const handle = await fs.open(filePath, "w");
-  let buffer = "[";
+  let buffer = "";
   let first = true;
   try {
+    await handle.write("[");
     for (const value of values) {
       const encoded = JSON.stringify(value);
       if (encoded === undefined) continue;
-      if (!first) buffer += ",\n";
-      buffer += encoded;
+      buffer += `${first ? "" : ",\n"}${encoded}`;
       first = false;
       if (buffer.length >= 1024 * 1024) {
         await handle.write(buffer);
@@ -1368,92 +856,94 @@ async function writeJsonArray(filePath: string, values: Iterable<unknown>): Prom
 }
 
 async function writeNormalizedFeatures(features: MapFeature[], outDir: string): Promise<void> {
-  const preserved = new Set([
-    "boundary-source.json",
-    "bdtopo-manifest.json",
-    "ign-unavailable.json",
-    "osm-manifest.json",
-    "osm-bulk-manifest.json",
-  ]);
+  const preserved = new Set(["boundary-source.json", "bdtopo-manifest.json", "ign-unavailable.json", "osm-manifest.json", "osm-bulk-manifest.json", "relation-issues.json", "normalization-issues.json"]);
   for (const entry of await fs.readdir(outDir, { withFileTypes: true })) {
-    if (entry.isFile() && entry.name.endsWith(".json") && !preserved.has(entry.name)) {
-      await fs.unlink(path.join(outDir, entry.name));
-    }
+    if (entry.isFile() && entry.name.endsWith(".json") && !preserved.has(entry.name)) await fs.unlink(path.join(outDir, entry.name));
   }
-
   const groups = new Map<string, MapFeature[]>();
-  for (const f of features) {
-    const list = groups.get(f.kind) ?? [];
-    list.push(f);
-    groups.set(f.kind, list);
+  for (const feature of features) {
+    const parsed = MapFeatureSchema.parse(feature);
+    const list = groups.get(parsed.kind) ?? [];
+    list.push(parsed);
+    groups.set(parsed.kind, list);
   }
-  const chunkSize = 20_000;
   for (const [kind, list] of groups) {
+    const chunkSize = 20_000;
     for (let offset = 0; offset < list.length; offset += chunkSize) {
       const suffix = offset === 0 ? "" : `-${String(offset / chunkSize).padStart(4, "0")}`;
       await writeJsonArray(path.join(outDir, `${kind}${suffix}.json`), list.slice(offset, offset + chunkSize));
     }
   }
-  function* provenanceRecords(): Iterable<ProvenanceRecord> {
-    for (const feature of features) {
-      yield* feature.provenance;
-    }
+  function* provenanceRecords(): Iterable<unknown> {
+    for (const feature of features) yield* feature.provenance;
   }
   await writeJsonArray(path.join(outDir, "provenance.json"), provenanceRecords());
 }
 
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
-
-export async function normalizeAll(rawDir?: string, outDir?: string): Promise<void> {
-  const root = dataRoot();
-  const rd = rawDir ?? path.join(root, "raw");
-  const od = outDir ?? path.join(root, "intermediate");
-  await fs.mkdir(od, { recursive: true });
-
-  const sources = await loadRawSources(rd);
-  const boundary = normalizeBoundary(sources.boundary);
-  const osmResult = normalizeOsmWithReport(sources.osm, boundary);
-  const bdtopoFeatures = normalizeBdtopo(sources.bdtopo, boundaryPolygonComponents(boundary)) as MapFeature[];
-  const osmBulkFeatures = normalizeOsmBulk(sources.osmBulk.features ?? []) as MapFeature[];
-  const addrFeatures = normalizeAddresses(sources.addresses, boundary);
-  const bizFeatures = normalizeBusinesses(
-    sources.businesses,
-    boundary,
-    sources.businessesOsm,
-    sources.businessesWeb,
-  );
-  const ignFeatures = normalizeIgn(sources.ign, boundary);
-
-  await fs.writeFile(
-    path.join(od, "relation-issues.json"),
-    JSON.stringify(osmResult.relationIssues, null, 2),
-    "utf8",
-  );
-  const all: MapFeature[] = [
-    boundary,
-    ...osmBulkFeatures,
-    ...bdtopoFeatures,
-    ...osmResult.features,
-    ...addrFeatures,
-    ...bizFeatures,
-    ...ignFeatures,
-  ];
-  await writeNormalizedFeatures(all, od);
-  console.error(`[normalize] Wrote ${all.length} features to ${od}`);
-  const kindCounts = new Map<string, number>();
-  for (const f of all) kindCounts.set(f.kind, (kindCounts.get(f.kind) ?? 0) + 1);
-  for (const [k, c] of kindCounts) console.error(`[normalize]  ${k}: ${c}`);
+function canonicalGeometry(geometry: Geometry): Geometry {
+  if (geometry.type !== "Polygon" && geometry.type !== "MultiPolygon") return geometry;
+  const normalized = normalizePolygonGeometry(geometry);
+  if (!normalized) throw new Error(`Area geometry has no non-degenerate polygon`);
+  return normalized;
 }
 
-// ---------------------------------------------------------------------------
-// CLI entry
-// ---------------------------------------------------------------------------
+function canonicalFeature(feature: MapFeature): MapFeature {
+  const sourceGeometry = feature.sourceGeometry ? canonicalGeometry(feature.sourceGeometry) : undefined;
+  const candidate = { ...feature, geometry: canonicalGeometry(feature.geometry), localGeometry: feature.localGeometry ? canonicalGeometry(feature.localGeometry) : undefined, sourceGeometry };
+  const parsed = MapFeatureSchema.safeParse(candidate);
+  if (!parsed.success) throw new Error(`Invalid normalized feature: ${parsed.error.message}`);
+  return parsed.data;
+}
+export async function normalizeAll(rawDir?: string, outDir?: string): Promise<void> {
+  const root = dataRoot();
+  const sourceDir = rawDir ?? path.join(root, "raw");
+  const destinationDir = outDir ?? path.join(root, "intermediate");
+  await fs.mkdir(destinationDir, { recursive: true });
+  const sources = await loadRawSources(sourceDir);
+  const boundary = boundaryFromRaw(sources.boundary);
+  const boundaries = boundaryPolygons(boundary);
+  const osmResult = normalizeOsmWithReport(sources.osm, boundary);
+  const bdtopoFeatures: MapFeature[] = [];
+  for (const filePath of sources.bdtopoFiles) {
+    const parsed = await readJson(filePath, true);
+    if (typeof parsed !== "object" || parsed === null || !("features" in parsed) || !Array.isArray(parsed.features)) throw new Error(`Invalid BD TOPO export ${filePath}`);
+    const sourceLayer = path.basename(filePath);
+    const sourceFeatures = parsed.features.map((feature) => {
+      if (typeof feature !== "object" || feature === null) return {};
+      return { ...feature, sourceLayer };
+    });
+    const normalizedFeatures = normalizeBdtopo(sourceFeatures, boundaries.map((polygon) => polygon.coordinates));
+    for (const feature of normalizedFeatures) bdtopoFeatures.push(feature);
+  }
+  const osmBulkFeatures = normalizeOsmBulk(sources.osmBulk.features ?? [], { polygons: boundaries, index: createBoundaryIndex(boundaries.map((polygon) => polygon.coordinates)) });
+  const addressFeatures = normalizeAddresses(sources.addresses, boundary);
+  const businessFeatures = normalizeBusinesses(sources.businesses, boundary, sources.businessesOsm, sources.businessesWeb);
+  const ignFeatures = normalizeIgn(sources.ign, boundary);
+  const invalidFeatures: Array<{ stableId: string; kind: string; error: string }> = [];
+  const features: MapFeature[] = [];
+  const candidates = [boundary].concat(bdtopoFeatures, osmBulkFeatures, osmResult.features, addressFeatures, businessFeatures, ignFeatures);
+  for (const feature of candidates) {
+    try {
+      features.push(canonicalFeature(feature));
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      if (feature.kind === "boundary") throw error;
+      invalidFeatures.push({ stableId: feature.stableId, kind: feature.kind, error: reason });
+    }
+  }
+  await fs.writeFile(path.join(destinationDir, "normalization-issues.json"), JSON.stringify(invalidFeatures, null, 2) + "\n", "utf8");
+  await fs.writeFile(path.join(destinationDir, "relation-issues.json"), JSON.stringify(osmResult.relationIssues, null, 2) + "\n", "utf8");
+  await writeNormalizedFeatures(features, destinationDir);
+  const counts = new Map<string, number>();
+  for (const feature of features) counts.set(feature.kind, (counts.get(feature.kind) ?? 0) + 1);
+  console.error(`[normalize] Wrote ${features.length} canonical features to ${destinationDir}`);
+  for (const [kind, count] of counts) console.error(`[normalize] ${kind}: ${count}`);
+}
+
 if (process.argv[1]?.endsWith("normalize.ts")) {
-  const opts = parseArgs(process.argv.slice(2));
-  normalizeAll(opts.rawDir, opts.outDir).catch((err) => {
-    console.error("[normalize] Fatal:", err);
+  const options = parseArgs(process.argv.slice(2));
+  normalizeAll(options.rawDir, options.outDir).catch((error: unknown) => {
+    console.error("[normalize] Fatal:", error);
     process.exit(1);
   });
 }

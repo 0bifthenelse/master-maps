@@ -1,9 +1,9 @@
 /**
  * scripts/data/fetch-ign.ts
  *
- * Discover IGN Géoplateforme WFS elevation layers for Auch (32013).
- * Acquires contour lines (ELEVATION.CONTOUR.LINE) as vector terrain data
- * and records available LiDAR HD tile indices.
+ * Discover IGN Géoplateforme WFS elevation layers for the Gers department.
+ * Acquire terrain records when a current service layer covers the territory.
+ * The report also records available LiDAR HD tile indices.
  *
  * If contour lines or any practical elevation grid is unavailable,
  * writes an explicit unavailable record to data/intermediate/ign-unavailable.json.
@@ -18,9 +18,8 @@ import crypto from "node:crypto";
 import { GERS_TERRITORY } from "../../src/lib/data/territory";
 
 // ---------------------------------------------------------------------------
-// Local type definitions (duplicated from src/lib/data/schema.ts until it
-// exists — compatible with the expected shared contract)
-// ---------------------------------------------------------------------------
+// Acquisition metadata has a script-local shape because it is not canonical
+// map feature data.
 
 interface IgnSourceRecord {
   readonly id: string;
@@ -39,19 +38,21 @@ interface IgnSourceRecord {
   readonly error?: string;
 }
 
+interface IgnLayer {
+  readonly name: string;
+  readonly title: string;
+  readonly abstract: string;
+  readonly defaultCrs: string;
+  readonly crsOptions: string[];
+  readonly wgs84Bbox: [number, number, number, number] | null;
+  readonly keywords: string[];
+}
+
 interface IgnCapabilityRecord {
   readonly wfsEndpoint: string;
   readonly acquiredAt: string;
   readonly version: string;
-  readonly layers: Array<{
-    readonly name: string;
-    readonly title: string;
-    readonly abstract: string;
-    readonly defaultCrs: string;
-    readonly crsOptions: string[];
-    readonly wgs84Bbox: [number, number, number, number] | null;
-    readonly keywords: string[];
-  }>;
+  readonly layers: IgnLayer[];
   readonly responseHash: string;
 }
 
@@ -78,7 +79,7 @@ const WFS_BASE = "https://data.geopf.fr/wfs/ows";
 /** Gers department bootstrap envelope for elevation discovery. */
 const TERRITORY_BBOX: [number, number, number, number] = [...GERS_TERRITORY.bootstrapBbox];
 
-/** WFS count limit — the server caps at 5000 */
+/** WFS count limit; the server caps at 5000. */
 const WFS_COUNT = 5000;
 
 // ---------------------------------------------------------------------------
@@ -144,13 +145,13 @@ function parseBbox(xml: string): [number, number, number, number] | null {
 
 async function discoverCapabilities(
   endpoint: string,
-): Promise<{xml: string; version: string; layers: Array<ReturnType<typeof parseFeatureType>>}> {
+): Promise<{ xml: string; version: string; layers: IgnLayer[] }> {
   const url = `${endpoint}?SERVICE=WFS&VERSION=2.0.0&REQUEST=GetCapabilities`;
   const xml = await fetchText(url, "application/xml, text/xml, text/plain");
 
   const version = extractTag(xml, "ows:ServiceTypeVersion") ?? "2.0.0";
 
-  function parseFeatureType(block: string) {
+  function parseFeatureType(block: string): IgnLayer {
     return {
       name: extractTag(block, "Name") ?? "",
       title: extractTag(block, "Title") ?? "",
@@ -163,10 +164,9 @@ async function discoverCapabilities(
   }
 
   const blocks: string[] = [];
-  const ftRe = /<FeatureType>([\s\S]*?)<\/FeatureType>/g;
+  const ftRe = /<(?:[A-Za-z0-9_]+:)?FeatureType\b[^>]*>([\s\S]*?)<\/(?:[A-Za-z0-9_]+:)?FeatureType>/g;
   let m: RegExpExecArray | null;
-  while ((m = ftRe.exec(xml)) !== null) blocks.push(m[1]);
-
+  while ((m = ftRe.exec(xml)) !== null) blocks.push(m[1]!);
   const layers = blocks.map(parseFeatureType);
 
   return {xml, version, layers};
@@ -237,7 +237,7 @@ async function storeJson(
 async function main() {
   // ---- Phase 1: Capabilities -------------------------------------------
   console.error("[fetch-ign] Discovering capabilities…");
-  let cap: {xml: string; version: string; layers: ReturnType<typeof parseFeatureType>[]};
+  let cap: { xml: string; version: string; layers: IgnLayer[] };
   try {
     cap = await discoverCapabilities(WFS_BASE);
   } catch (err: unknown) {
@@ -275,7 +275,7 @@ async function main() {
   const capFile = await storeJson(RAW_DIR, "ign-capabilities.json", capRecord);
   console.error(`[fetch-ign] Capabilities (${cap.layers.length} types) → ${capFile}`);
 
-  // ---- Phase 2: Select elevation layers covering Auch -------------------
+  // ---- Phase 2: Select elevation layers covering Gers ----------------------
   const [bw, bs, be, bn] = TERRITORY_BBOX;
 
   const applicable = cap.layers.filter((l) => {
@@ -295,21 +295,20 @@ async function main() {
   });
 
   console.error(
-    `[fetch-ign] ${applicable.length} elevation layer(s) cover Auch:`,
-    applicable.map((l) => l.name).join(", "),
+    `[fetch-ign] ${applicable.length} elevation layer(s) cover Gers:`,
   );
 
   if (applicable.length === 0) {
     await storeJson(INTERMEDIATE_DIR, "ign-unavailable.json", {
-      reason: "No IGN Géoplateforme elevation layer covers the Auch bounding box",
+      reason: "No IGN Géoplateforme elevation layer covers the Gers bounding box",
       checkedAt: utcTimestamp(),
       sourceFamily: "ign-geoplateforme",
       endpoint: WFS_BASE,
       attempts: 0,
       errors: [],
     } satisfies IgnUnavailableRecord);
-    console.error("[fetch-ign] No applicable layers — unavailable written");
-    console.log(JSON.stringify({status: "unavailable", reason: "no-elevation-layers-cover-auch"}));
+    console.error("[fetch-ign] No applicable layers; unavailable written");
+    console.log(JSON.stringify({status: "unavailable", reason: "no-elevation-layers-cover-gers"}));
     return;
   }
 
@@ -395,7 +394,7 @@ async function main() {
       .filter((e) => e.layer === "ELEVATION.CONTOUR.LINE:courbe")
       .map((e) => e.error);
     await storeJson(INTERMEDIATE_DIR, "ign-unavailable.json", {
-      reason: "No practical elevation grid available for Auch from IGN Géoplateforme: contour lines not acquired",
+      reason: "No practical elevation grid is available from IGN Géoplateforme: contour lines were not acquired",
       checkedAt: utcTimestamp(),
       sourceFamily: "ign-geoplateforme",
       endpoint: WFS_BASE,

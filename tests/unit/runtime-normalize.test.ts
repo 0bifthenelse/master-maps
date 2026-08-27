@@ -45,7 +45,7 @@ describe("runtime normalization geometry contract", () => {
       geometry: { type: "LineString", coordinates: [[-5, 5], [15, 5]] },
     }, source, square, projection);
     expect(water?.geometry).toEqual({ type: "LineString", coordinates: [[0, 5], [10, 5]] });
-    expect(water?.widthMetadata).toEqual({ width: 10, widthSource: "category_default" });
+    expect(water).toMatchObject({ width: 10, widthInferred: true, waterType: "river" });
   });
 
   it("retains verified business metadata", () => {

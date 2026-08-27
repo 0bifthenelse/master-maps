@@ -14,69 +14,67 @@ export interface TessellationOptions {
   miterLimit?: number;
 }
 
-/**
- * Builds one indexed strip for one source polyline. The returned left/right
- * vertices are shared by adjacent segments. A MultiLineString must call this
- * function once per component, never with components concatenated.
- */
-export function tessellatePolyline(
-  points: readonly PolylinePoint[],
-  options: TessellationOptions,
-): TessellatedPolyline {
+export function tessellatePolyline(points: readonly PolylinePoint[], options: TessellationOptions): TessellatedPolyline {
   const halfWidth = options.halfWidth;
   const miterLimit = options.miterLimit ?? 4;
-  if (!Number.isFinite(halfWidth) || halfWidth <= 0) {
-    throw new Error(`halfWidth must be positive and finite, got ${halfWidth}`);
-  }
-  if (!Number.isFinite(miterLimit) || miterLimit < 1) {
-    throw new Error(`miterLimit must be finite and at least one, got ${miterLimit}`);
-  }
+  if (!Number.isFinite(halfWidth) || halfWidth <= 0) throw new Error(`halfWidth must be positive and finite, got ${halfWidth}`);
+  if (!Number.isFinite(miterLimit) || miterLimit < 1) throw new Error(`miterLimit must be finite and at least one, got ${miterLimit}`);
   const clean = removeConsecutiveDuplicates(points);
-  if (clean.length < 2) {
-    return { left: [], right: [], indices: [], miterJoinCount: 0, bevelJoinCount: 0 };
+  if (clean.length < 2) return { left: [], right: [], indices: [], miterJoinCount: 0, bevelJoinCount: 0 };
+
+  const directions: TessellatedVertex[] = [];
+  const normals: TessellatedVertex[] = [];
+  for (let index = 0; index < clean.length - 1; index += 1) {
+    const direction = unitVector(clean[index + 1]![0] - clean[index]![0], clean[index + 1]![1] - clean[index]![1]);
+    directions.push(direction);
+    normals.push(leftNormal(direction));
   }
 
   const left: TessellatedVertex[] = [];
   const right: TessellatedVertex[] = [];
   let miterJoinCount = 0;
   let bevelJoinCount = 0;
-
   for (let index = 0; index < clean.length; index += 1) {
-    const previous = clean[Math.max(0, index - 1)]!;
-    const current = clean[index]!;
-    const next = clean[Math.min(clean.length - 1, index + 1)]!;
-    const incoming = unitVector(current[0] - previous[0], current[1] - previous[1]);
-    const outgoing = unitVector(next[0] - current[0], next[1] - current[1]);
-    const previousNormal = leftNormal(incoming);
-    const nextNormal = leftNormal(outgoing);
-
-    if (index === 0 || index === clean.length - 1) {
-      const normal = index === 0 ? nextNormal : previousNormal;
-      left.push(offset(current, normal, halfWidth));
-      right.push(offset(current, normal, -halfWidth));
+    if (index === 0) {
+      left.push(offset(clean[index]!, normals[0]!, halfWidth));
+      right.push(offset(clean[index]!, normals[0]!, -halfWidth));
+      continue;
+    }
+    if (index === clean.length - 1) {
+      const normal = normals[normals.length - 1]!;
+      left.push(offset(clean[index]!, normal, halfWidth));
+      right.push(offset(clean[index]!, normal, -halfWidth));
       continue;
     }
 
-    const sumX = previousNormal[0] + nextNormal[0];
-    const sumZ = previousNormal[1] + nextNormal[1];
-    const miterDirection = unitVector(sumX, sumZ);
-    const denominator = dot(miterDirection, nextNormal);
+    const incoming = directions[index - 1]!;
+    const outgoing = directions[index]!;
+    const incomingNormal = normals[index - 1]!;
+    const outgoingNormal = normals[index]!;
+    const directionDot = dot(incoming, outgoing);
+    const turn = incoming[0] * outgoing[1] - incoming[1] * outgoing[0];
+    const normalSum: TessellatedVertex = [incomingNormal[0] + outgoingNormal[0], incomingNormal[1] + outgoingNormal[1]];
+    const miterDirection = unitVector(normalSum[0], normalSum[1]);
+    const denominator = dot(miterDirection, outgoingNormal);
     const miterLength = Math.abs(denominator) > 1e-6 ? halfWidth / denominator : Infinity;
 
-    if (Number.isFinite(miterLength) && Math.abs(miterLength) <= halfWidth * miterLimit) {
-      left.push(offset(current, miterDirection, miterLength));
-      right.push(offset(current, miterDirection, -miterLength));
+    if (directionDot > 0 && Number.isFinite(miterLength) && Math.abs(miterLength) <= halfWidth * miterLimit) {
+      left.push(offset(clean[index]!, miterDirection, miterLength));
+      right.push(offset(clean[index]!, miterDirection, -miterLength));
       miterJoinCount += 1;
-    } else {
-      // The averaged normal produces a bounded bevel fallback. It preserves
-      // the source vertex and cannot create a spike at an acute turn.
-      const bevelNormal = Math.abs(sumX) + Math.abs(sumZ) > 1e-6
-        ? miterDirection
-        : nextNormal;
-      left.push(offset(current, bevelNormal, halfWidth));
-      right.push(offset(current, bevelNormal, -halfWidth));
-      bevelJoinCount += 1;
+      continue;
     }
+
+    bevelJoinCount += 1;
+    if (directionDot <= -0.95) {
+      left.push([clean[index]![0], clean[index]![1]]);
+      right.push([clean[index]![0], clean[index]![1]]);
+      continue;
+    }
+    const leftNormalForJoin = turn >= 0 ? incomingNormal : outgoingNormal;
+    const rightNormalForJoin = turn >= 0 ? outgoingNormal : incomingNormal;
+    left.push(offset(clean[index]!, leftNormalForJoin, halfWidth));
+    right.push(offset(clean[index]!, rightNormalForJoin, -halfWidth));
   }
 
   const indices: number[] = [];
@@ -90,30 +88,27 @@ export function tessellatePolyline(
   return { left, right, indices, miterJoinCount, bevelJoinCount };
 }
 
-function removeConsecutiveDuplicates(points: readonly PolylinePoint[]): PolylinePoint[] {
-  const result: PolylinePoint[] = [];
+function removeConsecutiveDuplicates(points: readonly PolylinePoint[]): TessellatedVertex[] {
+  const result: TessellatedVertex[] = [];
   for (const point of points) {
-    if (!Number.isFinite(point[0]) || !Number.isFinite(point[1])) {
-      throw new Error("Polyline coordinates must be finite");
-    }
+    if (!Number.isFinite(point[0]) || !Number.isFinite(point[1])) throw new Error("Polyline coordinates must be finite");
     const previous = result[result.length - 1];
-    if (!previous || previous[0] !== point[0] || previous[1] !== point[1]) result.push(point);
+    if (!previous || previous[0] !== point[0] || previous[1] !== point[1]) result.push([point[0], point[1]]);
   }
   return result;
 }
 
 function unitVector(x: number, z: number): TessellatedVertex {
   const length = Math.hypot(x, z);
-  if (length < 1e-9) return [1, 0];
-  return [x / length, z / length];
+  return length < 1e-9 ? [1, 0] : [x / length, z / length];
 }
 
 function leftNormal(direction: TessellatedVertex): TessellatedVertex {
   return [-direction[1], direction[0]];
 }
 
-function dot(a: TessellatedVertex, b: TessellatedVertex): number {
-  return a[0] * b[0] + a[1] * b[1];
+function dot(first: TessellatedVertex, second: TessellatedVertex): number {
+  return first[0] * second[0] + first[1] * second[1];
 }
 
 function offset(point: PolylinePoint, direction: TessellatedVertex, distance: number): TessellatedVertex {

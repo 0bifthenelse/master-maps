@@ -1,10 +1,9 @@
-// @ts-nocheck
 'use client';
 
-import { type CSSProperties, type ReactNode, useCallback, useRef, useState } from 'react';
+import { type CSSProperties, type FormEvent, type ReactNode, useCallback, useRef, useState } from 'react';
 
 /* ------------------------------------------------------------------ */
-/*  Design tokens — prefer CSS custom properties when available        */
+/*  Design tokens - prefer CSS custom properties when available        */
 /* ------------------------------------------------------------------ */
 
 const ACCENT = '#ff7d27';
@@ -133,7 +132,7 @@ export function MapHud({
   const [focused, setFocused] = useState(false);
 
   const handleSubmit = useCallback(
-    (e: React.FormEvent) => {
+    (e: FormEvent) => {
       e.preventDefault();
       onSearch?.(query);
     },
@@ -153,14 +152,14 @@ export function MapHud({
             onSubmit={handleSubmit}
             style={{ display: 'contents' }}
             role="search"
-            aria-label="Rechercher dans Auch"
+            aria-label="Rechercher dans le Gers"
           >
             <input
               ref={inputRef}
               type="search"
               data-testid="search-input"
-              placeholder="Rechercher dans Auch …"
-              aria-label="Rechercher dans Auch"
+              placeholder="Rechercher dans le Gers..."
+              aria-label="Rechercher dans le Gers"
               value={query}
               onChange={(e) => onQueryChange?.(e.target.value)}
               onFocus={() => setFocused(true)}
@@ -213,7 +212,7 @@ export function MapHud({
       {/* ---- Attribution footer ---- */}
       {attributions && attributions.length > 0 && (
         <div style={attributionStrip}>
-          <span>Sources : </span>
+          <span>Sources: </span>
           {attributions.map((a, i) => (
             <span key={i} dangerouslySetInnerHTML={{ __html: a }} />
           ))}
@@ -235,12 +234,12 @@ export function MapHud({
           </span>
           <span>
             <a
-              href="https://geo.api.gouv.fr/"
+              href="https://cartes.gouv.fr/"
               style={linkStyle}
               target="_blank"
               rel="noopener noreferrer"
             >
-              geo.api.gouv.fr
+              IGN Géoplateforme
             </a>
           </span>
           <span>

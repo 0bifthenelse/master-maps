@@ -81,9 +81,9 @@ async function main() {
       },
     });
 
-    const exitCode = await new Promise<number>((resolve) => {
-      pw.on("exit", resolve);
-    });
+    const exit = Promise.withResolvers<number>();
+    pw.on("exit", (code) => exit.resolve(code ?? 1));
+    const exitCode = await exit.promise;
 
     process.exitCode = exitCode;
     console.log(`Playwright exit code: ${exitCode}`);

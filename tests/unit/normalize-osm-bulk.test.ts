@@ -17,7 +17,7 @@ describe("bulk OSM normalization", () => {
     ]);
     expect(features).toHaveLength(2);
     expect(features[0]).toMatchObject({ kind: "poi", lon: 0.6, lat: 43.7 });
-    expect(features[1]).toMatchObject({ kind: "road", lon: 0.6, lat: 43.7 });
+    expect(features[1]).toMatchObject({ kind: "road", lon: expect.closeTo(0.605, 5), lat: expect.closeTo(43.7, 5) });
     expect(features[1]?.localGeometry).toEqual({
       type: "LineString",
       coordinates: [expect.any(Array), expect.any(Array)],

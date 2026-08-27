@@ -1,6 +1,6 @@
 /**
  * @file fetch-addresses.ts
- * Fetches BAN addresses for every commune in Gers department 32, retaining
+ * Fetches BAN addresses in Gers department 32, retaining
  * only positions inside the complete authoritative department boundary.
  *
  * BAN bulk data: https://adresse.data.gouv.fr/data/ban/adresses/latest/csv/

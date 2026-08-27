@@ -1,35 +1,51 @@
 # Master Maps data sources
 
-The production territory is the Gers department, code 32. Source records under `data/manifests/sources.json` contain acquisition time, resource URL, license, CRS, hash, and record count.
+The production territory is the Gers department, code 32. `data/manifests/sources.json` records the source URL, edition, timestamp, license, CRS, SHA-256 value, and record count for each acquisition.
 
 ## IGN Admin Express COG
 
-The pipeline queries the IGN Geoplateforme WFS resource `ADMINEXPRESS-COG.LATEST:departement` and selects `code_insee=32`. The 2026-08-27 acquisition returned one complete MultiPolygon feature. The response used EPSG:4326. The open data license is Licence Ouverte / Open Licence 2.0.
-
-The raw response stays in `data/raw/gers-boundary.geojson`. The normalizer preserves every polygon and every ring. It does not select the largest component.
+The pipeline queries the IGN Géoplateforme WFS resource `ADMINEXPRESS-COG.LATEST:departement` with `code_insee=32`. The source uses EPSG:4326 and returns one complete MultiPolygon feature. The normalizer keeps every polygon and every ring.
 
 ## IGN BD TOPO
 
-`fetch-bdtopo.ts` discovers a current D032 package from the official IGN distribution. The verified acquisition used edition 2026-06-15 and the resource `BDTOPO_3-5_TOUSTHEMES_GPKG_LAMB93_D032_2026-06-15`. The package source CRS is EPSG:2154. The open data license is Licence Ouverte / Open Licence 2.0.
+`fetch-bdtopo.ts` first queries the official Géoplateforme capabilities endpoint, then the filtered `BDTOPO` resource catalog. It selects the newest D032 GPKG edition from catalog metadata. It does not guess dates or archive names.
 
-The archive stays under `data/raw`. The pipeline exports buildings, road segments, hydrographic surfaces, and hydrographic segments as WGS84 GeoJSON copies. The archive preserves the original Lambert-93 coordinates and source identifiers. The normalizer gives BD TOPO geometry precedence for buildings, roads, and hydrography.
+The verified package edition is `2026-06-15`. The selected package is `BDTOPO_3-5_TOUSTHEMES_GPKG_LAMB93_D032_2026-06-15`. Its archive size is 273308797 bytes and its SHA-256 value is `aed0afbcac474a38fb164411de467793673ee83b767b88020d429d83623562fa`.
 
-Wide water uses `surface_hydrographique`. A fictive centerline does not create a second visible river surface.
+The package source CRS is EPSG:2154. `ogrinfo` verified these canonical layers: `batiment`, `troncon_de_route`, `surface_hydrographique`, and `troncon_hydrographique`. The current export counts are 397880 buildings, 166838 road segments, 13597 hydrographic surfaces, and 50274 hydrographic segments before normalization.
+
+The workstation GDAL build has no GEOS support. The acquisition therefore uses `ogr2ogr -spat` for the Lambert-93 envelope. The typed normalizer performs exact boundary clipping with polygon operations. The manifest records this decision.
+
+BD TOPO supplies canonical road, building, and water geometry. Road width uses `largeur_de_chaussee` only when that field contains a positive numeric value. Road strata use the actual `position_par_rapport_au_sol` enumeration. Water surfaces render as polygons. A true BD TOPO fictive hydrographic axis remains available as metadata but does not render as a duplicate ribbon.
 
 ## OpenStreetMap via Geofabrik
 
-`fetch-osm.ts` downloads `https://download.geofabrik.de/europe/france/midi-pyrenees-latest.osm.pbf`. The extract is current at acquisition time. Osmium clips it to the Gers boundary and exports an enrichment subset. The source license is ODbL 1.0.
+`fetch-osm.ts` downloads the current `midi-pyrenees-latest.osm.pbf` extract. Osmium extracts the complete Gers boundary and writes a smaller enrichment extract. Bulk normalization keeps path classes and semantic named points or areas. IGN remains canonical for buildings, roads, and hydrographic geometry.
 
-OSM supplies paths, named points, POI semantics, names, opening hours, and corroboration. OSM does not replace canonical IGN geometry.
+The Overpass fallback uses the complete Gers bounding box. Normalization applies the full Admin Express MultiPolygon afterward. The fallback never reduces a MultiPolygon to its largest ring.
 
-## BAN
+OSM object URLs and the Geofabrik resource are retained in source references. OSM data uses ODbL 1.0 attribution.
 
-`fetch-addresses.ts` downloads `https://adresse.data.gouv.fr/data/ban/adresses/latest/csv/adresses-32.csv.gz`. It keeps every valid D32 address whose WGS84 position lies inside the complete Admin Express boundary. The source CRS is EPSG:4326. The source license is Etalab Open Licence 2.0.
+## Base Adresse Nationale
+
+`fetch-addresses.ts` downloads the department file `adresses-32.csv.gz`. It checks all 115461 CSV rows against every Admin Express boundary component. The verified run kept 115453 addresses inside Gers. The source CRS is EPSG:4326 and the license is Etalab Open Licence 2.0.
 
 ## SIRENE and business sources
 
-`fetch-businesses.ts` queries the Annuaire des Entreprises API with the department filter. SIRET and SIREN values provide legal identity. BAN supplies address positioning. OSM and verified public pages can add names, phones, websites, and opening data when a conservative match exists.
+`fetch-businesses.ts` queries the Annuaire des Entreprises API with department 32 filters. The verified run acquired 755 SIRENE records. SIRET is the primary business identity. Name, address evidence, and Lambert-93 distance provide the conservative fallback match.
 
-## Google Maps
+OSM business queries and public-page fetches are corroborative. Overpass or page failures remain in the source manifest. The optional Moli page fallback is opt-in with `MASTER_MAPS_BUSINESS_MOLI=1` because the installed Moli binary can fail on a target page.
 
-Google Maps is visual corroboration only. The project does not ingest Google geometry, tiles, imagery, or bulk Places data.
+## Native workstation dependencies
+
+The data pipeline uses these installed commands:
+
+- `sci-libs/gdal` with the `tools` USE flag provides `ogrinfo`, `ogr2ogr`, and GDAL 3.13.1.
+- `app-arch/p7zip` provides 7-Zip 17.05.
+- `osmium-tool` has no matching package in the configured Gentoo eix repository. The verified workstation binary is `/home/ifthenelse/.local/bin/osmium`, version 1.19.1.
+
+The pipeline does not use apt or systemd. A missing command is a hard prerequisite failure.
+
+## OpenStreetMap comparison
+
+Current `openstreetmap.org` views provide the geographic visual reference. The project does not ingest Google geometry, Google tiles, imagery, or bulk Places data. OSM comparison screenshots remain temporary QA artifacts under `tests/artifacts/visual`.

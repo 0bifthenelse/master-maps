@@ -46,8 +46,8 @@ export interface MapControlsProps {
   screenSpacePanning?: boolean;
   /** Register as the R3F default controls */
   makeDefault?: boolean;
-  /** Commune bounds [west, south, east, north] in local metres — used by HJKL */
-  communeBounds?: [number, number, number, number];
+  /** Territory bounds [west, south, east, north] in local metres, used by HJKL */
+  territoryBounds?: [number, number, number, number];
   /** Callback when camera changes */
   onChange?: () => void;
 }
@@ -78,7 +78,7 @@ export const MapControls = forwardRef<ControlsHandle, MapControlsProps>(
       panSpeed = 0.5,
       screenSpacePanning = true,
       makeDefault = true,
-      communeBounds,
+      territoryBounds,
       onChange,
     },
     ref,
@@ -91,7 +91,7 @@ export const MapControls = forwardRef<ControlsHandle, MapControlsProps>(
     const onKeyDown = useCallback(
       (e: KeyboardEvent) => {
         if (!shouldHandle(e)) return;
-        if (!communeBounds) return;
+        if (!territoryBounds) return;
 
         const controls = controlsRef.current;
         if (!controls) return;
@@ -122,7 +122,7 @@ export const MapControls = forwardRef<ControlsHandle, MapControlsProps>(
 
         controls.update();
       },
-      [communeBounds, get],
+      [territoryBounds, get],
     );
 
     useEffect(() => {

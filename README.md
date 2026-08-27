@@ -29,10 +29,10 @@ src/
       loadTile.ts       tile loader with LRU cache, AbortController
       search.ts         accent-insensitive search with scoring
       provenance.ts     source-priority conflict resolution
-      normalize.ts      OSM tag and address normalisation
+      normalize.ts           runtime geometry compatibility API
       deduplicate.ts    stable-ID deduplication
     geo/
-      projection.ts     LocalProjection (spherical equirectangular)
+      projection.ts     LocalProjection backed by EPSG:2154 Lambert-93
       bounds.ts         2D bounding-box operations
       tiling.ts         deterministic tile assignment
       polygon.ts        ring closure, point-in-polygon, clipping
@@ -105,9 +105,10 @@ data/                    ignored department data volume
 
 ### Fresh acquisition
 
-```
-npm install
+```bash
+npm ci
 npm run data:refresh
+npm run data:qa
 npm run data:validate
 npm run typecheck
 npm run lint
@@ -115,17 +116,21 @@ npm test
 npm run build
 npm run start
 npm run test:e2e
+npx tsx scripts/chrome/run-verification.ts
+npx tsx scripts/chrome/compare-osm.ts
 ```
 
-1. `npm install` installs pinned dependencies from `package-lock.json`.
-2. `npm run data:refresh` acquires all configured sources, normalises, deduplicates, tiles, builds the search index, and validates.
-3. `npm run data:validate` validates the generated data volume against strict contracts.
-4. `npm run typecheck` runs TypeScript strict-mode check (`tsc --noEmit`).
-5. `npm run lint` runs flat ESLint configuration.
-6. `npm test` runs unit and integration Vitest suites.
-7. `npm run build` validates data, then runs `next build`.
-8. `npm run start` starts the production server.
-9. `npm run test:e2e` starts Next and Moli, then runs Playwright E2E tests.
+1. `npm ci` installs the locked dependencies.
+2. `npm run data:refresh` acquires fresh source data, normalises it, deduplicates it, builds all LODs, builds search, runs spatial QA, and validates the generated volume.
+3. `npm run data:qa` reruns the enforceable spatial and scene-input checks.
+4. `npm run data:validate` reparses manifests, tile envelopes, features, and search records.
+5. `npm run typecheck` runs the strict TypeScript check.
+6. `npm run lint` runs ESLint.
+7. `npm test` runs unit, visual-state, and integration Vitest suites.
+8. `npm run build` creates the production Next.js build.
+9. `npm run test:e2e` runs Moli CDP browser tests.
+10. `run-verification.ts` checks the real GPU WebGPU canvas.
+11. `compare-osm.ts` captures current OpenStreetMap pairs at equivalent views.
 
 ### Cached data (no network)
 
@@ -139,29 +144,25 @@ npm run data:validate
 ## Source families
 
 All data originates from verified public open-data sources.
-
 | Source | Content | License |
 |--------|---------|---------|
-| OpenStreetMap (Overpass API) | Roads, buildings, water, land use, parks, facilities, POIs, addresses | ODbL |
-| geo.api.gouv.fr | Commune boundary (contour), INSEE code, administrative geometry | Etalab OUVL |
-| Base Adresse Nationale (BAN) | Addresses with coordinates, street names, postal codes | Etalab OUVL |
-| IGN Geoplateforme (WFS) | Elevation, terrain, topographic references when available | Etalab OUVL (subject to layer availability) |
-| INSEE SIRENE | Legal establishment records (business identity, address, activity code) | Etalab OUVL |
-| Annuaire des Entreprises | Public business registry data | Etalab OUVL |
-| PagesJaunes | Corroborative public business listings | Public directory reference only |
-| Official business websites | Current public branding (fetched via Moli) | Fair use |
-| Ville d'Auch / Grand Auch Coeur de Gascogne | Local administrative open data | Varies |
-| Gers tourism | Public tourism and facility data | Varies |
+| IGN Admin Express COG | Complete Gers department boundary | Licence Ouverte / Open Licence 2.0 |
+| IGN BD TOPO | Canonical buildings, roads, hydrographic surfaces, and hydrographic segments | Licence Ouverte / Open Licence 2.0 |
+| OpenStreetMap via Geofabrik | Paths, semantic POIs, names, and corroboration | ODbL 1.0 |
+| Base Adresse Nationale (BAN) | Department addresses and street names | Etalab Open Licence 2.0 |
+| Annuaire des Entreprises and SIRENE | Department business identity and activity data | Licence Ouverte / Open Licence 2.0 |
+| Official business pages | Corroborative public business details | Source-specific |
 
-Google Maps is used only for narrow corroborative presence checks. Google geometry, tiles, imagery, and bulk business data are never redistributed.
+Current source editions and hashes come from `data/manifests/sources.json`. Runtime counts come from the generated coverage report.
 
-**Current dataset timestamp**: 2026-08-26.
+Current OpenStreetMap is the visual reference for geographic comparison. Google geometry, tiles, imagery, and bulk Places data are never redistributed.
 
-**Completeness definition**: A feature is considered complete when it has a verified source, a stable internal ID, WGS84 coordinates, normalised geometry clipped to the commune boundary, provenance records for every property, and a status distinguishing active, uncertain, inferred, and unresolved values. The coverage report in `data/manifests/coverage.json` records actual counts, unresolved gaps, failed sources, and measured budgets.
+**Current dataset timestamp**: generated at refresh time and recorded in `data/generated/manifest.json`.
+**Completeness definition**: A feature has a validated source reference, stable identity, WGS84 geometry, Lambert-93 local geometry, provenance, and an explicit confidence and status value. The coverage report records actual counts, failures, unresolved optional sources, and measured budgets.
 
 ## Licences and attribution
 
-OpenStreetMap data is copyright the OpenStreetMap contributors and available under the Open Database Licence (ODbL). Map data from French government sources is subject to the Etalab Open Licence (OUVL) or compatible open-data licences as specified by each source. All source licences, acquisition timestamps, response hashes, and transformations are recorded in `data/manifests/sources.json`.
+OpenStreetMap is copyright the OpenStreetMap contributors and uses the Open Database Licence (ODbL). French government data uses the applicable open-data licence recorded in the source manifest.
 
 The required OSM attribution appears in `SourceAttribution.tsx`: `(c) OpenStreetMap contributors`.
 
@@ -182,23 +183,26 @@ Routes that serve data reject traversal, reject unexpected tile IDs, bound file 
 | `npm run start` | Start production server |
 | `npm run typecheck` | TypeScript strict check (`tsc --noEmit`) |
 | `npm run lint` | Flat ESLint |
-| `npm run test` | Unit and integration Vitest suites |
-| `npm run test:unit` | Vitest unit tests (`tests/unit`) |
-| `npm run test:integration` | Vitest integration tests (`tests/integration`) |
-| `npm run test:e2e` | Moli CDP + Playwright E2E tests |
-| `npm run data:refresh` | Full acquisition and generation pipeline |
+| `npm run test` | Unit, visual-state, and integration Vitest suites |
+| `npm run test:unit` | Vitest unit and visual-state tests |
+| `npm run test:integration` | Vitest integration tests |
+| `npm run test:e2e` | Moli CDP and Playwright E2E tests |
+| `npm run data:refresh` | Full acquisition, generation, QA, and validation pipeline |
+| `npm run data:qa` | Enforceable spatial and scene-input QA |
 | `npm run data:validate` | Validate the generated data volume |
-| `npm run data:build` | Build from cached raw inputs (offline) |
+| `npm run data:build` | Build from cached raw inputs |
+| `npx tsx scripts/chrome/run-verification.ts` | Real-GPU WebGPU verification |
+| `npx tsx scripts/chrome/compare-osm.ts` | Current OpenStreetMap comparison captures |
 
 ## Moli requirement
 
-Every headless browser interaction, rendered web page research, visual QA, screenshot capture, and CDP automation session uses Moli version 1.0.4 (or a recorded newer secure version). Moli is resolved from `PATH`. The project-local skill at `skills/moli-visual-tests/SKILL.md` documents the exact operations.
+Moli version 1.0.4 is installed on this workstation. The official skills come from `https://github.com/lexmount/moli/tree/main/skills`. This repository does not contain a local `skills/moli-visual-tests/SKILL.md`.
 
-- **Research**: `moli fetch --dump markdown <URL>` or `moli fetch --dump semantic_tree_text <URL>`.
-- **E2E testing**: `moli serve --layout --host 127.0.0.1 --port 9222` provides a CDP endpoint. Playwright connects via `chromium.connectOverCDP`. Playwright must never call `chromium.launch` or download its own Chromium.
-- **Artifacts**: screenshots and traces go to `tests/artifacts/moli/`.
-- **Prohibitions**: no CAPTCHA bypass, no login-wall circumvention, no robots.txt disregard, no silent browser fallback.
-- **Failure**: if Moli is unavailable or crashes, the operation fails explicitly. No alternative browser automation tool substitutes.
+- **Research**: Use `moli fetch --dump markdown <URL>` or `moli fetch --dump semantic_tree_text <URL>`.
+- **E2E testing**: Use `moli serve --layout --host 127.0.0.1 --port 9222` and connect Playwright with `chromium.connectOverCDP`.
+- **Artifacts**: Store Moli output under `tests/artifacts/moli/`.
+- **Policy**: Do not bypass CAPTCHAs, login walls, robots rules, or access controls.
+- **Failure**: Report Moli failures. Do not replace Moli with a bundled browser.
 
 ## WebGPU requirements
 
@@ -208,22 +212,15 @@ The map renders through the Three.js `WebGPURenderer` backend. The client checks
 
 ### Known Moli canvas limitation
 
-Moli does not use a real GPU. Its canvas output is software-rendered and does not prove WebGPU device initialisation, shader compilation, or hardware-accelerated rendering. E2E tests relying on Moli assert DOM state and scene diagnostics (`renderer-status=initialized`, `backend=webgpu`, nonzero feature counts) but cannot validate canvas pixels. A supplementary check on a real GPU-capable browser is needed for pixel-level WebGPU validation.
+Moli does not provide the real GPU canvas oracle. Moli E2E checks DOM state, requests, camera diagnostics, and search behavior. Installed Chrome supplies the authoritative WebGPU screenshots and pixel evidence.
 
 ## Nocibé search steps
 
-1. Type `Nocibe` or `Nocibé` in the search control labelled `Rechercher dans Auch`.
-2. The Nocibé result appears with the verified address `28 avenue d'Alsace, 32000 Auch`.
-3. Select the result. The feature inspector opens with BAN coordinate `0.591913,43.648231`, source references, and provenance.
-4. The orthographic camera focuses on the BAN coordinate.
-5. The audited commercial perimeter (`nocibe-commercial-audit`) appears as a 750-metre radius around Nocibé with an 80-metre corridor geometry toward Place Villaret Joyeuse.
-6. The corridor is drawn from connected OSM road or pedestrian geometry when available. If no source geometry connects the anchors, endpoints and an unresolved-route notice display instead of a fictional route.
-7. The overlay is visible by default when Nocibé is selected and can be toggled in the layer panel.
-8. Search also works with a one-character typo (e.g. `nocib`) and with the canonical name `Nocibé` and `Nocibe`.
-
-Three verified corridor anchors exist in the generated manifest: Nocibé at `0.591913,43.648231`, Avenue d'Alsace at `0.591575,43.648437`, Place de Verdun at `0.592746,43.648079`, and Place Villaret Joyeuse at `0.588099,43.649466`.
-
-If the commercial gallery identity around Place Villaret Joyeuse cannot be verified from direct public sources, the area is labelled `commercial area around Place Villaret Joyeuse` and the unresolved identity is recorded in the coverage report. CRU (`10 Place Villaret Joyeuse`) and FANTOCHE (`8 B Place Villaret Joyeuse`) are included only after direct source validation.
+1. Type `Nocibe` or `Nocibé` in the search control labelled `Rechercher dans le Gers`.
+2. Select the result. The feature inspector shows the business identity, source references, provenance, and coordinate.
+3. The camera focuses through the canonical Lambert-93 local coordinate.
+4. The business marker supports hover details when the real WebGPU scene is initialized.
+5. Search accepts the unaccented spelling and bounded edit-distance matches.
 
 ## Production build procedure
 
@@ -246,7 +243,7 @@ A feature is considered complete when it meets six criteria:
 
 1. **Source-backed**: every property has at least one verified source reference.
 2. **Stable ID**: a durable internal ID derived from source type, source ID, or a stable hash of content, never from array position or random values.
-3. **Geometry**: clipped to the commune polygon, with finite coordinates, closed rings, and renderable polygons.
+3. **Geometry**: clipped to the complete Gers department boundary, with finite coordinates, closed rings, and renderable polygons.
 4. **Provenance**: every property conflict between sources is recorded in a `ProvenanceRecord` with winner, contenders, and priority rationale.
 5. **Status**: each feature has a status distinguishing active, uncertain, inferred, and unresolved values.
 6. **WGS84 preservation**: original WGS84 coordinates are preserved alongside local projected coordinates.

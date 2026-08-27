@@ -1,88 +1,26 @@
 #!/usr/bin/env tsx
-/**
- * build-search-index.ts — Writes an accent-insensitive search index with:
- *   - canonical name, normalized name, source-backed aliases
- *   - feature type, category, tile ID, feature ID, focus coordinates
- *
- * Accent-insensitive normalisation: NFD decompose, remove combining marks,
- * lower case, then tokenise.
- *
- * Scoring tiers (higher first):
- *   1. Exact canonical match (accent/case insensitive)
- *   2. Prefix match
- *   3. Containment match
- *   4. Edit-distance (bounded)
- *
- * Usage: tsx scripts/data/build-search-index.ts [--in-dir <path>] [--out-dir <path>]
- */
-
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-
-// ---------------------------------------------------------------------------
-// Type stubs
-// ---------------------------------------------------------------------------
-
-interface SearchRecord {
-  /** Stable feature ID */
-  featureId: string;
-  /** Canonical display name */
-  canonicalName: string;
-  /** Accent/case-normalized search key */
-  normalizedName: string;
-  /** Additional aliases for searching */
-  aliases: string[];
-  /** Feature kind */
-  kind: string;
-  /** Optional sub-category */
-  category?: string;
-  /** Tile ID containing this feature */
-  tileId?: string;
-  /** Focus coordinate (west, south, east, north or lon, lat) */
-  focusLon: number;
-  focusLat: number;
-  /** Priority boost (higher = ranked first among ties) */
-  boost: number;
-}
-
-interface TileManifest {
-  tileId: string;
-  featureCount: number;
-  features: string[];
-}
-
-interface MapFeature {
-  kind: string;
-  stableId: string;
-  name?: string;
-  address?: string;
-  lon: number;
-  lat: number;
-  [key: string]: unknown;
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-function dataRoot(): string {
-  return process.env.MASTER_MAPS_DATA_DIR ?? "data";
-}
+import { MapFeatureSchema, SearchRecordSchema, TileManifestSchema, type MapFeature, type SearchRecord } from "../../src/lib/data/schema";
 
 interface IndexOptions {
   inDir: string;
   outDir: string;
 }
 
+function dataRoot(): string {
+  return process.env.MASTER_MAPS_DATA_DIR ?? "data";
+}
+
 function parseArgs(args: string[]): IndexOptions {
   const root = dataRoot();
   let inDir = path.join(root, "generated", "tiles");
   let outDir = path.join(root, "search");
-  for (let i = 0; i < args.length; i++) {
-    const a = args[i]!;
-    if (a === "--in-dir" && args[i + 1]) { inDir = args[++i]!; }
-    else if (a === "--out-dir" && args[i + 1]) { outDir = args[++i]!; }
-    else if (a === "--help" || a === "-h") {
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index];
+    if (argument === "--in-dir" && args[index + 1]) inDir = args[++index]!;
+    else if (argument === "--out-dir" && args[index + 1]) outDir = args[++index]!;
+    else if (argument === "--help" || argument === "-h") {
       console.log("Usage: tsx scripts/data/build-search-index.ts [--in-dir <path>] [--out-dir <path>]");
       process.exit(0);
     }
@@ -90,182 +28,127 @@ function parseArgs(args: string[]): IndexOptions {
   return { inDir, outDir };
 }
 
-// ---------------------------------------------------------------------------
-// Unicode accent normalisation
-// ---------------------------------------------------------------------------
-
-/** Remove combining diacritical marks (NFD + strip \u0300-\u036f). */
-function stripAccents(s: string): string {
-  return s.normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+function normalizedKey(value: string): string {
+  return value.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/\s+/g, " ").trim();
 }
 
-/** Lowercase, strip accents, collapse whitespace. */
-function normalizedKey(s: string): string {
-  return stripAccents(s).toLowerCase().replace(/\s+/g, " ").trim();
+function tileLevel(tileId: string): number {
+  return Number(tileId.match(/^l(\d+)_/)?.[1] ?? 99);
 }
 
-// ---------------------------------------------------------------------------
-// Scoring
-// ---------------------------------------------------------------------------
+async function loadDataFromTiles(tilesDir: string): Promise<{ features: MapFeature[]; tileMap: Map<string, string> }> {
+  const features: MapFeature[] = [];
+  const tileMap = new Map<string, { tileId: string; lod: number }>();
+  for (const entry of await fs.readdir(tilesDir, { withFileTypes: true })) {
+    if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+    const tileId = entry.name.replace(/\.json$/, "");
+    const parsed: unknown = JSON.parse(await fs.readFile(path.join(tilesDir, entry.name), "utf8"));
+    if (!Array.isArray(parsed)) continue;
+    const lod = tileLevel(tileId);
+    for (const value of parsed) {
+      const feature = MapFeatureSchema.parse(value);
+      features.push(feature);
+      const previous = tileMap.get(feature.stableId);
+      if (!previous || lod < previous.lod) tileMap.set(feature.stableId, { tileId, lod });
+    }
+  }
+  return { features, tileMap: new Map([...tileMap].map(([stableId, value]) => [stableId, value.tileId])) };
+}
 
-function scoreMatch(query: string, target: string, boost: number): number {
-  const nq = normalizedKey(query);
-  const nt = normalizedKey(target);
-  if (nt === nq) return 1000 + boost;               // exact match
-  if (nt.startsWith(nq)) return 500 + boost;         // prefix
-  if (nt.includes(nq)) return 100 + boost;           // containment
+async function loadData(tilesDir: string): Promise<{ features: MapFeature[]; tileMap: Map<string, string> }> {
+  const intermediateDir = path.join(tilesDir, "..", "..", "intermediate");
+  try {
+    await fs.access(intermediateDir);
+  } catch {
+    return loadDataFromTiles(tilesDir);
+  }
+  const ignored = new Set(["provenance.json", "boundary-source.json", "bdtopo-manifest.json", "ign-unavailable.json", "osm-manifest.json", "osm-bulk-manifest.json", "relation-issues.json", "normalization-issues.json"]);
+  const featuresById = new Map<string, MapFeature>();
+  const entries = (await fs.readdir(intermediateDir, { withFileTypes: true }))
+    .filter((entry) => entry.isFile() && entry.name.endsWith(".json") && !ignored.has(entry.name))
+    .sort((first, second) => first.name.localeCompare(second.name));
+  for (const entry of entries) {
+    const parsed = JSON.parse(await fs.readFile(path.join(intermediateDir, entry.name), "utf8")) as unknown;
+    if (!Array.isArray(parsed)) continue;
+    for (const value of parsed) {
+      const feature = MapFeatureSchema.parse(value);
+      if (!featuresById.has(feature.stableId)) featuresById.set(feature.stableId, feature);
+    }
+  }
+  const rawManifest = JSON.parse(await fs.readFile(path.join(tilesDir, "..", "tile-manifest.json"), "utf8")) as unknown;
+  if (!Array.isArray(rawManifest)) throw new Error("tile manifest is not an array");
+  const manifests = rawManifest.map((value) => TileManifestSchema.parse(value)).sort((first, second) => first.lod - second.lod || first.tileId.localeCompare(second.tileId));
+  const tileMap = new Map<string, string>();
+  for (const manifest of manifests) {
+    for (const stableId of manifest.features) if (featuresById.has(stableId) && !tileMap.has(stableId)) tileMap.set(stableId, manifest.tileId);
+  }
+  return { features: [...featuresById.values()], tileMap };
+}
+
+function aliases(feature: MapFeature): string[] {
+  const candidates: string[] = [];
+  if (feature.address) candidates.push(feature.address);
+  if (feature.kind === "business") candidates.push(feature.businessName, feature.brand ?? "", feature.legalName ?? "");
+  if (feature.kind === "road" && feature.name) candidates.push(feature.name);
+  return [...new Set(candidates.map(normalizedKey).filter((value) => value.length > 0))];
+}
+
+function featureName(feature: MapFeature): string | undefined {
+  if (feature.name) return feature.name;
+  if (feature.kind === "business") return feature.businessName;
+  return feature.displayName;
+}
+
+function boostFor(feature: MapFeature): number {
+  if (feature.kind === "business") return 200;
+  if (feature.kind === "poi") return 100;
+  if (feature.kind === "address") return 50;
+  if (feature.kind === "building") return 10;
   return 0;
 }
 
-/**
- * Levenshtein distance, bounded — return -1 if distance exceeds maxDist.
- */
-function boundedEditDistance(a: string, b: string, maxDist: number): number {
-  const na = normalizedKey(a);
-  const nb = normalizedKey(b);
-  if (Math.abs(na.length - nb.length) > maxDist) return -1;
-
-  const rows = na.length + 1;
-  const cols = nb.length + 1;
-  const matrix: number[][] = [];
-
-  for (let i = 0; i < rows; i++) {
-    matrix[i] = [i];
-    for (let j = 1; j < cols; j++) {
-      if (i === 0) {
-        matrix[i]![j] = j;
-      } else {
-        const cost = na[i - 1] === nb[j - 1] ? 0 : 1;
-        matrix[i]![j] = Math.min(
-          matrix[i - 1]![j]! + 1,       // deletion
-          matrix[i]![j - 1]! + 1,       // insertion
-          matrix[i - 1]![j - 1]! + cost, // substitution
-        );
-      }
-      // Early prune if all values in this row exceed maxDist
-      if (i === rows - 1 && matrix[i]![j]! <= maxDist) {
-        // continue — we have at least one viable path
-      }
-    }
-  }
-
-  const dist = matrix[na.length]![nb.length]!;
-  return dist <= maxDist ? dist : -1;
+function categoryFor(feature: MapFeature): string | undefined {
+  if (feature.kind === "business") return feature.category ?? feature.nafLabel ?? feature.nafCode;
+  if (feature.kind === "poi") return feature.category ?? feature.poiType;
+  if (feature.kind === "road") return feature.roadClass ?? feature.highway;
+  if (feature.kind === "water") return feature.waterType;
+  return undefined;
 }
 
-// ---------------------------------------------------------------------------
-// Index building
-// ---------------------------------------------------------------------------
-
-/** Load features from tile files and the tile manifest. */
-async function loadData(
-  tilesDir: string,
-): Promise<{ features: MapFeature[]; tileMap: Map<string, string> }> {
-  const dir = await fs.readdir(tilesDir, { withFileTypes: true });
-  const features: MapFeature[] = [];
-  const tileMap = new Map<string, string>(); // featureId → tileId
-
-  for (const entry of dir) {
-    if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
-    const tileId = entry.name.replace(/\.json$/, "");
-    const content = await fs.readFile(path.join(tilesDir, entry.name), "utf8");
-    const parsed = JSON.parse(content);
-    // Could be array of features (tile) or a manifest
-    if (Array.isArray(parsed)) {
-      for (const f of parsed as MapFeature[]) {
-        features.push(f);
-        if (!tileMap.has(f.stableId) || tileId.startsWith("l0_")) tileMap.set(f.stableId, tileId);
-      }
-    }
-  }
-  return { features, tileMap };
-}
-
-function generateAliases(feature: MapFeature): string[] {
-  const aliases: string[] = [];
-  if (feature.address) {
-    const addressKey = normalizedKey(feature.address);
-    if (addressKey) aliases.push(addressKey);
-  }
-  const names = [
-    feature.businessName,
-    feature.brand,
-    feature.legalName,
-  ].filter((value): value is string => typeof value === "string" && value.length > 0);
-  for (const alias of names) {
-    const key = normalizedKey(alias);
-    if (key && !aliases.includes(key)) aliases.push(key);
-  }
-  const address = feature.address ?? "";
-  const number = address.match(/^(\d+)/);
-  const name = feature.name ?? feature.businessName;
-  if (number && name) aliases.push(`${number[1]} ${normalizedKey(name)}`);
-  return aliases.filter(Boolean);
-}
-
-/**
- * Build the complete search index.
- */
-export function buildSearchIndex(
-  features: MapFeature[],
-  tileMap: Map<string, string>,
-  outputPath: string,
-): SearchRecord[] {
-  const uniqueFeatures = [...new Map(features.map((feature) => [feature.stableId, feature])).values()];
+export function buildSearchIndex(features: MapFeature[], tileMap: Map<string, string>, _outputPath: string): SearchRecord[] {
+  const unique = new Map<string, MapFeature>();
+  for (const feature of features) if (!unique.has(feature.stableId)) unique.set(feature.stableId, feature);
   const records: SearchRecord[] = [];
-
-  for (const f of uniqueFeatures) {
-    const name = f.name ?? f.businessName ?? f.displayName ?? f.stableId;
-    const normalized = normalizedKey(name);
-    const aliases = generateAliases(f);
-
-    // Boost business and POI features
-    let boost = 0;
-    const kind = f.kind;
-    if (kind === "business") boost = 200;
-    else if (kind === "poi") boost = 100;
-    else if (kind === "address") boost = 50;
-    else if (kind === "building") boost = 10;
-
-    const tileId = tileMap.get(f.stableId);
-    records.push({
-      featureId: f.stableId,
+  for (const feature of unique.values()) {
+    const name = featureName(feature);
+    const tileId = tileMap.get(feature.stableId);
+    if (!name || !tileId || feature.lon === undefined || feature.lat === undefined) continue;
+    records.push(SearchRecordSchema.parse({
+      featureId: feature.stableId,
       canonicalName: name,
-      normalizedName: normalized,
-      aliases,
-      kind,
-      category: (f as Record<string, string>).category
-        ?? (f as Record<string, string>).nafLabel
-        ?? (f as Record<string, string>).poiType
-        ?? (f as Record<string, string>).nafCode
-        ?? undefined,
+      normalizedName: normalizedKey(name),
+      aliases: aliases(feature),
+      kind: feature.kind,
+      category: categoryFor(feature),
       tileId,
-      focusLon: f.lon,
-      focusLat: f.lat,
-      boost,
-    });
+      focusLon: feature.lon,
+      focusLat: feature.lat,
+      boost: boostFor(feature),
+    }));
   }
-
-  // Write the index file
-  const indexPath = outputPath;
-  // write in caller — just return
-
-  return records;
+  return records.sort((first, second) => first.canonicalName.localeCompare(second.canonicalName) || first.featureId.localeCompare(second.featureId));
 }
 
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
 async function writeJsonArray(filePath: string, values: Iterable<unknown>): Promise<void> {
   const handle = await fs.open(filePath, "w");
-  let buffer = "[";
+  let buffer = "";
   let first = true;
   try {
+    await handle.write("[");
     for (const value of values) {
       const encoded = JSON.stringify(value);
       if (encoded === undefined) continue;
-      if (!first) buffer += ",\n";
-      buffer += encoded;
+      buffer += `${first ? "" : ",\n"}${encoded}`;
       first = false;
       if (buffer.length >= 1024 * 1024) {
         await handle.write(buffer);
@@ -278,30 +161,21 @@ async function writeJsonArray(filePath: string, values: Iterable<unknown>): Prom
   }
 }
 
-export async function buildIndexAll(
-  inDir?: string,
-  outDir?: string,
-): Promise<void> {
+export async function buildIndexAll(inDir?: string, outDir?: string): Promise<void> {
   const root = dataRoot();
-  const ind = inDir ?? path.join(root, "generated", "tiles");
-  const otd = outDir ?? path.join(root, "search");
-
-  await fs.mkdir(otd, { recursive: true });
-
-  const { features, tileMap } = await loadData(ind);
-  const records = buildSearchIndex(features, tileMap, path.join(otd, "index.json"));
-
-  await writeJsonArray(path.join(otd, "index.json"), records);
-  console.error(`[search-index] Wrote ${records.length} search records to ${otd}/index.json`);
+  const sourceDir = inDir ?? path.join(root, "generated", "tiles");
+  const destinationDir = outDir ?? path.join(root, "search");
+  await fs.mkdir(destinationDir, { recursive: true });
+  const { features, tileMap } = await loadData(sourceDir);
+  const records = buildSearchIndex(features, tileMap, path.join(destinationDir, "index.json"));
+  await writeJsonArray(path.join(destinationDir, "index.json"), records);
+  console.error(`[search-index] Wrote ${records.length} canonical search records to ${destinationDir}/index.json`);
 }
 
-// ---------------------------------------------------------------------------
-// CLI entry
-// ---------------------------------------------------------------------------
 if (process.argv[1]?.endsWith("build-search-index.ts")) {
-  const opts = parseArgs(process.argv.slice(2));
-  buildIndexAll(opts.inDir, opts.outDir).catch((err) => {
-    console.error("[search-index] Fatal:", err);
+  const options = parseArgs(process.argv.slice(2));
+  buildIndexAll(options.inDir, options.outDir).catch((error: unknown) => {
+    console.error("[search-index] Fatal:", error);
     process.exit(1);
   });
 }

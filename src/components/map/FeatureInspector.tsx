@@ -1,7 +1,6 @@
-// @ts-nocheck
 'use client';
 
-import { useState, useCallback, type ReactNode } from 'react';
+import { useState, type ReactNode } from 'react';
 import type { MapFeature, ProvenanceRecord, SourceReference } from '@/lib/data/schema';
 
 /* ------------------------------------------------------------------ */
@@ -84,7 +83,13 @@ export function FeatureInspector({
 }: FeatureInspectorProps) {
   if (!feature) return null;
 
-  const isNocibe = feature.kind === 'business' && true /* nocibe check */;
+  const isNocibe = feature.kind === "business" && /nocibe/i.test(feature.businessName);
+  const category = "category" in feature ? feature.category : undefined;
+  const banId = feature.kind === "address" ? feature.banId : undefined;
+  const provenanceRecords = provenance ?? feature.provenance;
+  const coordinateLabel = typeof feature.lon === "number" && typeof feature.lat === "number"
+    ? `${feature.lat.toFixed(6)}, ${feature.lon.toFixed(6)}`
+    : undefined;
   const sources = feature.sourceRefs ?? [];
 
   return (
@@ -116,23 +121,18 @@ export function FeatureInspector({
       <Section label="Informations">
         <Field label="Identifiant" value={feature.stableId} />
         <Field label="Type" value={feature.kind} />
-        {feature.category && <Field label="Catégorie" value={feature.category} />}
+        {category && <Field label="Catégorie" value={category} />}
         {feature.confidence != null && (
-          <Field label="Confiance" value={`${(feature.confidence * 100).toFixed(0)} %`} />
+          <Field label="Confiance" value={feature.confidence} />
         )}
       </Section>
 
       {/* Address section */}
-      {(feature.address || feature.banId) && (
+      {(feature.address || banId || coordinateLabel) && (
         <Section label="Adresse">
           {feature.address && <Field label="Adresse" value={feature.address} />}
-          {feature.banId && <Field label="BAN ID" value={feature.banId} />}
-          {feature.geometry.coordinates && (
-            <Field
-              label="Coordonnées"
-              value={`${feature.geometry.coordinates[1].toFixed(6)}, ${feature.geometry.coordinates[0].toFixed(6)}`}
-            />
-          )}
+          {banId && <Field label="BAN ID" value={banId} />}
+          {coordinateLabel && <Field label="Coordonnées" value={coordinateLabel} />}
         </Section>
       )}
 
@@ -152,20 +152,6 @@ export function FeatureInspector({
             <span>Afficher le périmètre audité</span>
           </label>
 
-          {/* Anchors */}
-          {feature.anchors && feature.anchors.length > 0 && (
-            <div className="anchor-list">
-              <span className="inspector-field-label">Points de référence</span>
-              {feature.anchors.map((a: { name: string; coord: [number, number] }, i: number) => (
-                <div key={i} className="anchor-item">
-                  <span className="anchor-name">{a.name}</span>
-                  <span className="anchor-coord">
-                    {a.geometry.coordinates[1].toFixed(6)}, {a.geometry.coordinates[0].toFixed(6)}
-                  </span>
-                </div>
-              ))}
-            </div>
-          )}
         </Section>
       )}
 
@@ -193,9 +179,9 @@ export function FeatureInspector({
       )}
 
       {/* Provenance records */}
-      {provenance && provenance.length > 0 && (
+      {provenanceRecords.length > 0 && (
         <Section label="Conflits de provenance">
-          {provenance.map((p: ProvenanceRecord, i: number) => (
+          {provenanceRecords.map((p: ProvenanceRecord, i: number) => (
             <div key={i} className="provenance-row">
               <span className="prov-property">{p.property}</span>
               <span className="prov-winner">

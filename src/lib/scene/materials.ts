@@ -1,5 +1,5 @@
 /**
- * @file Shared Three.js materials for the flat Auch map scene.
+ * @file Shared Three.js materials for the flat Gers map scene.
  *
  * All materials are exported as mutable singletons so theme switches
  * can update color, opacity, and tone-mapped values in one pass.
@@ -154,19 +154,19 @@ function boundaryLineMaterial(): LineBasicMaterial {
 
 // ─── Exported singleton instances ───────────────────────────────────────────
 
-/** Roads and paved surfaces – semi-transparent ink. */
+/** Roads and paved surfaces, semi-transparent ink. */
 export const roadMat = roadMaterial();
-/** Water bodies – muted blue. */
+/** Water bodies, muted blue. */
 export const waterMat = waterMaterial();
-/** Building footprints – slight ink fill. */
+/** Building footprints, slight ink fill. */
 export const buildingMat = buildingMaterial();
-/** Parks, forests, farmland, etc. – per-type colour stored as fallback. */
+/** Parks, forests, farmland, and other land-use colours. */
 export const landuseMat = landuseMaterial();
-/** POI dot markers – accent (#ff7d27). */
+/** POI dot markers, accent (#ff7d27). */
 export const poiMat = poiMarkerMaterial();
-/** Accent lines (boundary highlight, corridor, etc.) – accent. */
+/** Accent lines for boundary highlights and corridors, accent. */
 export const accentLineMat = accentLineMaterial();
-/** Commune boundary outline – accent at reduced opacity. */
+/** Department boundary outline, accent at reduced opacity. */
 export const boundaryLineMat = boundaryLineMaterial();
 
 // ─── Convenience: update all materials from CSS custom properties ───────────

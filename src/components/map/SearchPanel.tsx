@@ -1,9 +1,9 @@
-// @ts-nocheck
 'use client';
 
+import { useCallback, useEffect, useRef, useState, type KeyboardEvent } from "react";
 import type { MapFeature } from "@/lib/data/schema";
-import { searchIndex } from '@/lib/data/search';
-
+import { SearchRecordSchema } from "@/lib/data/schema";
+import { searchIndex } from "@/lib/data/search";
 export interface SearchResult {
   featureId: string;
   name: string;
@@ -24,9 +24,8 @@ export interface SearchPanelProps {
   open?: boolean;
 }
 
-const PLACEHOLDER = 'Rechercher dans Auch';
+const PLACEHOLDER = 'Rechercher dans le Gers';
 const DEBOUNCE_MS = 200;
-
 export function SearchPanel({ onSelect, onClose, open = true }: SearchPanelProps) {
   const [query, setQuery] = useState('');
   const [results, setResults] = useState<SearchResult[]>([]);
@@ -54,13 +53,20 @@ export function SearchPanel({ onSelect, onClose, open = true }: SearchPanelProps
 
     setLoading(true);
     try {
-      // searchIndex returns Array<SearchResult>
-      const indexResp = await fetch("/api/map/search");
-      const indexData = await indexResp.json() as { records: SearchRecord[] };
-      const records = indexData.records ?? indexData ?? [];
-      const matches = searchIndex(trimmed, records);
+      const response = await fetch("/api/map/search");
+      const payload: unknown = await response.json();
+      if (!response.ok || !Array.isArray(payload)) throw new Error("Search index unavailable");
+      const records = payload.map((entry) => SearchRecordSchema.parse(entry));
+      const matches = searchIndex(trimmed, records).map(({ record }) => ({
+        featureId: record.featureId,
+        name: record.canonicalName,
+        kind: record.kind,
+        category: record.category,
+        tileId: record.tileId,
+        focus: [record.focusLon, record.focusLat] as [number, number],
+      }));
       setResults(matches);
-      setSelectedIndex(0); // auto-select first
+      setSelectedIndex(matches.length > 0 ? 0 : -1);
     } catch {
       setResults([]);
     } finally {
@@ -71,7 +77,7 @@ export function SearchPanel({ onSelect, onClose, open = true }: SearchPanelProps
   const handleChange = useCallback(
     (value: string) => {
       setQuery(value);
-      		clearTimeout(timerRef.current);
+      clearTimeout(timerRef.current ?? undefined);
       timerRef.current = setTimeout(() => performSearch(value), DEBOUNCE_MS);
     },
     [performSearch],

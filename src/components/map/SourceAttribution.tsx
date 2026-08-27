@@ -1,4 +1,3 @@
-// @ts-nocheck
 'use client';
 
 import type { SourceReference } from '@/lib/data/schema';

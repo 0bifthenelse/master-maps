@@ -1,4 +1,3 @@
-// @ts-nocheck
 /**
  * 2D bounding box in local projected coordinates (x=east, z=north).
  * @remarks The `y` axis is always zero for visible map geometry per project contract.
@@ -80,7 +79,7 @@ function _extentGeometry(
   geometry: GeoJSONGeometry | null | undefined,
   bounds: Bounds2D,
 ): Bounds2D {
-  if (!geometry || !geometry.type || !Array.isArray(geometry.coordinates)) {
+  if (!geometry || !geometry.type || (geometry.type !== "GeometryCollection" && !Array.isArray(geometry.coordinates))) {
     return bounds;
   }
 
@@ -95,15 +94,15 @@ function _extentGeometry(
       // Polygon: array of rings; MultiLineString: array of lines
       return _extentCoords(geometry.coordinates, bounds);
     case "MultiPolygon":
-      return (geometry.coordinates as unknown[][][]).reduce(
+      return (geometry.coordinates as unknown as unknown[][][]).reduce(
         (acc, polygon) => _extentCoords(polygon, acc),
         bounds,
       );
     case "GeometryCollection":
-      if (Array.isArray((geometry as Record<string, unknown>).geometries)) {
-        return ((geometry as Record<string, unknown>)
-          .geometries as GeoJSONGeometry[]).reduce(
-          (acc, geom) => _extentGeometry(geom, acc),
+      const geometries = (geometry as unknown as { geometries?: unknown }).geometries;
+      if (Array.isArray(geometries)) {
+        return geometries.reduce(
+          (acc, geom) => _extentGeometry(geom as GeoJSONGeometry, acc),
           bounds,
         );
       }
@@ -139,7 +138,7 @@ export function computeGeoJsonBounds(
     const fc = input as GeoJSONFeatureCollection;
     if (!Array.isArray(fc.features)) return b;
     return fc.features.reduce(
-      (acc, feat) => computeGeoJsonBounds(feat.geometry ?? null),
+      (acc, feat) => _extentGeometry(feat.geometry, acc),
       b,
     );
   }

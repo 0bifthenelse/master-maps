@@ -14,7 +14,7 @@
  * but every buffer allocation fails). A real X11 surface avoids that gap
  * and gets the actual NVIDIA RTX 4060 (Lovelace) adapter.
  *
- * Never disables GPU. Never downloads Playwright's own Chromium —
+ * Never disables GPU. Never downloads Playwright's own Chromium.
  * Playwright is used only as a CDP client via connectOverCDP.
  *
  * Usage: tsx scripts/chrome/run-verification.ts
@@ -26,6 +26,7 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as sleep } from "node:timers/promises";
 import { chromium } from "@playwright/test";
+import { wgs84ToRender } from "../../src/lib/geo/crs";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const NEXT_PORT = 3102;
@@ -41,21 +42,21 @@ const CHROME_CANDIDATES = [
 
 async function findChrome(): Promise<{ bin: string; version: string }> {
   for (const bin of CHROME_CANDIDATES) {
-    const found = await new Promise<string | null>((resolvePromise) => {
-      const proc = spawn("command", ["-v", bin], { shell: "/bin/bash" });
+    const foundWaiter = Promise.withResolvers<string | null>();
+    const proc = spawn("command", ["-v", bin], { shell: "/bin/bash" });
+    let out = "";
+    proc.stdout?.on("data", (d: Buffer) => (out += d.toString()));
+    proc.on("close", (code) => foundWaiter.resolve(code === 0 ? out.trim() : null));
+    proc.on("error", () => foundWaiter.resolve(null));
+    const found = await foundWaiter.promise;
+    if (found) {
+      const versionWaiter = Promise.withResolvers<string>();
+      const proc = spawn(found, ["--version"]);
       let out = "";
       proc.stdout?.on("data", (d: Buffer) => (out += d.toString()));
-      proc.on("close", (code) => resolvePromise(code === 0 ? out.trim() : null));
-      proc.on("error", () => resolvePromise(null));
-    });
-    if (found) {
-      const version = await new Promise<string>((resolvePromise) => {
-        const proc = spawn(found, ["--version"]);
-        let out = "";
-        proc.stdout?.on("data", (d: Buffer) => (out += d.toString()));
-        proc.on("close", () => resolvePromise(out.trim()));
-        proc.on("error", () => resolvePromise("unknown"));
-      });
+      proc.on("close", () => versionWaiter.resolve(out.trim()));
+      proc.on("error", () => versionWaiter.resolve("unknown"));
+      const version = await versionWaiter.promise;
       return { bin: found, version };
     }
   }
@@ -151,6 +152,7 @@ async function main() {
       }
     });
     console.log("navigator.gpu probe:", JSON.stringify(gpuInfo));
+    if (!gpuInfo.supported || !gpuInfo.adapter) throw new Error(`navigator.gpu adapter failed: ${JSON.stringify(gpuInfo)}`);
 
     try {
       await page.waitForFunction(
@@ -190,6 +192,7 @@ async function main() {
     }));
     console.log("Scene diagnostics:", JSON.stringify(diagAttrs, null, 2));
 
+    if (diagAttrs.status !== "initialized" || diagAttrs.backend !== "webgpu") throw new Error(`WebGPU renderer did not initialize: ${JSON.stringify(diagAttrs)}`);
     if (diagAttrs.status === "initialized") {
       const camera = JSON.parse(diagAttrs.camera ?? "null") as {
         position?: [number, number, number];
@@ -202,9 +205,6 @@ async function main() {
         || Math.abs(camera.azimuthalAngle ?? Number.NaN) > 1e-6
       ) {
         throw new Error(`Expected north-up camera, got ${diagAttrs.camera}`);
-      }
-      if (Number(diagAttrs.water) <= 0 || Number(diagAttrs.businesses) <= 0) {
-        throw new Error(`Expected source-backed water and business counts, got ${JSON.stringify(diagAttrs)}`);
       }
     }
 
@@ -230,6 +230,7 @@ async function main() {
         target: [number, number, number];
         zoom: number;
         azimuthalAngle: number;
+        headingRadians: number;
       }> => {
         const serialized = await page.locator("#scene-diagnostics").getAttribute("data-camera-state");
         if (!serialized) throw new Error("camera-state diagnostic is missing");
@@ -238,6 +239,7 @@ async function main() {
           target: [number, number, number];
           zoom: number;
           azimuthalAngle: number;
+          headingRadians: number;
         };
       };
 
@@ -272,39 +274,36 @@ async function main() {
 
       const moveToSourceCoordinate = async (coordinate: [number, number]): Promise<[number, number]> => {
         const camera = await readCamera();
-        const [originLon, originLat] = manifest.projectionOrigin;
-        const metersPerDegree = 111_319.9;
-        const originCosine = Math.cos(originLat * Math.PI / 180);
-        const localX = (coordinate[0] - originLon) * metersPerDegree * originCosine;
-        const localZ = (coordinate[1] - originLat) * metersPerDegree;
+        const [localX, localZ] = wgs84ToRender(coordinate);
         const worldWidth = manifest.bounds[2] - manifest.bounds[0];
         const worldHeight = manifest.bounds[3] - manifest.bounds[1];
         const aspect = canvasBox.width / canvasBox.height;
-        const frustumWidth = worldWidth / worldHeight > aspect
-          ? worldWidth * 1.15
-          : worldHeight * aspect * 1.15;
-        const frustumHeight = worldWidth / worldHeight > aspect
-          ? worldWidth / aspect * 1.15
-          : worldHeight * 1.15;
-        const screenX =
-          canvasBox.x + canvasBox.width / 2
-          + (localX - camera.target[0]) * camera.zoom / frustumWidth * canvasBox.width;
-        const screenY =
-          canvasBox.y + canvasBox.height / 2
-          - (localZ - camera.target[2]) * camera.zoom / frustumHeight * canvasBox.height;
-        console.log("Source coordinate screen position:", JSON.stringify({
-          coordinate,
-          local: [localX, localZ],
-          camera,
-          canvas: canvasBox,
-          screen: [screenX, screenY],
-        }));
+        const frustumWidth = worldWidth / worldHeight > aspect ? worldWidth * 1.15 : worldHeight * aspect * 1.15;
+        const frustumHeight = worldWidth / worldHeight > aspect ? worldWidth / aspect * 1.15 : worldHeight * 1.15;
+        const deltaX = localX - camera.target[0];
+        const deltaZ = localZ - camera.target[2];
+        const cosine = Math.cos(camera.headingRadians);
+        const sine = Math.sin(camera.headingRadians);
+        const screenX = canvasBox.x + canvasBox.width / 2 + (deltaX * cosine + deltaZ * sine) * camera.zoom / frustumWidth * canvasBox.width;
+        const screenY = canvasBox.y + canvasBox.height / 2 - (-deltaX * sine + deltaZ * cosine) * camera.zoom / frustumHeight * canvasBox.height;
+        console.log("Source coordinate screen position:", JSON.stringify({ coordinate, local: [localX, localZ], camera, canvas: canvasBox, screen: [screenX, screenY] }));
         await page.mouse.move(screenX, screenY);
         return [screenX, screenY];
       };
 
       await capture("after-overview");
       await selectSearch("Gare d'Auch");
+      await page.waitForFunction(
+        () => {
+          const element = document.querySelector("#scene-diagnostics");
+          return Number(element?.getAttribute("data-building-count")) > 0
+            && Number(element?.getAttribute("data-road-count")) > 0
+            && Number(element?.getAttribute("data-water-count")) > 0
+            && Number(element?.getAttribute("data-draw-calls")) > 0;
+        },
+        undefined,
+        { timeout: 15000 },
+      );
       await capture("gare-area");
       await resetView();
       await selectSearch("Cathédrale Sainte-Marie");
@@ -448,6 +447,10 @@ async function main() {
 
       await selectSearch("Avenue d'Alsace", "road");
       await capture("avenue-d-alsace");
+    }
+    if (consoleErrors.length > 0) {
+      console.error("FAIL: console.error events occurred during real Chrome verification.");
+      exitCode = 1;
     }
 
     console.log("Console errors:", JSON.stringify(consoleErrors, null, 2));

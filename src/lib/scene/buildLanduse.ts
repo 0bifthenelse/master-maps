@@ -1,149 +1,82 @@
-// @ts-nocheck
-/**
- * @file Landuse-area geometry builder.
- *
- * Converts LanduseFeature records (Polygon / MultiPolygon) into a single
- * merged BufferGeometry at y=0.  Each area type carries a `landuseType`
- * metadata attribute so the scene can apply per-type colours (park green,
- * farmland ochre, forest dark green, etc.) via the landuseMat material's
- * userData or a custom shader.
- *
- * @see THEME: landuseMat – per-type colour stored as userData.fallbackColor
- */
-
 import {
   BufferGeometry,
   Float32BufferAttribute,
+  Path,
   Shape,
   ShapeGeometry,
-  Path,
-} from 'three';
+} from "three";
+import type { LanduseFeature } from "@/lib/data/schema";
 import { mapShapeGeometryToWorld } from "./geometryCoordinates";
 
-// ─── Local types ────────────────────────────────────────────────────────────
-
-type CoordPair = [number, number];
-
-interface PolygonRep {
-  type: 'Polygon';
-  coordinates: CoordPair[][];
-}
-
-interface MultiPolygonRep {
-  type: 'MultiPolygon';
-  coordinates: CoordPair[][][];
-}
-
-export interface LanduseFeatureShape {
-  kind: 'landuse';
-  stableId: string;
-  geometry: PolygonRep | MultiPolygonRep;
-  name?: string;
-  /** OSM landuse or leisure tag (forest, park, farm, residential, etc.). */
-  landuseType?:
-    | 'forest' | 'park' | 'grass' | 'farmland'
-    | 'residential' | 'commercial' | 'industrial'
-    | 'cemetery' | 'meadow' | 'orchard'
-    | 'vineyard' | 'quarry' | 'landfill'
-    | 'construction' | 'brownfield' | 'greenfield'
-    | 'farmyard' | 'allotments' | 'plant_nursery'
-    | 'recreation_ground' | 'village_green' | 'golf_course'
-    | 'military' | 'retail' | 'religious'
-    | string;
-}
+type Coordinate = [number, number];
+export type LanduseFeatureShape = Pick<LanduseFeature, "kind" | "stableId" | "geometry" | "name" | "landuseType">;
 
 export interface BuildResult {
   geometry: BufferGeometry;
   featureCount: number;
-  /** Total landuse area in square metres. */
   areaMetres: number;
-  /** Landuse types present in this batch (for colour mapping). */
   typesPresent: Set<string>;
 }
 
-// ─── Helpers ────────────────────────────────────────────────────────────────
-
-function ringToShape(outerRing: CoordPair[]): Shape {
+function ringToShape(outerRing: Coordinate[]): Shape {
   const shape = new Shape();
-  if (outerRing.length < 3) return shape;
-  shape.moveTo(outerRing[0][0], outerRing[0][1]);
-  for (let i = 1; i < outerRing.length; i++) {
-    shape.lineTo(outerRing[i][0], outerRing[i][1]);
-  }
+  const first = outerRing[0];
+  if (!first || outerRing.length < 3) return shape;
+  shape.moveTo(first[0], first[1]);
+  for (const point of outerRing.slice(1)) shape.lineTo(point[0], point[1]);
   shape.closePath();
   return shape;
 }
 
-function addHoles(shape: Shape, holes: CoordPair[][]): void {
+function addHoles(shape: Shape, holes: Coordinate[][]): void {
   for (const ring of holes) {
-    if (ring.length < 3) continue;
+    const first = ring[0];
+    if (!first || ring.length < 3) continue;
     const path = new Path();
-    path.moveTo(ring[0][0], ring[0][1]);
-    for (let i = 1; i < ring.length; i++) {
-      path.lineTo(ring[i][0], ring[i][1]);
-    }
+    path.moveTo(first[0], first[1]);
+    for (const point of ring.slice(1)) path.lineTo(point[0], point[1]);
     path.closePath();
     shape.holes.push(path);
   }
 }
 
-function buildGeometryForShape(
-  shape: Shape,
-  featureIndex: number,
-  landuseType: string,
-): BufferGeometry {
-  const geom = mapShapeGeometryToWorld(new ShapeGeometry(shape));
-
-  const count = geom.getAttribute('position')?.count ?? 0;
-  const indices = new Float32BufferAttribute(
-    new Float32Array(count).fill(featureIndex), 1,
-  );
-  indices.name = 'featureIndex';
-  geom.setAttribute('featureIndex', indices);
-
-  // Store landuse type per-vertex for custom shader / colour mapping.
-  const typeId = landuseTypeHash(landuseType);
-  const typeAttr = new Float32BufferAttribute(
-    new Float32Array(count).fill(typeId), 1,
-  );
-  typeAttr.name = 'landuseType';
-  geom.setAttribute('landuseType', typeAttr);
-
-  return geom;
-}
-
-/** Stable numeric hash for a landuse type string (used for per-vertex colour mapping). */
 function landuseTypeHash(type: string): number {
-  // Simple hash: sum of char codes modulo 100 (more than enough for ~30 types).
   let hash = 0;
-  for (let i = 0; i < type.length; i++) {
-    hash = (hash * 31 + type.charCodeAt(i)) | 0;
-  }
+  for (const character of type) hash = (hash * 31 + character.charCodeAt(0)) | 0;
   return Math.abs(hash) % 100;
 }
 
-// ─── Area ───────────────────────────────────────────────────────────────────
-
-function polygonArea(rings: CoordPair[][]): number {
-  let total = 0;
-  for (const ring of rings) {
-    if (ring.length < 3) continue;
-    let area = 0;
-    for (let i = 0; i < ring.length; i++) {
-      const j = (i + 1) % ring.length;
-      area += ring[i][0] * ring[j][1];
-      area -= ring[j][0] * ring[i][1];
-    }
-    total += Math.abs(area) / 2;
-  }
-  return total;
+function buildGeometryForShape(shape: Shape, featureIndex: number, landuseType: string): BufferGeometry {
+  const geometry = mapShapeGeometryToWorld(new ShapeGeometry(shape));
+  const count = geometry.getAttribute("position")?.count ?? 0;
+  const featureIndices = new Float32BufferAttribute(new Float32Array(count).fill(featureIndex), 1);
+  featureIndices.name = "featureIndex";
+  geometry.setAttribute("featureIndex", featureIndices);
+  const typeAttribute = new Float32BufferAttribute(new Float32Array(count).fill(landuseTypeHash(landuseType)), 1);
+  typeAttribute.name = "landuseType";
+  geometry.setAttribute("landuseType", typeAttribute);
+  return geometry;
 }
 
-// ─── Merge ─────────────────────────────────────────────────────────────────
+function ringArea(ring: Coordinate[]): number {
+  let area = 0;
+  for (let index = 0; index < ring.length; index += 1) {
+    const first = ring[index]!;
+    const second = ring[(index + 1) % ring.length]!;
+    area += first[0] * second[1] - second[0] * first[1];
+  }
+  return Math.abs(area) / 2;
+}
+
+function polygonArea(rings: Coordinate[][]): number {
+  const [outer, ...holes] = rings;
+  if (!outer) return 0;
+  return Math.max(0, ringArea(outer) - holes.reduce((sum, hole) => sum + ringArea(hole), 0));
+}
 
 function mergeGeometries(geometries: BufferGeometry[]): BufferGeometry {
   if (geometries.length === 0) return new BufferGeometry();
-  if (geometries.length === 1) return geometries[0];
+  if (geometries.length === 1) return geometries[0]!;
 
   const merged = new BufferGeometry();
   const positions: number[] = [];
@@ -152,106 +85,61 @@ function mergeGeometries(geometries: BufferGeometry[]): BufferGeometry {
   const landuseTypes: number[] = [];
   let vertexOffset = 0;
 
-  for (const g of geometries) {
-    const pos = g.getAttribute('position');
-    const idx = g.getIndex();
-    const fi = g.getAttribute('featureIndex');
-    const lt = g.getAttribute('landuseType');
-    if (!pos) continue;
+  for (const geometry of geometries) {
+    const position = geometry.getAttribute("position");
+    if (!position) continue;
+    for (let index = 0; index < position.array.length; index += 1) positions.push(position.array[index]!);
 
-    const arr = pos.array as Float32Array;
-    for (let i = 0; i < arr.length; i++) positions.push(arr[i]);
+    const featureIndex = geometry.getAttribute("featureIndex");
+    if (featureIndex) for (let index = 0; index < featureIndex.array.length; index += 1) featureIndices.push(featureIndex.array[index]!);
+    else for (let index = 0; index < position.count; index += 1) featureIndices.push(0);
 
-    if (fi) {
-      const f = fi.array as Float32Array;
-      for (let i = 0; i < f.length; i++) featureIndices.push(f[i]);
-    } else {
-      for (let i = 0; i < pos.count; i++) featureIndices.push(0);
-    }
+    const type = geometry.getAttribute("landuseType");
+    if (type) for (let index = 0; index < type.array.length; index += 1) landuseTypes.push(type.array[index]!);
+    else for (let index = 0; index < position.count; index += 1) landuseTypes.push(0);
 
-    if (lt) {
-      const l = lt.array as Float32Array;
-      for (let i = 0; i < l.length; i++) landuseTypes.push(l[i]);
-    } else {
-      for (let i = 0; i < pos.count; i++) landuseTypes.push(0);
-    }
-
-    if (idx) {
-      const iarr = idx.array as Uint16Array | Uint32Array;
-      for (let i = 0; i < iarr.length; i++) indices.push(iarr[i] + vertexOffset);
-    } else {
-      for (let i = 0; i < pos.count; i++) indices.push(i + vertexOffset);
-    }
-    vertexOffset += pos.count;
+    const index = geometry.getIndex();
+    if (index) for (let offset = 0; offset < index.array.length; offset += 1) indices.push(index.array[offset]! + vertexOffset);
+    else for (let offset = 0; offset < position.count; offset += 1) indices.push(offset + vertexOffset);
+    vertexOffset += position.count;
   }
 
-  merged.setAttribute('position', new Float32BufferAttribute(positions, 3));
+  merged.setAttribute("position", new Float32BufferAttribute(positions, 3));
   merged.setIndex(indices);
-  merged.setAttribute('featureIndex', new Float32BufferAttribute(featureIndices, 1));
-  merged.setAttribute('landuseType', new Float32BufferAttribute(landuseTypes, 1));
-
+  merged.setAttribute("featureIndex", new Float32BufferAttribute(featureIndices, 1));
+  merged.setAttribute("landuseType", new Float32BufferAttribute(landuseTypes, 1));
   return merged;
 }
 
-// ─── Main builder ──────────────────────────────────────────────────────────
-
-/**
- * Build flat landuse geometry from LanduseFeature records.
- *
- * @param features - Array of landuse features (parks, forests, farmland, etc.).
- * @returns Merged polygon geometry, processed count, area, and type set.
- */
 export function buildLanduse(features: LanduseFeatureShape[]): BuildResult {
-  if (features.length === 0) {
-    return {
-      geometry: new BufferGeometry(),
-      featureCount: 0,
-      areaMetres: 0,
-      typesPresent: new Set(),
-    };
-  }
+  if (features.length === 0) return { geometry: new BufferGeometry(), featureCount: 0, areaMetres: 0, typesPresent: new Set() };
 
-  const geoms: BufferGeometry[] = [];
-  let totalArea = 0;
+  const geometries: BufferGeometry[] = [];
   const typesPresent = new Set<string>();
+  let totalArea = 0;
 
-  for (let fi = 0; fi < features.length; fi++) {
-    const feat = features[fi];
-    const geo = feat.geometry;
-    const luType = feat.landuseType ?? 'unknown';
-
-    typesPresent.add(luType);
-
-    if (geo.type === 'Polygon') {
-      totalArea += polygonArea([geo.coordinates[0]]);
-      const [outer, ...holes] = geo.coordinates;
-      if (outer.length < 3) continue;
+  for (let featureIndex = 0; featureIndex < features.length; featureIndex += 1) {
+    const feature = features[featureIndex]!;
+    const landuseType = feature.landuseType ?? "unknown";
+    typesPresent.add(landuseType);
+    const polygons = feature.geometry.type === "Polygon"
+      ? [feature.geometry.coordinates]
+      : feature.geometry.type === "MultiPolygon"
+        ? feature.geometry.coordinates
+        : [];
+    for (const coordinates of polygons) {
+      totalArea += polygonArea(coordinates);
+      const outer = coordinates[0];
+      if (!outer || outer.length < 3) continue;
       const shape = ringToShape(outer);
-      addHoles(shape, holes);
-      geoms.push(buildGeometryForShape(shape, fi, luType));
-    } else if (geo.type === 'MultiPolygon') {
-      for (const polyCoords of geo.coordinates) {
-        totalArea += polygonArea([polyCoords[0]]);
-        const [outer, ...holes] = polyCoords;
-        if (outer.length < 3) continue;
-        const shape = ringToShape(outer);
-        addHoles(shape, holes);
-        geoms.push(buildGeometryForShape(shape, fi, luType));
-      }
+      addHoles(shape, coordinates.slice(1));
+      geometries.push(buildGeometryForShape(shape, featureIndex, landuseType));
     }
   }
 
-  const geometry = mergeGeometries(geoms);
-  if (geoms.length > 1) {
-    for (const intermediate of geoms) intermediate.dispose();
-  }
-
-  return {
-    geometry,
-    featureCount: features.length,
-    areaMetres: totalArea,
-    typesPresent,
-  };
+  const geometry = mergeGeometries(geometries);
+  if (geometries.length > 1) for (const intermediate of geometries) intermediate.dispose();
+  return { geometry, featureCount: features.length, areaMetres: totalArea, typesPresent };
 }
 
 export default buildLanduse;

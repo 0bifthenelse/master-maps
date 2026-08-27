@@ -24,7 +24,7 @@ const IDLE_CONTROLS_STATE: ControlsDiagnostics = {
 };
 
 export interface CameraRigHandle {
-  focusOn: (coord: [number, number], bounds?: [number, number, number, number]) => void;
+  focusOn: (coord: [number, number], bounds?: [number, number, number, number], zoom?: number) => void;
   resetView: () => void;
   getCameraState: () => CameraDiagnostics;
   getControlsState: () => ControlsDiagnostics;
@@ -35,11 +35,12 @@ export interface ViewportSnapshot {
   zoom: number;
   width: number;
   height: number;
+  headingRadians: number;
 }
 
 export interface CameraRigProps {
   /** Full territory bounds [west, south, east, north] in render metres. */
-  communeBounds: [number, number, number, number];
+  territoryBounds: [number, number, number, number];
   cameraHeight?: number;
   onViewportChange?: (snapshot: ViewportSnapshot) => void;
 }
@@ -55,7 +56,7 @@ const DIAGNOSTICS_INTERVAL_MS = 100;
  * throttled to DIAGNOSTICS_INTERVAL_MS.
  */
 export const CameraRig = forwardRef<CameraRigHandle, CameraRigProps>(
-  ({ communeBounds, cameraHeight, onViewportChange }, ref) => {
+  ({ territoryBounds, cameraHeight, onViewportChange }, ref) => {
     const cameraRef = useRef<CameraHandle>(null);
     const controlsRef = useRef<ControlsHandle>(null);
     const lastPublish = useRef(0);
@@ -85,13 +86,14 @@ export const CameraRig = forwardRef<CameraRigHandle, CameraRigProps>(
         zoom: cameraState.zoom,
         width: Math.abs(camera.right - camera.left),
         height: Math.abs(camera.top - camera.bottom),
+        headingRadians: cameraState.headingRadians,
       });
     });
 
     return (
       <>
-        <MapCamera ref={cameraRef} communeBounds={communeBounds} cameraHeight={cameraHeight} />
-        <MapControls ref={controlsRef} communeBounds={communeBounds} />
+        <MapCamera ref={cameraRef} territoryBounds={territoryBounds} cameraHeight={cameraHeight} />
+        <MapControls ref={controlsRef} territoryBounds={territoryBounds} />
       </>
     );
   },

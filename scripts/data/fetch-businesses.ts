@@ -1,18 +1,18 @@
 /**
- * fetch-businesses.ts — department-wide business acquisition for Gers (32).
+ * fetch-businesses.ts - department-wide business acquisition for Gers (32).
  *
  * Sources:
  *   1. Annuaire des Entreprises / SIRENE (recherche-entreprises.api.gouv.fr)
- *      — commune-wide paginated scan + targeted name queries for known leads
+ *      department-wide paginated scan and targeted name queries for known leads
  *   2. OpenStreetMap business records (Overpass)
- *      — shop=*, office=*, craft=*, and business-oriented amenity within the commune bbox
+ *      shop=*, office=*, craft=*, and business-oriented amenity within the department bbox
  *   3. Individually verified public business pages
- *      — direct HTTP + Moli for rendered pages (PagesJaunes Nocibé, CRU, Nocibé official)
+ *      direct HTTP plus optional Moli for rendered pages
  *
  * Raw outputs (under MASTER_MAPS_DATA_DIR/raw/):
- *   businesses-sirene.json — Annuaire API responses (verbatim bodies + extracted records)
- *   businesses-osm.json   — Overpass response (verbatim JSON + query metadata)
- *   businesses-web.json   — per-page fetched results from business URLs
+ *   businesses-sirene.json - Annuaire API responses and extracted records
+ *   businesses-osm.json - Overpass response and query metadata
+ *   businesses-web.json - per-page fetched results from business URLs
  *
  * All failures are recorded, never treated as evidence of zero objects.
  * Bounded exponential retries on transient failures; Moli wrapped in try/catch.
@@ -142,7 +142,7 @@ export interface FetchBusinessesOptions {
   dataDir?: string;
   /** Skip all network; read existing raw dumps */
   offline?: boolean;
-  /** Max pages for the Annuaire commune scan (25 records/page); default 30, max 400 */
+  /** Max pages for the Annuaire department scan (25 records/page); default 30, max 400 */
   maxSirenePages?: number;
   /** Abort signal for cancellation */
   signal?: AbortSignal;
@@ -184,7 +184,7 @@ const MAX_RESPONSE_BYTES = 1_024 * 1_024; // 1 MiB
 const SIRENE_LICENSE = "Licence Ouverte / Open Licence 2.0 (ETALAB)";
 const OSM_LICENSE = "Open Database License (ODbL) v1.0";
 
-// Known verified business leads — used for targeted queries and web page verification
+// Known verified business leads, used for targeted queries and web page verification
 const KNOWN_BUSINESS_TARGETS = [
   {
     id: "nocibe-pagesjaunes",
@@ -198,7 +198,7 @@ const KNOWN_BUSINESS_TARGETS = [
     url: "https://www.nocibe.fr/",
     expectedName: "Nocibé",
     kind: "official",
-    note: "Previously crashed in Moli (bad_optional_access, exit 134) — recorded limitation; used for BAN/Annuaire/site corroboration",
+    note: "Previously crashed in Moli (bad_optional_access, exit 134), recorded limitation; used for BAN, Annuaire, and site corroboration",
   },
   {
     id: "crue-auch",
@@ -253,8 +253,13 @@ interface CachedFetchResult {
   fromCache: boolean;
 }
 
-/** In-memory cache — keyed by normalised URL. */
+/** In-memory cache, keyed by normalised URL. */
 const responseCache = new Map<string, CachedFetchResult>();
+function sleep(milliseconds: number): Promise<void> {
+  const waiter = Promise.withResolvers<void>();
+  setTimeout(waiter.resolve, milliseconds);
+  return waiter.promise;
+}
 
 interface FetchOptions {
   method?: string;
@@ -372,7 +377,7 @@ async function cachedFetch(
 		lastStatus = response.status;
 		lastError = new Error(`HTTP ${response.status}: ${body.slice(0, 200)}`);
 		const delay = backoffDelay(attempt, baseDelayMs, maxDelayMs);
-		await new Promise((r) => setTimeout(r, delay));
+		await sleep(delay);
 		continue;
 	}
 
@@ -388,10 +393,10 @@ async function cachedFetch(
 	lastError = err;
 	if (attempt < totalAttempts && isRetryable(lastStatus, err)) {
 		const delay = backoffDelay(attempt, baseDelayMs, maxDelayMs);
-		await new Promise((r) => setTimeout(r, delay));
+		await sleep(delay);
 		continue;
 	}
-	// Improve error message when retries=0 — "Exhausted 0 retries" is misleading
+    // Improve the error message when retries=0. "Exhausted 0 retries" is misleading.
 	if (maxRetries === 0 && lastError) {
 		throw new Error(`Request failed for ${url}: ${errMsg(lastError)}`);
 	}
@@ -399,7 +404,7 @@ async function cachedFetch(
 }
   }
 
-  // Should not reach here — only reached if the loop never ran (shouldn't happen with totalAttempts >= 1)
+  // Should not reach here. The loop always runs at least once.
   throw lastError ?? new Error(`Exhausted ${maxRetries} retries for ${url}`);
 }
 
@@ -415,9 +420,9 @@ interface MoliResult {
 
 /**
  * Run `moli fetch --dump markdown <url>` with a timeout.
- * Returns structured result. Does NOT throw — callers check `success`.
- * Moli is expected to fail for certain pages (official Nocibé crash);
- * this is by design — the script records the limitation.
+ * Returns structured result. Does not throw. Callers check `success`.
+ * Moli is expected to fail for certain pages, including the documented Nocibé crash.
+ * This behavior is by design. The script records the limitation.
  */
 async function runMoliFetch(
 	url: string,
@@ -593,7 +598,7 @@ async function acquireSirene(
   let totalResults = 0;
   let truncated = false;
 
-  // ── 1. Commune-wide scan ──────────────────────────────────
+  // ── 1. Department-wide scan ─────────────────────────────────
   const perPage = 25;
   const maxPages = Math.min(opts.maxSirenePages, 400);
 
@@ -639,7 +644,7 @@ async function acquireSirene(
       if (opts.signal?.aborted) break;
 
       // Small delay between pages to be gentle to the API
-      await new Promise((r) => setTimeout(r, 150));
+      await sleep(150);
 
       try {
         const pageResult = await querySirene({
@@ -666,7 +671,7 @@ async function acquireSirene(
         });
       } catch (err: unknown) {
         failures.push({
-          step: "sirene-commune-pagination",
+          step: "sirene-department-pagination",
           source: "recherche-entreprises.api.gouv.fr",
           url: `${ANNIAURE_BASE}/search?q=&departement=${DEPARTMENT_CODE}&per_page=${perPage}&page=${page}`,
           error: errMsg(err),
@@ -686,14 +691,14 @@ async function acquireSirene(
   } catch (err: unknown) {
     const msg = errMsg(err);
     failures.push({
-      step: "sirene-commune-initial",
+      step: "sirene-department-initial",
       source: "recherche-entreprises.api.gouv.fr",
       url: `${ANNIAURE_BASE}/search?q=&departement=${DEPARTMENT_CODE}&per_page=25&page=1`,
       error: msg,
       severity: "error",
     });
-    // If the first page fails completely, we cannot continue — rethrow
-    throw new Error(`SIRENE commune query failed: ${msg}`);
+    // If the first page fails completely, the script cannot continue.
+    throw new Error(`SIRENE department query failed: ${msg}`);
   }
 
   // ── 2. Targeted name queries ──────────────────────────────
@@ -899,7 +904,7 @@ async function acquireOsmBusiness(
       const osm3s = parsed["osm3s"] as Record<string, unknown> | undefined;
       if (!osm3s?.["timestamp_osm_base"]) {
         throw new Error(
-          `Missing osm3s timestamp in Overpass response — likely not a valid Overpass response`,
+          `Missing osm3s timestamp in Overpass response. The response is not valid Overpass data`,
         );
       }
 
@@ -918,7 +923,7 @@ async function acquireOsmBusiness(
 
       if (attempt < maxRetries) {
         const delay = backoffDelay(attempt, 2_000, 20_000);
-        await new Promise((r) => setTimeout(r, delay));
+        await sleep(delay);
       }
     }
   }
@@ -952,7 +957,7 @@ async function acquireOsmBusiness(
       rawFile,
       sources: [
         {
-          source: `Overpass API — businesses`,
+          source: `Overpass API, businesses`,
           query: queryText.slice(0, 200),
           acquiredAt: rawFile.acquiredAt,
           license: OSM_LICENSE,
@@ -986,7 +991,7 @@ async function acquireOsmBusiness(
 
   // Determine which endpoint succeeded (the last attempt that didn't error)
   const source: SourceManifestEntry = {
-    source: "OpenStreetMap (Overpass API) — businesses",
+    source: "OpenStreetMap (Overpass API), businesses",
     url: OVERPASS_ENDPOINTS[0],
     query: queryText.slice(0, 300),
     acquiredAt: rawFile.acquiredAt,
@@ -1020,7 +1025,7 @@ async function acquireWebBusinessPages(
 }> {
   const failures: FailureEntry[] = [];
   const results: WebPageResult[] = [];
-  const hasMoli = await moliAvailable();
+  const hasMoli = process.env.MASTER_MAPS_BUSINESS_MOLI === "1" && await moliAvailable();
 
   for (const target of KNOWN_BUSINESS_TARGETS) {
     if (opts.signal?.aborted) break;
@@ -1056,7 +1061,7 @@ async function acquireWebBusinessPages(
         const titleMatch = body.match(/<title>([^<]*)<\/title>/i);
         pageResult.title = titleMatch?.[1]?.trim() ?? "";
 
-        // Look for name/address/phone patterns (simple heuristics — not exhaustive)
+        // Look for name, address, and phone patterns.
         const nameMatch = body.match(
           /(?:business-name|company-name|h1|org|brand)[^>]*>([^<]{2,80})</i,
         );
@@ -1085,12 +1090,12 @@ async function acquireWebBusinessPages(
         pageResult.status = "not-found";
         pageResult.note = `HTTP 404`;
       } else {
-        // Non-ok but not 404 — may need Moli for JS-rendered page
+        // A non-ok response may need Moli for client-rendered content.
         pageResult.status = "blocked";
         pageResult.note = `HTTP ${httpResult.status}`;
       }
     } catch (err: unknown) {
-      // Plain HTTP failed — try Moli
+      // Plain HTTP failed: try Moli.
       pageResult.fetchedVia = "none";
       pageResult.status = "error";
       pageResult.note = `HTTP fetch error: ${errMsg(err)}`;
@@ -1120,7 +1125,7 @@ async function acquireWebBusinessPages(
           pageResult.note = `Moli fetch OK (${moliResult.stdout.length}B)`;
           pageResult.confidence = target.priority === "high" ? "high" : "medium";
         } else {
-          // Moli failed — record the limitation
+          // Moli failed: record the limitation.
           pageResult.fetchedVia = "moli";
           pageResult.status = "crashed";
           pageResult.moliError = moliResult.error ?? `exit ${moliResult.exitCode}`;
@@ -1183,7 +1188,7 @@ async function acquireWebBusinessPages(
 // ── Main orchestrator ──────────────────────────────────────────────────────
 
 /**
- * Fetch all business records for Auch and write raw files.
+ * Fetch all business records for Gers and write raw files.
  *
  * @param options  Configuration overrides.
  * @returns Summary with source entries, failures, and counts.
@@ -1237,11 +1242,11 @@ export async function fetchBusinesses(
 						`Offline mode: required raw file ${p} is missing. Run data:refresh without --offline first.`,
 					);
 				}
-				// Optional file missing — record but don't fail
+				// Optional file missing: record but do not fail.
 				allFailures.push({
 					step: `offline-missing-${name}`,
 					source: `raw:${name}`,
-					error: `Optional raw file ${p} not found — skipping`,
+					error: `Optional raw file ${p} not found; skipping`,
 					severity: "warning",
 				});
 			}
@@ -1303,12 +1308,12 @@ export async function fetchBusinesses(
   const status: "ok" | "partial" | "failed" =
     totalErrors > 0 ? "failed" : allFailures.length > 0 ? "partial" : "ok";
 
-  // If SIRENE returned no records, the entire acquisition is failed
+  // If SIRENE returned no records, the entire acquisition is failed.
   if (!allCounts["sireneRecords"]) {
     allFailures.push({
       step: "final",
       source: "sirene",
-      error: "No SIRENE records were acquired — required data missing",
+      error: "No SIRENE records were acquired; required data missing",
       severity: "error",
     });
     return {

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { LocalProjection } from "@/lib/geo/projection";
 import fixture from "../fixtures/auch-landmark-anchors.json";
+import { GERS_TERRITORY } from "@/lib/data/territory";
 
 type Anchor = { coordinate: [number, number]; sourceUrl: string };
 
@@ -9,7 +10,7 @@ testTopology(fixture.anchors as Record<string, Anchor>);
 function testTopology(anchors: Record<string, Anchor>): void {
   describe("source-backed Auch landmark topology", () => {
     it("retains the independently sourced relative positions", () => {
-      const projection = new LocalProjection([0.566553, 43.66256]);
+      const projection = new LocalProjection(GERS_TERRITORY.renderOriginWgs84);
       const local = Object.fromEntries(
         Object.entries(anchors).map(([name, anchor]) => [name, projection.forward(...anchor.coordinate)]),
       ) as Record<string, [number, number]>;

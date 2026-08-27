@@ -1,4 +1,3 @@
-// @ts-nocheck
 'use client';
 
 import { useState, type ReactNode } from 'react';
@@ -15,6 +14,7 @@ export interface LayerState {
   pois: boolean;
   labels: boolean;
   commercialAudit: boolean;
+  [key: string]: boolean;
 }
 
 export const DEFAULT_LAYERS: LayerState = {

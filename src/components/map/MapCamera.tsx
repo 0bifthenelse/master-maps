@@ -19,11 +19,11 @@ export interface CameraDiagnostics {
 }
 
 export interface CameraHandle {
-  /** Animate camera target to world coordinate with optional tight bounds */
-  focusOn: (coord: [number, number], bounds?: [number, number, number, number]) => void;
-  /** Reset to the full commune boundary view */
+  /** Animate camera target to world coordinate with optional tight bounds. */
+  focusOn: (coord: [number, number], bounds?: [number, number, number, number], zoom?: number) => void;
+  /** Reset to the full territory boundary view. */
   resetView: () => void;
-  /** Snapshot of current camera state for diagnostics */
+  /** Snapshot of current camera state for diagnostics. */
   getCameraState: () => CameraDiagnostics;
 }
 
@@ -32,9 +32,9 @@ export interface CameraHandle {
 /* ------------------------------------------------------------------ */
 
 export interface MapCameraProps {
-  /** Full commune bounds [west, south, east, north] in local meters */
-  communeBounds: [number, number, number, number];
-  /** Initial target in local coordinates (defaults to commune centre) */
+  /** Full territory bounds [west, south, east, north] in local meters. */
+  territoryBounds: [number, number, number, number];
+  /** Initial target in local coordinates (defaults to territory centre) */
   initialTarget?: [number, number];
   /** Initial zoom level */
   initialZoom?: number;
@@ -59,7 +59,7 @@ export function updateNorthUpProjection(camera: THREE.OrthographicCamera): void 
 export const MapCamera = forwardRef<CameraHandle, MapCameraProps>(
   (
     {
-      communeBounds,
+      territoryBounds,
       initialTarget,
       initialZoom = 1,
       makeDefault = true,
@@ -79,10 +79,10 @@ export const MapCamera = forwardRef<CameraHandle, MapCameraProps>(
     const initFrustum = useCallback(
       (zoom: number): THREE.OrthographicCamera => {
         const camera = cameraRef.current;
-        const worldWest = communeBounds[0];
-        const worldEast = communeBounds[2];
-        const worldSouth = communeBounds[1];
-        const worldNorth = communeBounds[3];
+        const worldWest = territoryBounds[0];
+        const worldEast = territoryBounds[2];
+        const worldSouth = territoryBounds[1];
+        const worldNorth = territoryBounds[3];
         const worldWidth = worldEast - worldWest;
         const worldHeight = worldNorth - worldSouth;
 
@@ -98,7 +98,7 @@ export const MapCamera = forwardRef<CameraHandle, MapCameraProps>(
           fw = worldHeight * aspect;
         }
 
-        // 15% padding so the commune boundary is visible with margin.
+        // 15% padding keeps the territory boundary visible with margin.
         const pad = 1.15;
         camera.left = (-fw / 2) * pad;
         camera.right = (fw / 2) * pad;
@@ -108,12 +108,12 @@ export const MapCamera = forwardRef<CameraHandle, MapCameraProps>(
         updateNorthUpProjection(camera);
         return camera;
       },
-      [communeBounds, size],
+      [territoryBounds, size],
     );
 
-    /* Centre of the commune */
-    const centreX = (communeBounds[0] + communeBounds[2]) / 2;
-    const centreZ = (communeBounds[1] + communeBounds[3]) / 2;
+    /* Centre of the territory */
+    const centreX = (territoryBounds[0] + territoryBounds[2]) / 2;
+    const centreZ = (territoryBounds[1] + territoryBounds[3]) / 2;
 
     /* Animation state */
     const desiredTarget = useRef(new THREE.Vector3(
@@ -149,7 +149,7 @@ export const MapCamera = forwardRef<CameraHandle, MapCameraProps>(
     );
 
     /* Re-fit the frustum whenever the Canvas is resized (mobile rotation,
-       window resize) so the commune stays fully visible. */
+       window resize) so the territory stays fully visible. */
     useEffect(() => {
       if (cameraRef.current) initFrustum(cameraRef.current.zoom || initialZoom);
     }, [initFrustum, initialZoom]);
@@ -239,41 +239,30 @@ export const MapCamera = forwardRef<CameraHandle, MapCameraProps>(
     /* --- Imperative API --- */
 
     const doFocusOn = useCallback(
-      (coord: [number, number], focusBounds?: [number, number, number, number]) => {
+      (coord: [number, number], focusBounds?: [number, number, number, number], focusZoom?: number) => {
         const camera = cameraRef.current;
         if (!camera) return;
 
         desiredTarget.current.set(coord[0], 0, coord[1]);
 
         if (focusBounds) {
-          /* Fit the supplied bounds inside the frustum with 20 % padding */
-          const fw = focusBounds[2] - focusBounds[0];
-          const fh = focusBounds[3] - focusBounds[1];
+          const fw = Math.max(focusBounds[2] - focusBounds[0], 1);
+          const fh = Math.max(focusBounds[3] - focusBounds[1], 1);
           const aspect = size.height > 0 ? size.width / size.height : 16 / 9;
           const pad = 1.2;
-
-          let nfw: number;
-          let nfh: number;
-          if (fw / fh > aspect) {
-            nfw = fw * pad;
-            nfh = nfw / aspect;
-          } else {
-            nfh = fh * pad;
-            nfw = nfh * aspect;
-          }
-
+          const nfw = fw / fh > aspect ? fw * pad : fh * pad * aspect;
+          const nfh = fw / fh > aspect ? fw * pad / aspect : fh * pad;
           camera.left = -nfw / 2;
           camera.right = nfw / 2;
           camera.top = nfh / 2;
           camera.bottom = -nfh / 2;
           camera.zoom = 1;
           updateNorthUpProjection(camera);
-          desiredZoom.current = 1;
         }
-
+        desiredZoom.current = focusZoom ?? (focusBounds ? 1 : Math.max(initialZoom, 20));
         animating.current = true;
       },
-      [size],
+      [initialZoom, size],
     );
 
     const doResetView = useCallback(() => {

@@ -53,8 +53,8 @@ export class TilingSystem {
   private readonly _bounds: Bounds2D;
 
   /**
-   * @param bounds  Commune or dataset bounding box (Bouds2D uses minY/maxY
-   *                for the north axis; internally mapped to z).
+   * @param bounds  Territory or dataset bounding box. Bounds2D uses minY/maxY
+   *                for the north axis; internally mapped to z.
    * @param tileSize  Edge length in local metres. Must be > 0.
    */
   constructor(bounds: Bounds2D, tileSize: number) {
@@ -65,7 +65,7 @@ export class TilingSystem {
     const h = bounds.maxY - bounds.minY;
     if (w <= 0 || h <= 0) {
       throw new Error(
-        `Invalid bounds: (${bounds.minX}, ${bounds.minY}) – (${bounds.maxX}, ${bounds.maxY})`,
+        `Invalid bounds: (${bounds.minX}, ${bounds.minY}) to (${bounds.maxX}, ${bounds.maxY})`,
       );
     }
 
@@ -102,7 +102,7 @@ export class TilingSystem {
 
   /**
    * Deterministic tile ID from a local (x, z) position.
-   * ID format: `"<col>_<row>"` — parseable via `idToCoord()`.
+   * ID format: `"<col>_<row>"`, parseable via `idToCoord()`.
    */
   getTileId(x: number, z: number): string {
     const { col, row } = this.positionToCoord(x, z);
@@ -133,8 +133,8 @@ export class TilingSystem {
    * Return the half-open bounds for a tile.
    *
    * Normal tiles: [min, max) with exclusive upper edge.
-   * Max-edge tiles (furthest col, furthest row): [min, max] inclusive so
-   * the commune boundary position at exactly maxX/maxY is covered.
+   * Max-edge tiles use an inclusive upper edge so the territory boundary
+   * position at exactly maxX/maxY is covered.
    */
   getTileBounds(tileId: string): Bounds2D {
     const { col, row } = this.idToCoord(tileId);

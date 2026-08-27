@@ -24,15 +24,15 @@ describe("indexed boundary containment", () => {
 });
 
 describe("multipolygon centroid", () => {
-  it("weights polygons independently of ring winding", () => {
+  it("weights complete polygons independently of ring winding", () => {
     const center = computeCenter({
       type: "MultiPolygon",
       coordinates: [
-        [[[0, 0], [1, 0], [1, 1], [0, 1], [0, 0]]],
-        [[[10, 0], [10, 1], [11, 1], [11, 0], [10, 0]]],
+        [[[0.5, 43.5], [0.51, 43.5], [0.51, 43.51], [0.5, 43.51], [0.5, 43.5]]],
+        [[[0.59, 43.5], [0.6, 43.5], [0.6, 43.51], [0.59, 43.51], [0.59, 43.5]]],
       ],
     });
-    expect(center[0]).toBeCloseTo(5.5, 8);
-    expect(center[1]).toBeCloseTo(0.5, 8);
+    expect(center[0]).toBeCloseTo(0.55, 5);
+    expect(center[1]).toBeCloseTo(43.505, 4);
   });
 });
