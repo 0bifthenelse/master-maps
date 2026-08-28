@@ -1,7 +1,7 @@
 import { renderToWgs84, wgs84ToRender } from "../../src/lib/geo/crs";
 import { clipLineStringToPolygon, clipPolygonToPolygon, normalizePolygonGeometry, type PolygonGeometry } from "../../src/lib/geo/polygon";
 import { createBoundaryIndex, type BoundaryIndex } from "./boundaryIndex";
-import type { Geometry, MapFeature } from "../../src/lib/data/schema";
+import { MapFeatureSchema, type Geometry, type MapFeature } from "../../src/lib/data/schema";
 
 export interface BulkBoundary {
   polygons: PolygonGeometry[];
@@ -16,6 +16,251 @@ const ENRICHMENT_HIGHWAYS = new Set([
 ]);
 const SOURCE_URL = "https://download.geofabrik.de/europe/france/midi-pyrenees.html";
 const SOURCE_TIMESTAMP = new Date().toISOString();
+
+export interface OsmNormalizeConfig {
+  sourceName: string;
+  sourceUrl: string;
+  stableIdPrefix: string;
+  priority: number;
+  retention: "enrichment" | "complete";
+}
+
+const DEFAULT_OSM_NORMALIZE_CONFIG: OsmNormalizeConfig = {
+  sourceName: "osm-bulk",
+  sourceUrl: SOURCE_URL,
+  stableIdPrefix: "osm-bulk:",
+  priority: 60,
+  retention: "enrichment",
+};
+
+type CompleteKind = "building" | "water" | "landuse" | "road" | "transport" | "poi";
+
+interface CompleteClassification {
+  kind: CompleteKind;
+  subtype?: string;
+}
+
+function classifyCompleteTags(properties: Record<string, unknown>): CompleteClassification | null {
+  const name = text(properties.name);
+  const building = text(properties.building);
+  const buildingPart = text(properties["building:part"]);
+  if (building !== undefined || buildingPart !== undefined) return { kind: "building", subtype: building };
+  const waterway = text(properties.waterway);
+  const natural = text(properties.natural);
+  const landuse = text(properties.landuse);
+  if (waterway !== undefined || natural === "water" || natural === "wetland" || landuse === "reservoir") {
+    return { kind: "water", subtype: waterway ?? (natural === "water" ? "water" : natural ?? "reservoir") };
+  }
+  const leisure = text(properties.leisure);
+  if (landuse !== undefined || leisure !== undefined) return { kind: "landuse", subtype: landuse ?? leisure };
+  const highway = text(properties.highway);
+  if (highway !== undefined) return { kind: "road", subtype: highway };
+  const railway = text(properties.railway);
+  const publicTransport = text(properties.public_transport);
+  if (railway !== undefined || publicTransport !== undefined) {
+    return { kind: "transport", subtype: railway ?? publicTransport ?? "other" };
+  }
+  if (name !== undefined) {
+    const poiType = text(properties.place) ?? text(properties.shop) ?? text(properties.amenity) ?? text(properties.tourism)
+      ?? text(properties.historic) ?? text(properties.office) ?? text(properties.craft);
+    if (poiType !== undefined) return { kind: "poi", subtype: poiType };
+  }
+  return null;
+}
+
+function clipGeometryToBoundary(sourceGeometry: Geometry, boundary: BulkBoundary | undefined): Geometry | null {
+  if (!boundary) return sourceGeometry;
+  if (sourceGeometry.type === "Point") return boundary.index.contains(sourceGeometry.coordinates) ? sourceGeometry : null;
+  if (sourceGeometry.type === "LineString" || sourceGeometry.type === "MultiLineString") {
+    const vertices = sourceGeometry.type === "LineString" ? sourceGeometry.coordinates : sourceGeometry.coordinates.flat();
+    if (!boundary.index.touches(vertices)) return null;
+    const lines = (sourceGeometry.type === "LineString" ? [sourceGeometry.coordinates] : sourceGeometry.coordinates)
+      .flatMap((line) => boundary.polygons.flatMap((polygon) => clipLineStringToPolygon(line, polygon)));
+    if (lines.length === 0) return null;
+    return lines.length === 1 ? { type: "LineString", coordinates: lines[0]! } : { type: "MultiLineString", coordinates: lines };
+  }
+  const rings = sourceGeometry.type === "Polygon" ? [sourceGeometry.coordinates] : sourceGeometry.coordinates;
+  const polygons = rings.flatMap((coordinates) => boundary.polygons.flatMap((polygon) => {
+    const clipped = clipPolygonToPolygon({ type: "Polygon", coordinates }, polygon);
+    if (!clipped) return [];
+    return clipped.type === "Polygon" ? [clipped.coordinates] : clipped.coordinates;
+  }));
+  if (polygons.length === 0) return null;
+  return polygons.length === 1 ? { type: "Polygon", coordinates: polygons[0]! } : { type: "MultiPolygon", coordinates: polygons };
+}
+
+function parseLanes(value: unknown): number | undefined {
+  if (typeof value === "number") return Number.isInteger(value) && value > 0 ? value : undefined;
+  if (typeof value !== "string") return undefined;
+  const candidate = Number.parseInt(value.trim(), 10);
+  return Number.isInteger(candidate) && candidate > 0 ? candidate : undefined;
+}
+
+function parseMaxSpeed(value: unknown): number | undefined {
+  if (typeof value === "number") return Number.isInteger(value) && value >= 0 ? value : undefined;
+  if (typeof value !== "string") return undefined;
+  const match = value.trim().match(/^(\d+)(?:\.\d+)?/);
+  if (!match) return undefined;
+  const candidate = Number.parseInt(match[1]!, 10);
+  return Number.isInteger(candidate) && candidate >= 0 ? candidate : undefined;
+}
+
+function parseCompleteFeature(value: unknown): MapFeature | null {
+  const result = MapFeatureSchema.safeParse(value);
+  return result.success ? result.data : null;
+}
+function completeFeature(
+  raw: Record<string, unknown>,
+  properties: Record<string, unknown>,
+  sourceGeometry: Geometry,
+  boundary: BulkBoundary | undefined,
+  config: OsmNormalizeConfig,
+): MapFeature | null {
+  const classification = classifyCompleteTags(properties);
+  if (!classification) return null;
+  const areal = sourceGeometry.type === "Polygon" || sourceGeometry.type === "MultiPolygon";
+  const linear = sourceGeometry.type === "LineString" || sourceGeometry.type === "MultiLineString";
+  if ((classification.kind === "building" || classification.kind === "landuse") && !areal) return null;
+  if (classification.kind === "water" && !areal && !linear) return null;
+  if (classification.kind === "road" && !linear) return null;
+  if (classification.kind === "transport" && sourceGeometry.type !== "Point" && !linear) return null;
+  const sourceId = stableSourceId(raw, properties);
+  if (!sourceId) return null;
+  const effective = clipGeometryToBoundary(sourceGeometry, boundary);
+  if (!effective) return null;
+  const local = localize(effective);
+  if (!local) return null;
+  const geometryLocalAnchor = geometryAnchor(local);
+  const anchor = anchorFor(effective, geometryLocalAnchor, boundary);
+  const localAnchor = wgs84ToRender(anchor);
+  const stableId = `${config.stableIdPrefix}${sourceId}`;
+  const objectUrl = sourceObjectUrl(sourceId);
+  const base = {
+    stableId,
+    sourceId,
+    name: text(properties.name),
+    lon: anchor[0],
+    lat: anchor[1],
+    x: localAnchor[0],
+    z: localAnchor[1],
+    confidence: "medium" as const,
+    status: "active" as const,
+    sourceGeometry: effective,
+    sourceRefs: [{ source: config.sourceName, url: objectUrl ?? config.sourceUrl, timestamp: SOURCE_TIMESTAMP, license: "ODbL-1.0" }],
+    provenance: [{ featureId: stableId, property: "geometry", winner: config.sourceName, contenders: [config.sourceName], priority: config.priority, timestamp: SOURCE_TIMESTAMP }],
+  };
+  const sourceMetadata = metadata({ sourceId, sourceObjectUrl: objectUrl, tags: text(properties["@id"]) ?? text(raw.id), highway: properties.highway, amenity: properties.amenity, shop: properties.shop, tourism: properties.tourism });
+  if (classification.kind === "building") {
+    const height = parseWidth(properties.height);
+    const levels = Number.parseInt(text(properties["building:levels"]) ?? "", 10);
+    const validLevels = Number.isFinite(levels) && levels >= 0 ? levels : undefined;
+    const inferredHeight = height ?? (validLevels !== undefined && validLevels > 0 ? validLevels * 3 : 3);
+    const heightSource = height !== undefined ? "explicit" : validLevels !== undefined && validLevels > 0 ? "inferred_from_levels" : "inferred_default";
+    return parseCompleteFeature({
+      ...base,
+      kind: "building",
+      geometry: effective,
+      localGeometry: local,
+      height: inferredHeight,
+      heightInferred: height === undefined,
+      heightSource,
+      levels: validLevels,
+      buildingType: classification.subtype,
+      roofType: text(properties["roof:shape"]),
+      wallType: text(properties["building:material"]),
+      buildingColour: text(properties["building:colour"]),
+      roofColour: text(properties["roof:colour"]),
+      startDate: text(properties["start_date"]),
+      sourceMetadata,
+    });
+  }
+  if (classification.kind === "water") {
+    const width = parseWidth(properties.width ?? properties["water:width"]);
+    const salt = text(properties.salt);
+    return parseCompleteFeature({
+      ...base,
+      kind: "water",
+      geometry: effective,
+      localGeometry: local,
+      waterType: classification.subtype,
+      width,
+      widthInferred: width === undefined,
+      isSurface: areal,
+      intermittent: parseBoolean(properties.intermittent),
+      salt: salt === "yes" || salt === "no" ? salt : undefined,
+      tidal: parseBoolean(properties.tidal),
+      sourceMetadata,
+    });
+  }
+  if (classification.kind === "landuse") {
+    return parseCompleteFeature({
+      ...base,
+      kind: "landuse",
+      geometry: effective,
+      localGeometry: local,
+      landuseType: classification.subtype ?? "other",
+      sourceMetadata,
+    });
+  }
+  if (classification.kind === "road") {
+    const width = parseWidth(properties.width);
+    const bridge = parseBoolean(properties.bridge);
+    const tunnel = parseBoolean(properties.tunnel);
+    return parseCompleteFeature({
+      ...base,
+      kind: "road",
+      geometry: effective,
+      localGeometry: local,
+      highway: classification.subtype,
+      roadClass: classification.subtype,
+      width,
+      widthInferred: width === undefined,
+      widthSource: width === undefined ? "inferred_default" : "explicit",
+      lanes: parseLanes(properties.lanes),
+      surface: text(properties.surface),
+      maxSpeed: parseMaxSpeed(properties.maxspeed),
+      bridge,
+      tunnel,
+      stratum: tunnel ? "tunnel" : bridge ? "bridge" : "normal",
+      layer: text(properties.layer),
+      oneway: parseBoolean(properties.oneway),
+      lit: parseBoolean(properties.lit),
+      sidewalk: text(properties.sidewalk),
+      sourceMetadata,
+    });
+  }
+  if (classification.kind === "transport") {
+    return parseCompleteFeature({
+      ...base,
+      kind: "transport",
+      geometry: effective,
+      localGeometry: local,
+      transportType: classification.subtype ?? "other",
+      line: text(properties.line),
+      route: text(properties.route),
+      network: text(properties.network),
+      operator: text(properties.operator),
+      ref: text(properties.ref),
+      publicTransport: text(properties.public_transport),
+      sourceMetadata,
+    });
+  }
+  return parseCompleteFeature({
+    ...base,
+    kind: "poi",
+    geometry: { type: "Point", coordinates: anchor },
+    sourceGeometry,
+    localGeometry: { type: "Point", coordinates: localAnchor },
+    poiType: classification.subtype ?? "poi",
+    category: text(properties.shop) ?? text(properties.amenity) ?? text(properties.tourism) ?? text(properties.historic) ?? text(properties.office) ?? text(properties.craft) ?? text(properties.place),
+    website: text(properties.website) ?? text(properties["contact:website"]),
+    phone: text(properties.phone) ?? text(properties["contact:phone"]),
+    openingHours: text(properties.opening_hours),
+    wheelchair: text(properties.wheelchair),
+    operator: text(properties.operator),
+    sourceMetadata,
+  });
+}
 
 function record(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -189,6 +434,26 @@ function geometryAnchor(geometry: Geometry): Coordinate {
   return totalArea > 1e-9 ? [x / totalArea, y / totalArea] : geometry.coordinates[0]?.[0]?.[0] ?? [0, 0];
 }
 
+function geometryPoints(geometry: Geometry): Coordinate[] {
+  const points: Coordinate[] = [];
+  const visit = (value: unknown): void => {
+    if (!Array.isArray(value)) return;
+    if (value.length >= 2 && typeof value[0] === "number" && typeof value[1] === "number") {
+      points.push([value[0], value[1]]);
+      return;
+    }
+    for (const child of value) visit(child);
+  };
+  visit(geometry.coordinates);
+  return points;
+}
+
+function anchorFor(geometry: Geometry, localAnchor: Coordinate, boundary: BulkBoundary | undefined): Coordinate {
+  const candidate = geometry.type === "Point" ? geometry.coordinates : renderToWgs84(localAnchor);
+  if (!boundary || boundary.index.contains(candidate)) return candidate;
+  return geometryPoints(geometry).find((point) => boundary.index.contains(point)) ?? candidate;
+}
+
 function parseBoolean(value: unknown): boolean | undefined {
   if (typeof value === "boolean") return value;
   if (typeof value !== "string") return undefined;
@@ -208,7 +473,7 @@ function metadata(values: Record<string, unknown>): Record<string, unknown> {
 }
 
 function stableSourceId(raw: Record<string, unknown>, properties: Record<string, unknown>): string | null {
-  return text(raw.id) ?? text(properties["@id"]) ?? text(properties.osm_id);
+  return text(raw.id) ?? text(properties["@id"]) ?? text(properties.osm_id) ?? null;
 }
 
 function isNamedPoi(properties: Record<string, unknown>): boolean {
@@ -225,13 +490,18 @@ function sourceObjectUrl(sourceId: string): string | undefined {
   }
   return /^(node|way|relation)\/\d+$/.test(sourceId) ? `https://www.openstreetmap.org/${sourceId}` : undefined;
 }
-export function normalizeOsmBulk(features: Record<string, unknown>[], boundary?: BulkBoundary): MapFeature[] {
+export function normalizeOsmBulk(features: Record<string, unknown>[], boundary?: BulkBoundary, config?: OsmNormalizeConfig): MapFeature[] {
+  const resolved = config ?? DEFAULT_OSM_NORMALIZE_CONFIG;
   const result: MapFeature[] = [];
   for (const raw of features) {
     const sourceGeometry = parseGeometry(raw.geometry);
-
     const properties = record(raw.properties) ? raw.properties : {};
     if (!sourceGeometry) continue;
+    if (resolved.retention === "complete") {
+      const feature = completeFeature(raw, properties, sourceGeometry, boundary, resolved);
+      if (feature !== null) result.push(feature);
+      continue;
+    }
     const highway = text(properties.highway);
     const namedRoad = highway !== undefined && text(properties.name) !== undefined;
     const isRoad = highway !== undefined && (ENRICHMENT_HIGHWAYS.has(highway) || namedRoad);
@@ -239,34 +509,15 @@ export function normalizeOsmBulk(features: Record<string, unknown>[], boundary?:
     if (!isRoad && !isPoi) continue;
     const sourceId = stableSourceId(raw, properties);
     if (!sourceId) continue;
-    const clipToBoundary = (): Geometry | null => {
-      if (!boundary) return sourceGeometry;
-      if (sourceGeometry.type === "Point") return boundary.index.contains(sourceGeometry.coordinates) ? sourceGeometry : null;
-      if (sourceGeometry.type === "LineString" || sourceGeometry.type === "MultiLineString") {
-        const vertices = sourceGeometry.type === "LineString" ? sourceGeometry.coordinates : sourceGeometry.coordinates.flat();
-        if (!boundary.index.touches(vertices)) return null;
-        const lines = (sourceGeometry.type === "LineString" ? [sourceGeometry.coordinates] : sourceGeometry.coordinates)
-          .flatMap((line) => boundary.polygons.flatMap((polygon) => clipLineStringToPolygon(line, polygon)));
-        if (lines.length === 0) return null;
-        return lines.length === 1 ? { type: "LineString", coordinates: lines[0]! } : { type: "MultiLineString", coordinates: lines };
-      }
-      const rings = sourceGeometry.type === "Polygon" ? [sourceGeometry.coordinates] : sourceGeometry.coordinates;
-      const polygons = rings.flatMap((coordinates) => boundary.polygons.flatMap((polygon) => {
-        const clipped = clipPolygonToPolygon({ type: "Polygon", coordinates }, polygon);
-        if (!clipped) return [];
-        return clipped.type === "Polygon" ? [clipped.coordinates] : clipped.coordinates;
-      }));
-      if (polygons.length === 0) return null;
-      return polygons.length === 1 ? { type: "Polygon", coordinates: polygons[0]! } : { type: "MultiPolygon", coordinates: polygons };
-    };
-    const effectiveSourceGeometry = clipToBoundary();
+    const effectiveSourceGeometry = clipGeometryToBoundary(sourceGeometry, boundary);
     if (!effectiveSourceGeometry) continue;
     const localSourceGeometry = localize(effectiveSourceGeometry);
     if (!localSourceGeometry) continue;
-    const localAnchor = geometryAnchor(localSourceGeometry);
-    const anchor = effectiveSourceGeometry.type === "Point" ? effectiveSourceGeometry.coordinates : renderToWgs84(localAnchor);
-    const stableId = `osm-bulk:${sourceId}`;
-    const reference = { source: "osm-bulk", url: sourceObjectUrl(sourceId) ?? SOURCE_URL, timestamp: SOURCE_TIMESTAMP, license: "ODbL-1.0" };
+    const geometryLocalAnchor = geometryAnchor(localSourceGeometry);
+    const anchor = anchorFor(effectiveSourceGeometry, geometryLocalAnchor, boundary);
+    const localAnchor = wgs84ToRender(anchor);
+    const stableId = `${resolved.stableIdPrefix}${sourceId}`;
+    const reference = { source: resolved.sourceName, url: sourceObjectUrl(sourceId) ?? resolved.sourceUrl, timestamp: SOURCE_TIMESTAMP, license: "ODbL-1.0" };
     const common = {
       stableId,
       sourceId,
@@ -278,7 +529,7 @@ export function normalizeOsmBulk(features: Record<string, unknown>[], boundary?:
       confidence: "medium" as const,
       status: "active" as const,
       sourceRefs: [reference],
-      provenance: [{ featureId: stableId, property: "geometry", winner: "osm-bulk", contenders: ["osm-bulk"], priority: 60, timestamp: SOURCE_TIMESTAMP }],
+      provenance: [{ featureId: stableId, property: "geometry", winner: resolved.sourceName, contenders: [resolved.sourceName], priority: resolved.priority, timestamp: SOURCE_TIMESTAMP }],
       sourceMetadata: metadata({ sourceId, sourceObjectUrl: sourceObjectUrl(sourceId), enrichmentOnly: namedRoad && !ENRICHMENT_HIGHWAYS.has(highway ?? ""), tags: properties["@id"], highway, amenity: properties.amenity, shop: properties.shop, tourism: properties.tourism }),
     };
     if (isRoad && localSourceGeometry.type !== "Point") {

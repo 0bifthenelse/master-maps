@@ -1,31 +1,14 @@
 #!/usr/bin/env tsx
-/// <reference lib="es2024.promise" />
-/**
- * fetch-osm.ts - bulk OpenStreetMap enrichment acquisition for Gers department.
- *
- * The preferred path downloads the current Geofabrik Midi-Pyrenees extract and
- * clips it with osmium. Overpass remains an explicit spot/enrichment fallback.
- *
- * Environment:
- *   MASTER_MAPS_DATA_DIR  data root directory (default "data")
- *
- * Exit codes:
- *   0  all themes acquired successfully
- *   1  one or more themes failed after retries
- */
 
-import { readFile, writeFile, mkdir, rename, unlink } from "node:fs/promises";
+import { access, readFile, writeFile, mkdir } from "node:fs/promises";
 import path from "node:path";
 import crypto from "node:crypto";
-import { createReadStream, createWriteStream } from "node:fs";
-import { Readable } from "node:stream";
-import { pipeline } from 'node:stream/promises';
+import { createReadStream } from "node:fs";
 import { execFile } from 'node:child_process';
+import { AUCH_DETAIL_SCOPE } from "../../src/lib/data/territory";
 import { promisify } from 'node:util';
+import { acquireFile, acquireJson, type AcquisitionOutcome } from "./http-cache";
 
-// ---------------------------------------------------------------------------
-// Configuration
-// ---------------------------------------------------------------------------
 
 const DATA_DIR = process.env.MASTER_MAPS_DATA_DIR ?? 'data';
 const RAW_DIR = path.join(DATA_DIR, 'raw');
@@ -35,20 +18,12 @@ const OVERPASS_PRIMARY = 'https://overpass-api.de/api/interpreter';
 const OVERPASS_FALLBACK = 'https://overpass.kumi.systems/api/interpreter';
 const OVERPASS_ENDPOINTS = [OVERPASS_PRIMARY, OVERPASS_FALLBACK] as const;
 
-/** Maximum HTTP/network retries per endpoint before switching. */
 const MAX_RETRIES = 3;
-/** Base delay for exponential backoff (milliseconds). */
 const BASE_DELAY_MS = 1_000;
-/** Per-request timeout (milliseconds). */
 const REQUEST_TIMEOUT_MS = 150_000;
-/** Delay between successive theme requests to rate-limit. */
 const INTER_REQUEST_DELAY_MS = 1_500;
-/** Overpass query timeout (seconds) sent in the query. */
 const OVERPASS_QUERY_TIMEOUT = 120;
 
-// ---------------------------------------------------------------------------
-// Theme definitions
-// ---------------------------------------------------------------------------
 
 interface ThemeDef {
   name: string;
@@ -236,16 +211,8 @@ out body; >; out skel qt;`,
   },
 ];
 
-// ---------------------------------------------------------------------------
-// Boundary polygon helpers
-// ---------------------------------------------------------------------------
 
 
-/**
- * Type guards for GeoJSON coordinate nesting.  A ring must be a closed loop
- * (≥4 [lng, lat] positions); polygons and multipolygons are one and two
- * levels of ring arrays respectively.
- */
 function isPosition(value: unknown): value is [number, number] {
   return (
     Array.isArray(value) &&
@@ -270,95 +237,59 @@ function isMultiPolygonCoordinates(value: unknown): value is number[][][][] {
 }
 
 
-// ---------------------------------------------------------------------------
-// Overpass fetch with retry and fallback
-// ---------------------------------------------------------------------------
 
 interface OverpassResult {
   response: unknown;
   endpointUrl: string;
-  /** Number of failed attempts before the successful response. */
   retryCount: number;
 }
 
-/**
- * Fetch from the Overpass API with exponential backoff per endpoint and a
- * fallback to the mirror endpoint when all retries are exhausted.
- */
 async function fetchOverpass(query: string): Promise<OverpassResult> {
   let lastError: Error | null = null;
-
   for (const endpoint of OVERPASS_ENDPOINTS) {
-    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt += 1) {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
       try {
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-
-        const res = await fetch(endpoint, {
-          method: 'POST',
-          signal: controller.signal,
-          headers: {
-            'User-Agent': 'master-maps/1.0 (OSM acquisition for Gers department, France; contact@ifthenelse.com)',
-            Accept: 'application/json',
-            'Content-Type': 'application/x-www-form-urlencoded',
-          },
+        const acquired = await acquireJson({
+          url: endpoint,
+          method: "POST",
           body: `data=${encodeURIComponent(query)}`,
+          signal: controller.signal,
+          maxBytes: 64 * 1024 * 1024,
+          headers: {
+            "User-Agent": "master-maps/1.0 (OSM acquisition for Gers department, France; contact@ifthenelse.com)",
+            Accept: "application/json",
+            "Content-Type": "application/x-www-form-urlencoded",
+          },
         });
+        const data: unknown = JSON.parse(acquired.body);
+        if (typeof data === "object" && data !== null && "remark" in data) {
+          const remark = data.remark;
+          if (typeof remark === "string" && remark !== "" && /error|timeout|abort/i.test(remark)) throw new Error(`Overpass error: ${remark}`);
+        }
+        return { response: data, endpointUrl: endpoint, retryCount: attempt + acquired.retryCount };
+      } catch (error: unknown) {
+        lastError = error instanceof Error ? error : new Error(String(error));
+        const tag = lastError.name === "AbortError" ? "TIMEOUT" : "ERROR";
+        console.error(`  [${tag}] ${endpoint}  attempt ${attempt + 1}/${MAX_RETRIES + 1}: ${lastError.message.slice(0, 200)}`);
+        if (attempt < MAX_RETRIES) await sleep(BASE_DELAY_MS * 2 ** attempt);
+      } finally {
         clearTimeout(timeoutId);
-
-        if (!res.ok) {
-          const body = await res.text().catch(() => '');
-          throw new Error(`HTTP ${res.status} ${res.statusText}: ${body.slice(0, 500)}`);
-        }
-
-        const data: unknown = await res.json();
-
-        // Overpass may return a JSON error (HTTP 200) with a "remark" field.
-        // Only treat "runtime error" / "timeout" remarks as failures; a remark
-        // like "number of results" is informational.
-        if (typeof data === 'object' && data !== null && 'remark' in data) {
-          const { remark } = data;
-          if (typeof remark === 'string' && remark !== '' && /error|timeout|abort/i.test(remark)) {
-            throw new Error(`Overpass error: ${remark}`);
-          }
-        }
-
-        return { response: data, endpointUrl: endpoint, retryCount: attempt };
-      } catch (err) {
-        const error = err instanceof Error ? err : new Error(String(err));
-        lastError = error;
-
-        const tag = error.name === 'AbortError' ? 'TIMEOUT' : 'ERROR';
-        console.error(
-          `  [${tag}] ${endpoint}  attempt ${attempt + 1}/${MAX_RETRIES + 1}: ${error.message.slice(0, 200)}`,
-        );
-
-        if (attempt < MAX_RETRIES) {
-          await sleep(BASE_DELAY_MS * 2 ** attempt);
-        }
       }
     }
-    // Brief cooldown before switching to fallback
     await sleep(500);
   }
-
-  throw lastError ?? new Error('All Overpass endpoints exhausted');
+  throw lastError ?? new Error("All Overpass endpoints exhausted");
 }
 
-// ---------------------------------------------------------------------------
-// Utilities
-// ---------------------------------------------------------------------------
 
-/** Pause execution for `ms` milliseconds (abort-safe timer wrapper). */
 function sleep(ms: number): Promise<void> {
   const { promise, resolve } = Promise.withResolvers<void>();
   setTimeout(resolve, ms);
   return promise;
 }
 
-// ---------------------------------------------------------------------------
-// Manifest type
-// ---------------------------------------------------------------------------
 
 interface ThemeResult {
   query: string;
@@ -383,10 +314,6 @@ interface OsmManifest {
   failedQueries: number;
 }
 
-// ---------------------------------------------------------------------------
-// The Overpass fallback uses the complete department bounding box. The exact
-// Admin Express geometry is still applied during normalization, so a
-// MultiPolygon is never reduced to one component by the query.
 
 function geometryBbox(geometry: { coordinates: unknown }): [number, number, number, number] {
   let west = Infinity;
@@ -409,10 +336,6 @@ function geometryBbox(geometry: { coordinates: unknown }): [number, number, numb
   return [west, south, east, north];
 }
 
-/**
- * Type guard: value is a Polygon/MultiPolygon-like object whose coordinates
- * pass the nesting checks for Polygon/MultiPolygon.
- */
 function isValidBoundaryGeometry(
   value: unknown,
 ): value is { type: 'Polygon' | 'MultiPolygon'; coordinates: unknown } {
@@ -435,21 +358,13 @@ interface ParsedBoundaryRecord {
   bbox: [number, number, number, number] | null;
 }
 
-/**
- * Extract a boundary geometry from any of the shapes the acquisition
- * pipeline writes: a source record `{ geometry, bbox }`, a GeoJSON Feature
- * `{ type, geometry }`, a FeatureCollection, or a bare Polygon/MultiPolygon.
- * Returns null when no recognized geometry is present.
- */
 function parseBoundaryRecord(raw: unknown): ParsedBoundaryRecord | null {
   if (typeof raw !== 'object' || raw === null) return null;
 
-  // GeoJSON Feature or boundary source record: { geometry, bbox? }
   if ('geometry' in raw && isValidBoundaryGeometry(raw.geometry)) {
     return { geometry: raw.geometry, bbox: 'bbox' in raw ? parseBbox(raw.bbox) : null };
   }
 
-  // FeatureCollection: use the first feature that carries a geometry
   if ('features' in raw && Array.isArray(raw.features)) {
     for (const feature of raw.features) {
       if (typeof feature === 'object' && feature !== null && 'geometry' in feature) {
@@ -462,7 +377,6 @@ function parseBoundaryRecord(raw: unknown): ParsedBoundaryRecord | null {
     return null;
   }
 
-  // Bare Polygon/MultiPolygon at the top level
   if (isValidBoundaryGeometry(raw)) {
     return { geometry: raw, bbox: null };
   }
@@ -479,21 +393,135 @@ async function hashFile(filePath: string): Promise<string> {
   return hash.digest("hex");
 }
 
-async function fetchBulkOsm(): Promise<void> {
-  const pbfPath = path.join(RAW_DIR, "midi-pyrenees-latest.osm.pbf");
-  if (process.env.OSM_USE_CACHE !== "1") {
-    const partialPath = `${pbfPath}.part`;
-    try { await unlink(partialPath); } catch { /* no stale partial */ }
-    const response = await fetch(OSM_BULK_URL, { headers: { Accept: "application/octet-stream" } });
-    if (!response.ok || !response.body) throw new Error(`Geofabrik bulk extract failed: HTTP ${response.status}`);
-    await pipeline(Readable.fromWeb(response.body as Parameters<typeof Readable.fromWeb>[0]), createWriteStream(partialPath));
-    await rename(partialPath, pbfPath);
+interface OsmBulkOutput {
+  file: string;
+  sha256: string;
+  recordCount: number;
+}
+
+interface OsmBulkReuseManifest {
+  source: string;
+  resource: string;
+  acquiredAt: string;
+  license: string;
+  crs: string;
+  sourceSha256: string;
+  boundarySha256: string;
+  featureCount: number;
+  boundary: string;
+  method: string;
+  outputs: OsmBulkOutput[];
+}
+
+function isOsmBulkOutput(value: unknown): value is OsmBulkOutput {
+  if (typeof value !== "object" || value === null) return false;
+  const record = value as Record<string, unknown>;
+  return typeof record.file === "string"
+    && typeof record.sha256 === "string"
+    && typeof record.recordCount === "number"
+    && Number.isInteger(record.recordCount)
+    && record.recordCount >= 0;
+}
+
+function isOsmBulkOutputArray(value: unknown): value is OsmBulkOutput[] {
+  return Array.isArray(value) && value.length > 0 && value.every(isOsmBulkOutput);
+}
+
+function parseReuseManifest(raw: unknown): OsmBulkReuseManifest | null {
+  if (typeof raw !== "object" || raw === null) return null;
+  const record = raw as Record<string, unknown>;
+  const source = record.source;
+  const resource = record.resource;
+  const acquiredAt = record.acquiredAt;
+  const license = record.license;
+  const crs = record.crs;
+  const sourceSha256 = record.sourceSha256;
+  const boundarySha256 = record.boundarySha256;
+  const featureCount = record.featureCount;
+  const boundary = record.boundary;
+  const method = record.method;
+  const outputs = record.outputs;
+  if (typeof source !== "string" || typeof resource !== "string" || typeof acquiredAt !== "string" || typeof license !== "string" || typeof crs !== "string") return null;
+  if (typeof sourceSha256 !== "string" || typeof boundarySha256 !== "string" || typeof boundary !== "string" || typeof method !== "string") return null;
+  if (typeof featureCount !== "number" || !Number.isInteger(featureCount) || featureCount < 0) return null;
+  if (!isOsmBulkOutputArray(outputs)) return null;
+  return { source, resource, acquiredAt, license, crs, sourceSha256, boundarySha256, featureCount, boundary, method, outputs };
+}
+
+async function readReuseManifest(manifestPath: string): Promise<OsmBulkReuseManifest | null> {
+  try {
+    return parseReuseManifest(JSON.parse(await readFile(manifestPath, "utf8")));
+  } catch {
+    return null;
   }
-  const sourceHash = await hashFile(pbfPath);
+}
+
+async function outputsExist(outputs: OsmBulkOutput[]): Promise<boolean> {
+  for (const output of outputs) {
+    try {
+      await access(output.file);
+    } catch {
+      return false;
+    }
+  }
+  return true;
+}
+
+async function writeReuseManifest(manifestPath: string, previous: OsmBulkReuseManifest, boundarySha256: string, outcome: AcquisitionOutcome): Promise<void> {
+  await writeFile(manifestPath, JSON.stringify({
+    source: previous.source,
+    resource: previous.resource,
+    acquiredAt: previous.acquiredAt,
+    license: previous.license,
+    crs: previous.crs,
+    sourceSha256: previous.sourceSha256,
+    boundarySha256,
+    featureCount: previous.featureCount,
+    boundary: previous.boundary,
+    method: previous.method,
+    outputs: previous.outputs,
+    bytesDownloaded: outcome.bytesDownloaded,
+    fromCache: outcome.fromCache,
+    httpStatus: outcome.httpStatus,
+    requestCount: outcome.requestCount,
+    retryCount: outcome.retryCount,
+  }, null, 2) + "\n", "utf8");
+}
+
+function fileinfoCount(value: unknown, label: string, filePath: string): number {
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 0) throw new Error(`osmium fileinfo ${label} count is invalid for ${filePath}`);
+  return value;
+}
+
+async function osmiumObjectCount(filePath: string): Promise<number> {
+  const { stdout } = await execFileAsync("osmium", ["fileinfo", "-e", "--json", filePath], { maxBuffer: 2 * 1024 * 1024 });
+  const parsed: unknown = JSON.parse(stdout);
+  if (typeof parsed !== "object" || parsed === null || !("data" in parsed)) throw new Error(`osmium fileinfo produced no report for ${filePath}`);
+  const data: unknown = parsed.data;
+  if (typeof data !== "object" || data === null || !("count" in data)) throw new Error(`osmium fileinfo report has no data count section for ${filePath}`);
+  const count: unknown = data.count;
+  if (typeof count !== "object" || count === null || !("nodes" in count) || !("ways" in count) || !("relations" in count)) throw new Error(`osmium fileinfo report has incomplete object counts for ${filePath}`);
+  return fileinfoCount(count.nodes, "nodes", filePath)
+    + fileinfoCount(count.ways, "ways", filePath)
+    + fileinfoCount(count.relations, "relations", filePath);
+}
+
+async function fetchBulkOsm(forceRefresh: boolean): Promise<void> {
+  const pbfPath = path.join(RAW_DIR, "midi-pyrenees-latest.osm.pbf");
   const boundaryPath = path.join(RAW_DIR, "gers-boundary.geojson");
   const extractPath = path.join(RAW_DIR, "gers-osm.osm.pbf");
   const filteredPath = path.join(RAW_DIR, "gers-osm-enrichment.osm.pbf");
   const geojsonPath = path.join(RAW_DIR, "osm-bulk.geojson");
+  const manifestPath = path.join(INTERMEDIATE_DIR, "osm-bulk-manifest.json");
+  const outcome = await acquireFile({ url: OSM_BULK_URL, destination: pbfPath, forceRefresh, headers: { Accept: "application/octet-stream" } });
+  const sourceSha256 = outcome.sha256;
+  const boundarySha256 = await hashFile(boundaryPath);
+  const previous = await readReuseManifest(manifestPath);
+  if (!forceRefresh && previous !== null && previous.sourceSha256 === sourceSha256 && previous.boundarySha256 === boundarySha256 && await outputsExist(previous.outputs)) {
+    console.log(`Bulk OSM extract unchanged: reusing ${previous.outputs.length} osmium outputs (fromCache=${outcome.fromCache}, httpStatus=${outcome.httpStatus}, bytesDownloaded=${outcome.bytesDownloaded})`);
+    await writeReuseManifest(manifestPath, previous, boundarySha256, outcome);
+    return;
+  }
   await execFileAsync("osmium", ["extract", "-p", boundaryPath, pbfPath, "-o", extractPath, "--overwrite"], { maxBuffer: 2 * 1024 * 1024 });
   await execFileAsync("osmium", [
     "tags-filter", extractPath, "-o", filteredPath, "--overwrite",
@@ -507,32 +535,156 @@ async function fetchBulkOsm(): Promise<void> {
   if (!Array.isArray(geojson.features) || geojson.features.length === 0) {
     throw new Error("Geofabrik extract produced no features inside the Gers boundary");
   }
-  await writeFile(path.join(INTERMEDIATE_DIR, "osm-bulk-manifest.json"), JSON.stringify({
+  const outputs: OsmBulkOutput[] = [
+    { file: extractPath, sha256: await hashFile(extractPath), recordCount: await osmiumObjectCount(extractPath) },
+    { file: filteredPath, sha256: await hashFile(filteredPath), recordCount: await osmiumObjectCount(filteredPath) },
+    { file: geojsonPath, sha256: await hashFile(geojsonPath), recordCount: geojson.features.length },
+  ];
+  await writeFile(manifestPath, JSON.stringify({
     source: "OpenStreetMap contributors via Geofabrik",
     resource: OSM_BULK_URL,
     acquiredAt: new Date().toISOString(),
     license: "ODbL-1.0",
     crs: "EPSG:4326",
-    sourceSha256: sourceHash,
+    sourceSha256,
+    boundarySha256,
     featureCount: geojson.features.length,
-    boundary: "data/raw/gers-boundary.geojson",
+    boundary: boundaryPath,
     method: "osmium extract and export",
+    outputs,
+    bytesDownloaded: outcome.bytesDownloaded,
+    fromCache: outcome.fromCache,
+    httpStatus: outcome.httpStatus,
+    requestCount: outcome.requestCount,
+    retryCount: outcome.retryCount,
   }, null, 2) + "\n", "utf8");
   console.log(`Bulk OSM extract: ${geojson.features.length} features`);
 }
 
 
-// ---------------------------------------------------------------------------
-// Main
-// ---------------------------------------------------------------------------
+interface AuchOsmManifest {
+  source: string;
+  resource: string;
+  sourceSha256: string;
+  boundarySha256: string;
+  extractSha256: string;
+  geojsonSha256: string;
+  extractFile: string;
+  geojsonFile: string;
+  featureCount: number;
+  acquiredAt: string;
+  checkedAt: string;
+  bytesDownloaded: number;
+  fromCache: boolean;
+  httpStatus: number;
+  requestCount: number;
+  retryCount: number;
+  extractSkipped: boolean;
+  exportSkipped: boolean;
+}
+
+function parseAuchOsmManifest(value: unknown): AuchOsmManifest | null {
+  if (typeof value !== "object" || value === null) return null;
+  const record = value as Record<string, unknown>;
+  const strings = ["source", "resource", "sourceSha256", "boundarySha256", "extractSha256", "geojsonSha256", "extractFile", "geojsonFile", "acquiredAt", "checkedAt"];
+  if (!strings.every((key) => typeof record[key] === "string")) return null;
+  const numbers = ["featureCount", "bytesDownloaded", "httpStatus", "requestCount", "retryCount"];
+  if (!numbers.every((key) => typeof record[key] === "number" && Number.isFinite(record[key]))) return null;
+  if (typeof record.fromCache !== "boolean" || typeof record.extractSkipped !== "boolean" || typeof record.exportSkipped !== "boolean") return null;
+  return record as unknown as AuchOsmManifest;
+}
+
+async function readAuchOsmManifest(filePath: string): Promise<AuchOsmManifest | null> {
+  try {
+    return parseAuchOsmManifest(JSON.parse(await readFile(filePath, "utf8")));
+  } catch {
+    return null;
+  }
+}
+
+async function acquireAuchOsm(forceRefresh: boolean): Promise<void> {
+  const upstreamPath = path.join(RAW_DIR, "midi-pyrenees-latest.osm.pbf");
+  const boundaryPath = path.join(RAW_DIR, AUCH_DETAIL_SCOPE.boundaryRawFile);
+  const extractPath = path.join(RAW_DIR, AUCH_DETAIL_SCOPE.osmExtractFile);
+  const geojsonPath = path.join(RAW_DIR, AUCH_DETAIL_SCOPE.osmGeojsonFile);
+  const manifestPath = path.join(INTERMEDIATE_DIR, "auch-osm-manifest.json");
+  const outcome = await acquireFile({ url: OSM_BULK_URL, destination: upstreamPath, forceRefresh, headers: { Accept: "application/octet-stream" } });
+  const boundarySha256 = await hashFile(boundaryPath);
+  const previous = await readAuchOsmManifest(manifestPath);
+  const outputFiles = [extractPath, geojsonPath];
+  const reusable = !forceRefresh && previous !== null
+    && previous.sourceSha256 === outcome.sha256
+    && previous.boundarySha256 === boundarySha256
+    && previous.extractSha256 === await hashFile(extractPath).catch(() => "")
+    && previous.geojsonSha256 === await hashFile(geojsonPath).catch(() => "")
+    && await outputsExist(outputFiles.map((file) => ({ file, sha256: "", recordCount: 0 })));
+  if (reusable && previous !== null) {
+    await writeFile(manifestPath, JSON.stringify({
+      ...previous,
+      checkedAt: outcome.checkedAt,
+      bytesDownloaded: outcome.bytesDownloaded,
+      fromCache: outcome.fromCache,
+      httpStatus: outcome.httpStatus,
+      requestCount: outcome.requestCount,
+      retryCount: outcome.retryCount,
+      extractSkipped: true,
+      exportSkipped: true,
+    }, null, 2) + "\n", "utf8");
+    console.log(`Auch OSM extract unchanged: reusing both osmium outputs (fromCache=${outcome.fromCache}, httpStatus=${outcome.httpStatus}, bytesDownloaded=${outcome.bytesDownloaded})`);
+    return;
+  }
+  await execFileAsync("osmium", ["extract", "-p", boundaryPath, "-s", "smart", upstreamPath, "-o", extractPath, "--overwrite", "--set-bounds"], { maxBuffer: 2 * 1024 * 1024 });
+  await execFileAsync("osmium", ["export", extractPath, "-o", geojsonPath, "-O", "--add-unique-id", "type_id", "-a", "type,id", "--geometry-types", "point,linestring,polygon"], { maxBuffer: 2 * 1024 * 1024 });
+  const parsed = JSON.parse(await readFile(geojsonPath, "utf8")) as { features?: unknown[] };
+  if (!Array.isArray(parsed.features) || parsed.features.length === 0) throw new Error("Auch OSM extract produced no features inside the commune boundary");
+  await writeFile(manifestPath, JSON.stringify({
+    source: "OpenStreetMap contributors via Geofabrik",
+    resource: OSM_BULK_URL,
+    sourceSha256: outcome.sha256,
+    boundarySha256,
+    extractSha256: await hashFile(extractPath),
+    geojsonSha256: await hashFile(geojsonPath),
+    extractFile: extractPath,
+    geojsonFile: geojsonPath,
+    featureCount: parsed.features.length,
+    acquiredAt: outcome.acquiredAt,
+    checkedAt: outcome.checkedAt,
+    bytesDownloaded: outcome.bytesDownloaded,
+    fromCache: outcome.fromCache,
+    httpStatus: outcome.httpStatus,
+    requestCount: outcome.requestCount,
+    retryCount: outcome.retryCount,
+    extractSkipped: false,
+    exportSkipped: false,
+  }, null, 2) + "\n", "utf8");
+  console.log(`Auch OSM extract: ${parsed.features.length} features`);
+}
+
+
+interface FetchOsmOptions {
+  forceRefresh: boolean;
+  auch: boolean;
+}
+
+function parseArgs(args: string[]): FetchOsmOptions {
+  return {
+    forceRefresh: args.includes("--force") || args.includes("--force-osm-pbf"),
+    auch: args.includes("--auch"),
+  };
+}
 
 async function main(): Promise<void> {
-  console.log('=== OSM enrichment acquisition for Gers department 32 ===\n');
+  const { forceRefresh, auch } = parseArgs(process.argv.slice(2));
 
   await mkdir(RAW_DIR, { recursive: true });
   await mkdir(INTERMEDIATE_DIR, { recursive: true });
+  if (auch) {
+    await acquireAuchOsm(forceRefresh);
+    return;
+  }
+  await mkdir(INTERMEDIATE_DIR, { recursive: true });
   if (process.env.OSM_USE_OVERPASS !== "1") {
-    await fetchBulkOsm();
+    await fetchBulkOsm(forceRefresh);
     return;
   }
 

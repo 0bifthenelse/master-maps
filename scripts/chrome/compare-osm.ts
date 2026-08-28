@@ -18,23 +18,55 @@ interface FixtureAnchor { coordinate: Coordinate; sourceUrl: string }
 interface SearchRecord { featureId: string; canonicalName: string; tileId: string; kind: string; focusLon: number; focusLat: number }
 interface Manifest { bounds: [number, number, number, number] }
 interface View { slug: string; query: string; coordinate: Coordinate }
+interface CompareOptions { auch: boolean; dataDir?: string }
 
-const fixture = JSON.parse(readFileSync(resolve(ROOT, "tests/fixtures/gers-landmark-anchors.json"), "utf8")) as { anchors: Record<string, FixtureAnchor> };
-const views: View[] = [
+const gersFixture = JSON.parse(readFileSync(resolve(ROOT, "tests/fixtures/gers-landmark-anchors.json"), "utf8")) as { anchors: Record<string, FixtureAnchor> };
+const auchFixture = JSON.parse(readFileSync(resolve(ROOT, "tests/fixtures/auch-landmark-anchors.json"), "utf8")) as { anchors: Record<string, FixtureAnchor> };
+const gersViews: View[] = [
   { slug: "auch-centre", query: "Auch", coordinate: [0.5905, 43.6475] },
-  { slug: "auch-cathedral", query: "Cathédrale Sainte-Marie", coordinate: fixture.anchors.cathedralSainteMarie.coordinate },
+  { slug: "auch-cathedral", query: "Cathédrale Sainte-Marie", coordinate: gersFixture.anchors.cathedralSainteMarie.coordinate },
   { slug: "auch-river", query: "Gers", coordinate: [0.5905, 43.6475] },
-  { slug: "condom", query: "Condom", coordinate: fixture.anchors.condom.coordinate },
-  { slug: "lectoure", query: "Lectoure", coordinate: fixture.anchors.lectoure.coordinate },
-  { slug: "fleurance", query: "Fleurance", coordinate: fixture.anchors.fleurance.coordinate },
-  { slug: "eauze", query: "Eauze", coordinate: fixture.anchors.eauze.coordinate },
-  { slug: "vic-fezensac", query: "Vic-Fezensac", coordinate: fixture.anchors.vicFezensac.coordinate },
-  { slug: "mirande", query: "Mirande", coordinate: fixture.anchors.mirande.coordinate },
-  { slug: "marciac", query: "Marciac", coordinate: fixture.anchors.marciac.coordinate },
-  { slug: "nogaro", query: "Nogaro", coordinate: fixture.anchors.nogaro.coordinate },
-  { slug: "samatan", query: "Samatan", coordinate: fixture.anchors.samatan.coordinate },
-  { slug: "lisle-jourdain", query: "L'Isle-Jourdain", coordinate: fixture.anchors.lisleJourdain.coordinate },
+  { slug: "condom", query: "Condom", coordinate: gersFixture.anchors.condom.coordinate },
+  { slug: "lectoure", query: "Lectoure", coordinate: gersFixture.anchors.lectoure.coordinate },
+  { slug: "fleurance", query: "Fleurance", coordinate: gersFixture.anchors.fleurance.coordinate },
+  { slug: "eauze", query: "Eauze", coordinate: gersFixture.anchors.eauze.coordinate },
+  { slug: "vic-fezensac", query: "Vic-Fezensac", coordinate: gersFixture.anchors.vicFezensac.coordinate },
+  { slug: "mirande", query: "Mirande", coordinate: gersFixture.anchors.mirande.coordinate },
+  { slug: "marciac", query: "Marciac", coordinate: gersFixture.anchors.marciac.coordinate },
+  { slug: "nogaro", query: "Nogaro", coordinate: gersFixture.anchors.nogaro.coordinate },
+  { slug: "samatan", query: "Samatan", coordinate: gersFixture.anchors.samatan.coordinate },
+  { slug: "lisle-jourdain", query: "L'Isle-Jourdain", coordinate: gersFixture.anchors.lisleJourdain.coordinate },
 ];
+const cathedralAnchor = auchFixture.anchors.cathedralSainteMarie ?? auchFixture.anchors.cathedral;
+if (!cathedralAnchor) throw new Error("Auch cathedral anchor is missing");
+const AUCH_VIEWS: View[] = [
+  { slug: "auch-centre", query: "Auch", coordinate: [0.5905, 43.6475] },
+  { slug: "auch-cathedral", query: "Cathédrale Sainte-Marie", coordinate: cathedralAnchor.coordinate },
+  { slug: "auch-gers-river", query: "Le Gers", coordinate: midpoint(auchFixture.anchors.gersSouth.coordinate, auchFixture.anchors.gersNorth.coordinate) },
+  { slug: "auch-dense-block", query: "Boulevard Sadi Carnot", coordinate: auchFixture.anchors.boulevardSadiCarnot.coordinate },
+  { slug: "auch-commercial", query: "NOCIBE", coordinate: auchFixture.anchors.nocibe.coordinate },
+];
+
+function midpoint(first: Coordinate, second: Coordinate): Coordinate {
+  return [(first[0] + second[0]) / 2, (first[1] + second[1]) / 2];
+}
+
+function parseOptions(args: string[]): CompareOptions {
+  let auch = false;
+  let dataDir = process.env.MASTER_MAPS_DATA_DIR;
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index];
+    if (argument === "--auch") auch = true;
+    else if (argument?.startsWith("--data-dir=")) dataDir = argument.slice("--data-dir=".length);
+    else if (argument === "--data-dir") {
+      const value = args[index + 1];
+      if (!value) throw new Error("--data-dir requires a path");
+      dataDir = value;
+      index += 1;
+    }
+  }
+  return { auch, dataDir };
+}
 
 async function waitForPort(host: string, port: number, timeoutMs = 30_000): Promise<void> {
   const started = Date.now();
@@ -43,7 +75,6 @@ async function waitForPort(host: string, port: number, timeoutMs = 30_000): Prom
       const response = await fetch(`http://${host}:${port}/`);
       if (response.status < 500) return;
     } catch {
-      /* service is not ready */
     }
     await sleep(250);
   }
@@ -109,9 +140,11 @@ async function capturePair(page: Page, view: View, consoleErrors: string[], page
 }
 
 async function main(): Promise<void> {
+  const options = parseOptions(process.argv.slice(2));
+  const captureViews = options.auch ? AUCH_VIEWS : gersViews;
   mkdirSync(ARTIFACTS_DIR, { recursive: true });
   const chrome = await findChrome();
-  const next: ChildProcess = spawn("npm", ["run", "start", "--", "--port", String(NEXT_PORT)], { cwd: ROOT, shell: true, stdio: ["ignore", "pipe", "pipe"] });
+  const next: ChildProcess = spawn("npm", ["run", "start", "--", "--port", String(NEXT_PORT)], { cwd: ROOT, shell: true, stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, ...(options.dataDir ? { MASTER_MAPS_DATA_DIR: options.dataDir } : {}) } });
   next.stdout?.on("data", (chunk: Buffer) => process.stdout.write(`[next] ${chunk}`));
   next.stderr?.on("data", (chunk: Buffer) => process.stderr.write(`[next:err] ${chunk}`));
   const profile = resolve(ROOT, ".chrome-compare-profile");
@@ -129,10 +162,10 @@ async function main(): Promise<void> {
     page.on("console", (message) => { if (message.type() === "error") consoleErrors.push(message.text()); });
     page.on("pageerror", (error) => pageErrors.push(error.message));
     const results: Record<string, unknown>[] = [];
-    for (const view of views) results.push(await capturePair(page, view, consoleErrors, pageErrors));
+    for (const view of captureViews) results.push(await capturePair(page, view, consoleErrors, pageErrors));
     await page.close();
     await browser.close();
-    await writeFile(resolve(ARTIFACTS_DIR, "comparison-report.json"), `${JSON.stringify({ capturedAt: new Date().toISOString(), viewport: VIEWPORT, locations: results }, null, 2)}\n`, "utf8");
+    await writeFile(resolve(ARTIFACTS_DIR, "comparison-report.json"), `${JSON.stringify({ capturedAt: new Date().toISOString(), viewport: VIEWPORT, scope: options.auch ? "auch" : "gers", dataDir: options.dataDir, locations: results }, null, 2)}\n`, "utf8");
     console.log(JSON.stringify({ ok: true, locations: results.length, report: resolve(ARTIFACTS_DIR, "comparison-report.json") }, null, 2));
   } finally {
     chromeProcess.kill("SIGTERM");

@@ -34,7 +34,7 @@ import {
 } from "./osmRelations";
 import { createBoundaryIndex, type BoundaryIndex } from "./boundaryIndex";
 import { normalizeBdtopo } from "./normalizeBdtopo";
-import { normalizeOsmBulk } from "./normalizeOsmBulk";
+import { normalizeOsmBulk, type OsmNormalizeConfig } from "./normalizeOsmBulk";
 
 type Coordinate = [number, number];
 
@@ -58,6 +58,7 @@ type RawSources = {
   businessesOsm: { status?: string; body?: unknown };
   businessesWeb: { results?: Record<string, unknown>[] };
   ign: { features: Record<string, unknown>[]; unavailable: boolean };
+  osmExtract?: { features: Record<string, unknown>[] };
 };
 
 type OsmGeometry =
@@ -77,6 +78,12 @@ interface NormalizeOptions {
   outDir: string;
 }
 
+export interface NormalizeScope {
+  boundaryRawFile: string;
+  osmExtractFile?: string;
+  bdtopoDir?: string;
+}
+
 interface TagClassification {
   kind: Exclude<FeatureKind, "boundary" | "business" | "address">;
   poiType?: string;
@@ -90,6 +97,13 @@ const SOURCE_TIMESTAMP = new Date().toISOString();
 const OSM_URL = "https://www.openstreetmap.org";
 const BAN_URL = "https://adresse.data.gouv.fr";
 const BUSINESS_URL = "https://recherche-entreprises.api.gouv.fr";
+const AUCH_OSM_CONFIG: OsmNormalizeConfig = {
+  sourceName: "osm-auch",
+  sourceUrl: "https://download.geofabrik.de/europe/france/midi-pyrenees.html",
+  stableIdPrefix: "osm-auch:",
+  priority: 65,
+  retention: "complete",
+};
 
 function dataRoot(): string {
   return process.env.MASTER_MAPS_DATA_DIR ?? "data";
@@ -214,7 +228,7 @@ function boundaryPolygons(boundary: BoundaryFeature | { geometry?: unknown; ring
   throw new Error("Boundary has no Polygon or MultiPolygon geometry");
 }
 
-function boundaryFromRaw(raw: RawBoundary): BoundaryFeature {
+function boundaryFromRaw(raw: RawBoundary, scope?: NormalizeScope): BoundaryFeature {
   const rawFeature = raw.features?.find((candidate) => candidate.geometry !== undefined);
   const geometry = toGeometry(rawFeature?.geometry);
   if (!geometry || (geometry.type !== "Polygon" && geometry.type !== "MultiPolygon")) {
@@ -226,12 +240,21 @@ function boundaryFromRaw(raw: RawBoundary): BoundaryFeature {
   }
   const localFocus = computeLocalFocus(localGeometry as LocalGeometry);
   const [lon, lat] = renderToWgs84(localFocus);
-  const stableId = `boundary:department/${GERS_TERRITORY.code}`;
+  let context: { stableId: string; sourceId: string; territoryCode: string; name: string | undefined };
+  if (scope === undefined) {
+    context = { stableId: `boundary:department/${GERS_TERRITORY.code}`, sourceId: `admin-express:${GERS_TERRITORY.code}`, territoryCode: GERS_TERRITORY.code, name: undefined };
+  } else {
+    const properties = rawFeature?.properties ?? {};
+    const communeCode = text(properties.code_insee) ?? text(properties.code);
+    if (!communeCode) throw new Error("Commune boundary is missing an INSEE code property");
+    context = { stableId: `boundary:commune/${communeCode}`, sourceId: `admin-express:${communeCode}`, territoryCode: communeCode, name: text(properties.nom_officiel) ?? text(properties.nom) };
+  }
   const feature = {
     kind: "boundary",
-    stableId,
-    sourceId: `admin-express:${GERS_TERRITORY.code}`,
-    territoryCode: GERS_TERRITORY.code,
+    stableId: context.stableId,
+    sourceId: context.sourceId,
+    territoryCode: context.territoryCode,
+    name: context.name,
     geometry,
     localGeometry,
     lon,
@@ -240,10 +263,10 @@ function boundaryFromRaw(raw: RawBoundary): BoundaryFeature {
     z: localFocus[1],
     confidence: "high",
     status: "active",
-    provenance: [{ featureId: stableId, property: "geometry", winner: "IGN ADMIN EXPRESS COG", contenders: ["IGN ADMIN EXPRESS COG"], priority: 100, timestamp: SOURCE_TIMESTAMP }],
+    provenance: [{ featureId: context.stableId, property: "geometry", winner: "IGN ADMIN EXPRESS COG", contenders: ["IGN ADMIN EXPRESS COG"], priority: 100, timestamp: SOURCE_TIMESTAMP }],
     sourceRefs: [{ source: "IGN ADMIN EXPRESS COG", url: "https://data.geopf.fr/wfs/ows", timestamp: SOURCE_TIMESTAMP, license: "Licence Ouverte / Open Licence 2.0" }],
   };
-  return parseFeature(feature, stableId) as BoundaryFeature;
+  return parseFeature(feature, context.stableId) as BoundaryFeature;
 }
 
 function parseFeature(value: unknown, stableId: string): MapFeature {
@@ -794,8 +817,39 @@ async function readJson(filePath: string, required: boolean): Promise<unknown> {
   }
 }
 
-async function loadRawSources(rawDir: string): Promise<RawSources> {
-  const boundary = await readJson(path.join(rawDir, GERS_TERRITORY.boundaryRawFile), true);
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isGeojsonFeatureCollection(value: unknown): value is { features: Record<string, unknown>[] } {
+  return typeof value === "object" && value !== null && "features" in value && Array.isArray(value.features);
+}
+
+function extractOsmObjectIds(features: Record<string, unknown>[]): Set<string> {
+  const ids = new Set<string>();
+  for (const feature of features) {
+    if (!isRecord(feature.properties)) continue;
+    const type = text(feature.properties["@type"]);
+    const id = numberValue(feature.properties["@id"]);
+    if (type === undefined || id === undefined) continue;
+    ids.add(`${type}/${id}`);
+  }
+  return ids;
+}
+function canonicalOsmObjectIds(sourceId: string | undefined): string[] {
+  if (sourceId === undefined) return [];
+  if (/^(node|way|relation)\/\d+$/.test(sourceId)) return [sourceId];
+  if (/^[nwr]\d+$/.test(sourceId)) {
+    const prefix = sourceId[0]!;
+    const type = prefix === "n" ? "node" : prefix === "w" ? "way" : "relation";
+    return [`${type}/${sourceId.slice(1)}`];
+  }
+  if (/^a\d+$/.test(sourceId)) return [`way/${sourceId.slice(1)}`, `relation/${sourceId.slice(1)}`];
+  return [];
+}
+
+async function loadRawSources(rawDir: string, scope?: NormalizeScope, intermediateDir = path.join(dataRoot(), "intermediate")): Promise<RawSources> {
+  const boundary = await readJson(path.join(rawDir, scope?.boundaryRawFile ?? GERS_TERRITORY.boundaryRawFile), true);
   if (typeof boundary !== "object" || boundary === null) throw new Error("Admin Express boundary is not an object");
   const osmParsed = await readJson(path.join(rawDir, "osm.json"), false);
   let osm: RawOsm = typeof osmParsed === "object" && osmParsed !== null && Array.isArray((osmParsed as Record<string, unknown>).elements)
@@ -807,17 +861,26 @@ async function loadRawSources(rawDir: string): Promise<RawSources> {
     : { features: [] };
   if ((osmBulk.features?.length ?? 0) > 0) osm = { elements: [], timestamp: "bulk", query: "geofabrik-enrichment" };
   const files = await fs.readdir(rawDir, { withFileTypes: true });
-  const bdtopoFiles = files
+  const bdtopoDir = scope?.bdtopoDir ?? rawDir;
+  const bdtopoEntries = bdtopoDir === rawDir ? files : await fs.readdir(bdtopoDir, { withFileTypes: true });
+  const bdtopoFiles = bdtopoEntries
     .filter((entry) => entry.isFile() && /^bdtopo-(buildings|roads|water-surfaces|water-lines)\.geojson$/.test(entry.name))
-    .map((entry) => path.join(rawDir, entry.name));
+    .map((entry) => path.join(bdtopoDir, entry.name));
   if (bdtopoFiles.length === 0) throw new Error("No canonical BD TOPO exports found");
-  const addresses = (await readJson(path.join(rawDir, "ban-addresses.json"), true)) as { addresses?: Record<string, unknown>[]; license?: string };
-  const businesses = ((await readJson(path.join(rawDir, "businesses-sirene.json"), false)) ?? { records: [] }) as RawSources["businesses"];
-  const businessesOsm = ((await readJson(path.join(rawDir, "businesses-osm.json"), false)) ?? { status: "missing" }) as RawSources["businessesOsm"];
-  const businessesWeb = ((await readJson(path.join(rawDir, "businesses-web.json"), false)) ?? { results: [] }) as RawSources["businessesWeb"];
+  const addressFile = scope === undefined ? "ban-addresses.json" : "ban-addresses-auch.json";
+  const addresses = (await readJson(path.join(rawDir, addressFile), true)) as { addresses?: Record<string, unknown>[]; license?: string };
+  const businesses = (await readJson(path.join(rawDir, "businesses-sirene.json"), true)) as RawSources["businesses"];
+  const businessesOsm = (await readJson(path.join(rawDir, "businesses-osm.json"), false)) as RawSources["businessesOsm"] ?? {};
+  const businessesWeb = (await readJson(path.join(rawDir, "businesses-web.json"), false)) as RawSources["businessesWeb"] ?? {};
   const ign: RawSources["ign"] = { features: [], unavailable: true };
-  const intermediateDir = path.join(dataRoot(), "intermediate");
   const ignUnavailable = await readJson(path.join(intermediateDir, "ign-unavailable.json"), false);
+  let osmExtract: RawSources["osmExtract"];
+  if (scope?.osmExtractFile !== undefined) {
+    const extractPath = path.join(rawDir, scope.osmExtractFile);
+    const parsed = await readJson(extractPath, true);
+    if (!isGeojsonFeatureCollection(parsed)) throw new Error(`OSM extract is not a GeoJSON FeatureCollection: ${extractPath}`);
+    osmExtract = { features: parsed.features };
+  }
   for (const entry of files) {
     if (!entry.isFile() || !/^ign-[^/]+\.json$/.test(entry.name) || entry.name === "ign-capabilities.json") continue;
     const parsed = await readJson(path.join(rawDir, entry.name), false);
@@ -830,7 +893,7 @@ async function loadRawSources(rawDir: string): Promise<RawSources> {
     ign.features = [];
     ign.unavailable = true;
   }
-  return { boundary: boundary as RawBoundary, osm, osmBulk, bdtopoFiles, addresses, businesses, businessesOsm, businessesWeb, ign };
+  return { boundary: boundary as RawBoundary, osm, osmBulk, osmExtract, bdtopoFiles, addresses, businesses, businessesOsm, businessesWeb, ign };
 }
 
 async function writeJsonArray(filePath: string, values: Iterable<unknown>): Promise<void> {
@@ -894,14 +957,15 @@ function canonicalFeature(feature: MapFeature): MapFeature {
   if (!parsed.success) throw new Error(`Invalid normalized feature: ${parsed.error.message}`);
   return parsed.data;
 }
-export async function normalizeAll(rawDir?: string, outDir?: string): Promise<void> {
+export async function normalizeAll(rawDir?: string, outDir?: string, scope?: NormalizeScope): Promise<void> {
   const root = dataRoot();
   const sourceDir = rawDir ?? path.join(root, "raw");
   const destinationDir = outDir ?? path.join(root, "intermediate");
   await fs.mkdir(destinationDir, { recursive: true });
-  const sources = await loadRawSources(sourceDir);
-  const boundary = boundaryFromRaw(sources.boundary);
+  const sources = await loadRawSources(sourceDir, scope, destinationDir);
+  const boundary = boundaryFromRaw(sources.boundary, scope);
   const boundaries = boundaryPolygons(boundary);
+  const boundaryIndex = createBoundaryIndex(boundaries.map((polygon) => polygon.coordinates));
   const osmResult = normalizeOsmWithReport(sources.osm, boundary);
   const bdtopoFeatures: MapFeature[] = [];
   for (const filePath of sources.bdtopoFiles) {
@@ -915,13 +979,20 @@ export async function normalizeAll(rawDir?: string, outDir?: string): Promise<vo
     const normalizedFeatures = normalizeBdtopo(sourceFeatures, boundaries.map((polygon) => polygon.coordinates));
     for (const feature of normalizedFeatures) bdtopoFeatures.push(feature);
   }
-  const osmBulkFeatures = normalizeOsmBulk(sources.osmBulk.features ?? [], { polygons: boundaries, index: createBoundaryIndex(boundaries.map((polygon) => polygon.coordinates)) });
+  const osmBulkFeatures = normalizeOsmBulk(sources.osmBulk.features ?? [], { polygons: boundaries, index: boundaryIndex });
+  const extractObjectIds = sources.osmExtract === undefined ? null : extractOsmObjectIds(sources.osmExtract.features);
+  const deduplicatedBulkFeatures = extractObjectIds === null
+    ? osmBulkFeatures
+    : osmBulkFeatures.filter((feature) => !canonicalOsmObjectIds(feature.sourceId).some((id) => extractObjectIds.has(id)));
+  const auchOsmFeatures = sources.osmExtract === undefined
+    ? []
+    : normalizeOsmBulk(sources.osmExtract.features, { polygons: boundaries, index: boundaryIndex }, AUCH_OSM_CONFIG);
   const addressFeatures = normalizeAddresses(sources.addresses, boundary);
   const businessFeatures = normalizeBusinesses(sources.businesses, boundary, sources.businessesOsm, sources.businessesWeb);
   const ignFeatures = normalizeIgn(sources.ign, boundary);
   const invalidFeatures: Array<{ stableId: string; kind: string; error: string }> = [];
   const features: MapFeature[] = [];
-  const candidates = [boundary].concat(bdtopoFeatures, osmBulkFeatures, osmResult.features, addressFeatures, businessFeatures, ignFeatures);
+  const candidates = [boundary].concat(bdtopoFeatures, deduplicatedBulkFeatures, auchOsmFeatures, osmResult.features, addressFeatures, businessFeatures, ignFeatures);
   for (const feature of candidates) {
     try {
       features.push(canonicalFeature(feature));

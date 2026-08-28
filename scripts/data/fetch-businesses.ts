@@ -1,31 +1,11 @@
-/**
- * fetch-businesses.ts - department-wide business acquisition for Gers (32).
- *
- * Sources:
- *   1. Annuaire des Entreprises / SIRENE (recherche-entreprises.api.gouv.fr)
- *      department-wide paginated scan and targeted name queries for known leads
- *   2. OpenStreetMap business records (Overpass)
- *      shop=*, office=*, craft=*, and business-oriented amenity within the department bbox
- *   3. Individually verified public business pages
- *      direct HTTP plus optional Moli for rendered pages
- *
- * Raw outputs (under MASTER_MAPS_DATA_DIR/raw/):
- *   businesses-sirene.json - Annuaire API responses and extracted records
- *   businesses-osm.json - Overpass response and query metadata
- *   businesses-web.json - per-page fetched results from business URLs
- *
- * All failures are recorded, never treated as evidence of zero objects.
- * Bounded exponential retries on transient failures; Moli wrapped in try/catch.
- *
- * @module
- */
+import { createHash } from "node:crypto";
+import { access, mkdir, readFile, writeFile } from "node:fs/promises";
+import path from "node:path";
+import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { acquireJson, createRateLimiter } from "./http-cache";
+import { AUCH_DETAIL_SCOPE, GERS_TERRITORY } from "../../src/lib/data/territory";
 
-// ── Structural types matching the canonical schema contract ─────────────────
-// The canonical src/lib/data/schema.ts is loaded dynamically when available;
-// these local structural types are the fallback for runtime and annotation.
-// They mirror the agreed contracts for SourceReference and business records.
-
-/** A single raw business record extracted from the Annuaire API response body. */
 interface ExtractedBusinessRecord {
   sourceId: string;
   siret: string;
@@ -43,7 +23,6 @@ interface ExtractedBusinessRecord {
   acquiredFromQuery: { q: string; page: number };
 }
 
-/** Per-query entry in the SIRENE raw file. */
 interface SireneQueryEntry {
   query: Record<string, unknown>;
   url: string;
@@ -51,11 +30,14 @@ interface SireneQueryEntry {
   httpStatus?: number;
   sha256: string;
   recordCount: number;
+  fromCache?: boolean;
+  bytesDownloaded?: number;
+  requestCount?: number;
+  retryCount?: number;
+  rateLimitCount?: number;
   error?: string;
-  body: unknown; // verbatim parsed JSON response
-}
 
-/** Schema for data/raw/businesses-sirene.json */
+}
 interface SireneRawFile {
   dataset: "businesses-sirene";
   sourceName: string;
@@ -63,15 +45,20 @@ interface SireneRawFile {
   version: string;
   license: string;
   department: { code: string; name: string };
+  commune?: string;
   acquiredAt: string;
   totalQueries: number;
   totalUniqueRecords: number;
   truncated: boolean;
+  bytesDownloaded: number;
+  requestCount: number;
+  retryCount: number;
+  rateLimitCount: number;
+  sha256: string;
+  fromCache: boolean;
   queries: SireneQueryEntry[];
   records: ExtractedBusinessRecord[];
 }
-
-/** Schema for data/raw/businesses-osm.json */
 interface OsmRawFile {
   dataset: "businesses-osm";
   sourceName: string;
@@ -82,13 +69,12 @@ interface OsmRawFile {
   queryText: string;
   acquiredAt: string;
   elementCount: number;
-  status: "ok" | "error";
+  status: "ok" | "error" | "missing";
   error?: string;
   sha256: string;
-  body: unknown; // verbatim Overpass response
+  body: unknown;
 }
 
-/** A result from fetching one verified business URL. */
 interface WebPageResult {
   sourceId: string;
   url: string;
@@ -104,7 +90,7 @@ interface WebPageResult {
   coordinate?: { lon: number; lat: number } | null;
   confidence: "high" | "medium" | "low";
   moliError?: string;
-  textTruncated?: string; // bounded excerpt, ≤ 8_000 chars
+  textTruncated?: string;
   note?: string;
 }
 
@@ -115,7 +101,6 @@ interface WebRawFile {
   results: WebPageResult[];
 }
 
-/** Source metadata entry returned for manifest assembly. */
 interface SourceManifestEntry {
   source: string;
   url?: string;
@@ -125,10 +110,13 @@ interface SourceManifestEntry {
   recordCount: number;
   status: "ok" | "partial" | "failed";
   sha256?: string;
+  fromCache?: boolean;
+  bytesDownloaded?: number;
+  requestCount?: number;
+  retryCount?: number;
+  rateLimitCount?: number;
   error?: string;
 }
-
-/** A recorded failure with context. */
 interface FailureEntry {
   step: string;
   source: string;
@@ -138,14 +126,13 @@ interface FailureEntry {
 }
 
 export interface FetchBusinessesOptions {
-  /** Root of MASTER_MAPS_DATA_DIR; default "data" */
   dataDir?: string;
-  /** Skip all network; read existing raw dumps */
   offline?: boolean;
-  /** Max pages for the Annuaire department scan (25 records/page); default 30, max 400 */
   maxSirenePages?: number;
-  /** Abort signal for cancellation */
   signal?: AbortSignal;
+  communeCode?: string;
+  departement?: boolean;
+  forceRefresh?: boolean;
 }
 
 export interface FetchBusinessesResult {
@@ -154,6 +141,23 @@ export interface FetchBusinessesResult {
   failures: FailureEntry[];
   counts: Record<string, number>;
   rawFiles: string[];
+}
+
+interface AcquireSireneOptions {
+  maxSirenePages: number;
+  signal?: AbortSignal;
+  communeCode: string;
+  departement: boolean;
+  forceRefresh?: boolean;
+}
+
+interface OsmBusinessElement {
+  type: string;
+  id: number;
+  lat?: number;
+  lon?: number;
+  center?: { lat: number; lon: number };
+  tags: Record<string, string>;
 }
 
 const DEPARTMENT_CODE = GERS_TERRITORY.code;
@@ -168,23 +172,53 @@ const BBOX = {
 const USER_AGENT =
   "master-maps-data-script/0.1 (+https://github.com/0bifthenelse/master-maps)";
 
-/** Annuaire des Entreprises / SIRENE base URL */
 const ANNIAURE_BASE = "https://recherche-entreprises.api.gouv.fr";
+const ANNUAIRE_REQUESTS_PER_SECOND = 3;
+const annuaireRateLimiter = createRateLimiter(ANNUAIRE_REQUESTS_PER_SECOND);
 
-/** Overpass endpoints, tried in order */
-const OVERPASS_ENDPOINTS = [
-  "https://overpass-api.de/api/interpreter",
-  "https://overpass.kumi.systems/api/interpreter",
-] as const;
+const MAX_RESPONSE_BYTES = 1_024 * 1_024;
+const DEFAULT_TIMEOUT_MS = 30_000;
+const HTTP_ATTEMPTS = 4;
 
-/** Bounded max bytes for a single HTTP response body */
-const MAX_RESPONSE_BYTES = 1_024 * 1_024; // 1 MiB
-
-/** User-facing license for SIRENE data */
 const SIRENE_LICENSE = "Licence Ouverte / Open Licence 2.0 (ETALAB)";
 const OSM_LICENSE = "Open Database License (ODbL) v1.0";
 
-// Known verified business leads, used for targeted queries and web page verification
+const DEFAULT_COMMUNE_CODE = AUCH_DETAIL_SCOPE.code;
+const OSM_EXTRACT_SOURCE_NAME = "osm-auch-extract";
+const OSM_EXTRACT_DERIVATION =
+  "named features with shop, office, craft, or commercial amenity tags derived from the local auch-osm.geojson extract";
+
+const COMMERCIAL_AMENITIES: ReadonlySet<string> = new Set([
+  "restaurant",
+  "cafe",
+  "bar",
+  "fast_food",
+  "pharmacy",
+  "bank",
+  "cinema",
+  "fuel",
+  "hotel",
+  "hostel",
+  "pub",
+  "biergarten",
+  "ice_cream",
+  "car_rental",
+  "car_wash",
+  "charging_station",
+  "atm",
+  "library",
+  "theatre",
+  "nightclub",
+  "casino",
+  "clinic",
+  "dentist",
+  "doctors",
+  "veterinary",
+  "post_office",
+  "marketplace",
+  "shopping_centre",
+]);
+
 const KNOWN_BUSINESS_TARGETS = [
   {
     id: "nocibe-pagesjaunes",
@@ -209,27 +243,15 @@ const KNOWN_BUSINESS_TARGETS = [
   },
 ] as const;
 
-// ── Helpers ────────────────────────────────────────────────────────────────
-
-import { createHash } from "node:crypto";
-import { access, mkdir, readFile, writeFile } from "node:fs/promises";
-import path from "node:path";
-import { spawn } from "node:child_process";
-import { fileURLToPath } from "node:url";
-import { GERS_TERRITORY } from "../../src/lib/data/territory";
-
-/** Get a human-readable message from an unknown error. */
 function errMsg(e: unknown): string {
   if (e instanceof Error) return `${e.name}: ${e.message}`;
   return String(e);
 }
 
-/** Compute SHA-256 hex digest of a string. */
 function sha256(content: string): string {
   return createHash("sha256").update(content, "utf-8").digest("hex");
 }
 
-/** Resolve the data root directory from options or environment. */
 function resolveDataDir(overrides?: Pick<FetchBusinessesOptions, "dataDir">): string {
   const dir =
     overrides?.dataDir ??
@@ -238,12 +260,9 @@ function resolveDataDir(overrides?: Pick<FetchBusinessesOptions, "dataDir">): st
   return path.resolve(process.cwd(), dir);
 }
 
-/** Ensure a directory exists. */
 async function ensureDir(dirPath: string): Promise<void> {
   await mkdir(dirPath, { recursive: true });
 }
-
-// ── Cached HTTP fetch with retries ─────────────────────────────────────────
 
 interface CachedFetchResult {
   status: number;
@@ -251,14 +270,10 @@ interface CachedFetchResult {
   body: string;
   sha256: string;
   fromCache: boolean;
-}
-
-/** In-memory cache, keyed by normalised URL. */
-const responseCache = new Map<string, CachedFetchResult>();
-function sleep(milliseconds: number): Promise<void> {
-  const waiter = Promise.withResolvers<void>();
-  setTimeout(waiter.resolve, milliseconds);
-  return waiter.promise;
+  bytesDownloaded: number;
+  requestCount: number;
+  retryCount: number;
+  rateLimitCount: number;
 }
 
 interface FetchOptions {
@@ -267,148 +282,46 @@ interface FetchOptions {
   headers?: Record<string, string>;
   timeoutMs?: number;
   maxBytes?: number;
-  retries?: number;
+  forceRefresh?: boolean;
+  signal?: AbortSignal;
 }
 
-/**
- * Bounded exponential backoff + jitter.
- * Returns delay in milliseconds.
- */
-function backoffDelay(
-  attempt: number,
-  baseMs: number,
-  maxMs: number,
-): number {
-  const delay = Math.min(maxMs, baseMs * 2 ** (attempt - 1));
-  const jitter = Math.random() * 0.3 * delay;
-  return delay + jitter;
-}
-
-function isRetryable(status: number | undefined, err: unknown): boolean {
-  if (err) return true; // network/timeout errors are retryable
-  if (status === undefined) return true;
-  if (status >= 500) return true; // server errors
-  if (status === 429) return true; // rate limit
-  return false;
-}
-
-/**
- * Fetch a URL with in-memory caching, size cap, content hashing,
- * and bounded exponential retries.
- * On persistent failure, the last error is thrown.
- */
 async function cachedFetch(
   url: string,
   opts: FetchOptions = {},
 ): Promise<CachedFetchResult> {
-  const maxRetries = opts.retries ?? 3;
-  const baseDelayMs = 1_000;
-  const maxDelayMs = 15_000;
-  const timeoutMs = opts.timeoutMs ?? 30_000;
-  const maxBytes = opts.maxBytes ?? MAX_RESPONSE_BYTES;
-  const method = opts.method ?? "GET";
-
-  // Check cache for GET requests
-  const cacheKey = method === "GET" ? url : `POST:${sha256(opts.body ?? "")}:${url}`;
-  const cached = responseCache.get(cacheKey);
-  if (cached && method === "GET") {
-    return { ...cached, fromCache: true };
-  }
-
-  let lastError: unknown;
-  let lastStatus: number | undefined;
-
-  // Ensure at least one attempt even when maxRetries is 0 (try-once mode)
-  const totalAttempts = Math.max(1, maxRetries);
-
-  for (let attempt = 1; attempt <= totalAttempts; attempt++) {
-    try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), timeoutMs);
-
-      const response = await fetch(url, {
-        method,
-        headers: {
-          "User-Agent": USER_AGENT,
-          Accept: "application/json, text/html, text/plain, */*",
-          ...opts.headers,
-        },
-        body: opts.body,
-        signal: opts.signal
-          ? AbortSignal.any([opts.signal, controller.signal])
-          : controller.signal,
-      });
-
-      clearTimeout(timeout);
-
-      // Check content-length cap before reading body
-      const contentLen = response.headers.get("content-length");
-      if (contentLen && Number(contentLen) > maxBytes) {
-        throw new Error(
-          `Response content-length ${contentLen} exceeds max ${maxBytes}`,
-        );
-      }
-
-      const body = await response.text();
-
-      if (body.length > maxBytes) {
-        throw new Error(
-          `Response body length ${body.length} exceeds max ${maxBytes}`,
-        );
-      }
-
-      const digest = sha256(body);
-      const contentType = response.headers.get("content-type");
-
-      const result: CachedFetchResult = {
-        status: response.status,
-        contentType,
-        body,
-        sha256: digest,
-        fromCache: false,
-      };
-
-      // Cache successful GET responses
-      if (method === "GET" && response.ok) {
-        responseCache.set(cacheKey, result);
-      }
-
-      	if (!response.ok && isRetryable(response.status, null) && attempt < totalAttempts) {
-		lastStatus = response.status;
-		lastError = new Error(`HTTP ${response.status}: ${body.slice(0, 200)}`);
-		const delay = backoffDelay(attempt, baseDelayMs, maxDelayMs);
-		await sleep(delay);
-		continue;
-	}
-
-	// Non-ok responses that can't be retried (retries exhausted or non-retryable status) must throw
-	if (!response.ok) {
-		throw new Error(
-			`HTTP ${response.status} after ${attempt} attempt(s): ${body.slice(0, 200)}`,
-		);
-	}
-
-	return result;
-} catch (err: unknown) {
-	lastError = err;
-	if (attempt < totalAttempts && isRetryable(lastStatus, err)) {
-		const delay = backoffDelay(attempt, baseDelayMs, maxDelayMs);
-		await sleep(delay);
-		continue;
-	}
-    // Improve the error message when retries=0. "Exhausted 0 retries" is misleading.
-	if (maxRetries === 0 && lastError) {
-		throw new Error(`Request failed for ${url}: ${errMsg(lastError)}`);
-	}
-	throw lastError;
+  const method = opts.method === "POST" ? "POST" : "GET";
+  const timeoutSignal = AbortSignal.timeout(
+    (opts.timeoutMs ?? DEFAULT_TIMEOUT_MS) * HTTP_ATTEMPTS,
+  );
+  const signal = opts.signal
+    ? AbortSignal.any([opts.signal, timeoutSignal])
+    : timeoutSignal;
+  const outcome = await acquireJson({
+    url,
+    method,
+    body: opts.body,
+    headers: {
+      "User-Agent": USER_AGENT,
+      Accept: "application/json, text/html, text/plain, */*",
+      ...opts.headers,
+    },
+    maxBytes: opts.maxBytes ?? MAX_RESPONSE_BYTES,
+    forceRefresh: opts.forceRefresh,
+    signal,
+  });
+  return {
+    status: outcome.httpStatus,
+    contentType: null,
+    body: outcome.body,
+    sha256: outcome.sha256,
+    fromCache: outcome.fromCache,
+    bytesDownloaded: outcome.bytesDownloaded,
+    requestCount: outcome.requestCount,
+    retryCount: outcome.retryCount,
+    rateLimitCount: outcome.rateLimitCount,
+  };
 }
-  }
-
-  // Should not reach here. The loop always runs at least once.
-  throw lastError ?? new Error(`Exhausted ${maxRetries} retries for ${url}`);
-}
-
-// ── Moli fetch wrapper ─────────────────────────────────────────────────────
 
 interface MoliResult {
   success: boolean;
@@ -418,12 +331,6 @@ interface MoliResult {
   error?: string;
 }
 
-/**
- * Run `moli fetch --dump markdown <url>` with a timeout.
- * Returns structured result. Does not throw. Callers check `success`.
- * Moli is expected to fail for certain pages, including the documented Nocibé crash.
- * This behavior is by design. The script records the limitation.
- */
 async function runMoliFetch(
 	url: string,
 	timeoutMs: number = 30_000,
@@ -490,23 +397,15 @@ async function runMoliFetch(
 	return promise;
 }
 
-/** Check if `moli` is available on PATH. Returns false quickly. */
 async function moliAvailable(): Promise<boolean> {
   try {
     const r = await runMoliFetch("https://example.com/", 5_000);
-    return r.exitCode !== null; // spawned and ran, even if it failed
+    return r.exitCode !== null;
   } catch {
     return false;
   }
 }
 
-// ── SIRENE / Annuaire acquisition ──────────────────────────────────────────
-
-/**
- * Parse a SIRENE "entreprises result" (from recherche-entreprises JSON) into an
- * extracted business record focusing on the selected department establishment.
- * Uses the first matching establishment or falls back to the registered head office.
- */
 function extractSireneRecord(
   apiResult: Record<string, unknown>,
   nominatedRecord: boolean,
@@ -514,7 +413,6 @@ function extractSireneRecord(
 ): ExtractedBusinessRecord | null {
   const siege = apiResult["siege"] as Record<string, unknown> | undefined;
   const matching = (apiResult["matching_etablissements"] as Array<Record<string, unknown>>) ?? [];
-  // Use the first matching establishment (local Auch) or fall back to siege
   const local = matching[0] as Record<string, unknown> | undefined ?? siege;
   if (!local) return null;
 
@@ -553,39 +451,39 @@ function extractSireneRecord(
   };
 }
 
-/**
- * Run one Annuaire API query and return the parsed result.
- * Cached via cachedFetch.
- */
+function annuaireQueryString(params: Record<string, string | number>): string {
+  return Object.entries(params)
+    .map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(String(value))}`)
+    .join("&");
+}
+
+function annuaireSearchUrl(params: Record<string, string | number>): string {
+  return `${ANNIAURE_BASE}/search?${annuaireQueryString(params)}`;
+}
+
 async function querySirene(
   params: Record<string, string | number>,
+  forceRefresh = false,
 ): Promise<{
   body: Record<string, unknown>;
   sha256: string;
   status: number;
+  fromCache: boolean;
+  bytesDownloaded: number;
+  requestCount: number;
+  retryCount: number;
+  rateLimitCount: number;
 }> {
-  const queryString = Object.entries(params)
-    .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(String(v))}`)
-    .join("&");
-  const url = `${ANNIAURE_BASE}/search?${queryString}`;
-
-  const result = await cachedFetch(url, { retries: 3, timeoutMs: 20_000 });
-  const body = JSON.parse(result.body);
-  return { body: body as Record<string, unknown>, sha256: result.sha256, status: result.status };
+  await annuaireRateLimiter.acquire();
+  const result = await cachedFetch(annuaireSearchUrl(params), { timeoutMs: 20_000, forceRefresh });
+  const body: unknown = JSON.parse(result.body);
+  if (typeof body !== "object" || body === null || Array.isArray(body)) throw new Error("Annuaire des Entreprises returned a non-object JSON response");
+  return { body: body as Record<string, unknown>, sha256: result.sha256, status: result.status, fromCache: result.fromCache, bytesDownloaded: result.bytesDownloaded, requestCount: result.requestCount, retryCount: result.retryCount, rateLimitCount: result.rateLimitCount };
 }
 
-/**
- * Acquire all SIRENE / Annuaire records for Gers department 32.
- *
- * Strategy:
- *   1. Paginated department-wide scan with `departement=32`.
- *   2. Targeted name queries for known regression leads.
- *
- * Returns the assembled raw file data plus metadata.
- */
 async function acquireSirene(
   rawDir: string,
-  opts: Required<Pick<FetchBusinessesOptions, "maxSirenePages" | "offline" | "signal">>,
+  opts: AcquireSireneOptions,
 ): Promise<{
   rawFile: SireneRawFile;
   sources: SourceManifestEntry[];
@@ -598,18 +496,15 @@ async function acquireSirene(
   let totalResults = 0;
   let truncated = false;
 
-  // ── 1. Department-wide scan ─────────────────────────────────
+  const scopeParams: Record<string, string | number> = opts.departement
+    ? { departement: DEPARTMENT_CODE }
+    : { code_commune: opts.communeCode };
   const perPage = 25;
   const maxPages = Math.min(opts.maxSirenePages, 400);
 
   try {
-    // First page to get total_results
-    const first = await querySirene({
-      q: "",
-      departement: DEPARTMENT_CODE,
-      per_page: perPage,
-      page: 1,
-    });
+    const firstParams: Record<string, string | number> = { q: "", ...scopeParams, per_page: perPage, page: 1 };
+    const first = await querySirene(firstParams, opts.forceRefresh);
 
     totalResults = (first.body["total_results"] as number) ?? 0;
     const totalPages = Math.min(
@@ -617,7 +512,6 @@ async function acquireSirene(
       400,
     );
 
-    // Extract records from page 1
     const results = (first.body["results"] as Array<Record<string, unknown>>) ?? [];
     for (const r of results) {
       const rec = extractSireneRecord(r, false, { q: "", page: 1 });
@@ -625,16 +519,19 @@ async function acquireSirene(
     }
 
     queries.push({
-      query: { q: "", departement: DEPARTMENT_CODE, per_page: perPage, page: 1 },
-      url: `${ANNIAURE_BASE}/search?q=&departement=${DEPARTMENT_CODE}&per_page=${perPage}&page=1`,
+      query: firstParams,
+      url: annuaireSearchUrl(firstParams),
       status: "ok",
       httpStatus: first.status,
       sha256: first.sha256,
       recordCount: results.length,
-      body: first.body,
+      fromCache: first.fromCache,
+      bytesDownloaded: first.bytesDownloaded,
+      requestCount: first.requestCount,
+      retryCount: first.retryCount,
+      rateLimitCount: first.rateLimitCount,
     });
 
-    // Paginate remaining pages
     const pagesToFetch = Math.min(maxPages, totalPages);
     if (totalResults > pagesToFetch * perPage) {
       truncated = true;
@@ -643,16 +540,9 @@ async function acquireSirene(
     for (let page = 2; page <= pagesToFetch; page++) {
       if (opts.signal?.aborted) break;
 
-      // Small delay between pages to be gentle to the API
-      await sleep(150);
-
       try {
-        const pageResult = await querySirene({
-          q: "",
-          departement: DEPARTMENT_CODE,
-          per_page: perPage,
-          page,
-        });
+        const pageParams: Record<string, string | number> = { q: "", ...scopeParams, per_page: perPage, page };
+        const pageResult = await querySirene(pageParams, opts.forceRefresh);
 
         const pageResults = (pageResult.body["results"] as Array<Record<string, unknown>>) ?? [];
         for (const r of pageResults) {
@@ -661,29 +551,32 @@ async function acquireSirene(
         }
 
         queries.push({
-          query: { q: "", departement: DEPARTMENT_CODE, per_page: perPage, page },
-          url: `${ANNIAURE_BASE}/search?q=&departement=${DEPARTMENT_CODE}&per_page=${perPage}&page=${page}`,
+          query: pageParams,
+          url: annuaireSearchUrl(pageParams),
           status: "ok",
           httpStatus: pageResult.status,
           sha256: pageResult.sha256,
           recordCount: pageResults.length,
-          body: pageResult.body,
+          fromCache: pageResult.fromCache,
+          bytesDownloaded: pageResult.bytesDownloaded,
+          requestCount: pageResult.requestCount,
+          retryCount: pageResult.retryCount,
+          rateLimitCount: pageResult.rateLimitCount,
         });
       } catch (err: unknown) {
         failures.push({
-          step: "sirene-department-pagination",
+          step: "sirene-scan-pagination",
           source: "recherche-entreprises.api.gouv.fr",
-          url: `${ANNIAURE_BASE}/search?q=&departement=${DEPARTMENT_CODE}&per_page=${perPage}&page=${page}`,
+          url: annuaireSearchUrl({ q: "", ...scopeParams, per_page: perPage, page }),
           error: errMsg(err),
           severity: "warning",
         });
         queries.push({
-          query: { q: "", departement: DEPARTMENT_CODE, per_page: perPage, page },
-          url: `${ANNIAURE_BASE}/search?q=&departement=${DEPARTMENT_CODE}&per_page=${perPage}&page=${page}`,
+          query: { q: "", ...scopeParams, per_page: perPage, page },
+          url: annuaireSearchUrl({ q: "", ...scopeParams, per_page: perPage, page }),
           status: "error",
           error: errMsg(err),
           recordCount: 0,
-          body: null,
           sha256: "",
         });
       }
@@ -691,17 +584,15 @@ async function acquireSirene(
   } catch (err: unknown) {
     const msg = errMsg(err);
     failures.push({
-      step: "sirene-department-initial",
+      step: "sirene-scan-initial",
       source: "recherche-entreprises.api.gouv.fr",
-      url: `${ANNIAURE_BASE}/search?q=&departement=${DEPARTMENT_CODE}&per_page=25&page=1`,
+      url: annuaireSearchUrl({ q: "", ...scopeParams, per_page: perPage, page: 1 }),
       error: msg,
       severity: "error",
     });
-    // If the first page fails completely, the script cannot continue.
-    throw new Error(`SIRENE department query failed: ${msg}`);
+    throw new Error(`SIRENE scan query failed: ${msg}`);
   }
 
-  // ── 2. Targeted name queries ──────────────────────────────
   const nameQueries = [
     { q: "NOCIBE", label: "nocibe" },
     { q: "FANTOCHE", label: "fantoche" },
@@ -712,16 +603,11 @@ async function acquireSirene(
     if (opts.signal?.aborted) break;
 
     try {
-      const result = await querySirene({
-        q: nq.q,
-        departement: DEPARTMENT_CODE,
-        per_page: 25,
-        page: 1,
-      });
+      const targetedParams: Record<string, string | number> = { q: nq.q, ...scopeParams, per_page: 25, page: 1 };
+      const result = await querySirene(targetedParams, opts.forceRefresh);
 
       const results = (result.body["results"] as Array<Record<string, unknown>>) ?? [];
 
-      // For targeted queries, iterate all matching_etablissements
       for (const r of results) {
         const matching = (r["matching_etablissements"] as Array<Record<string, unknown>>) ?? [];
         for (let i = 0; i < matching.length; i++) {
@@ -755,35 +641,37 @@ async function acquireSirene(
       }
 
       queries.push({
-        query: { q: nq.q, departement: DEPARTMENT_CODE, per_page: 25, page: 1 },
-        url: `${ANNIAURE_BASE}/search?q=${nq.q}&departement=${DEPARTMENT_CODE}&per_page=25&page=1`,
+        query: targetedParams,
+        url: annuaireSearchUrl(targetedParams),
         status: "ok",
         httpStatus: result.status,
         sha256: result.sha256,
         recordCount: results.length,
-        body: result.body,
+        fromCache: result.fromCache,
+        bytesDownloaded: result.bytesDownloaded,
+        requestCount: result.requestCount,
+        retryCount: result.retryCount,
+        rateLimitCount: result.rateLimitCount,
       });
     } catch (err: unknown) {
       failures.push({
         step: `sirene-targeted-query-${nq.label}`,
         source: "recherche-entreprises.api.gouv.fr",
-        url: `${ANNIAURE_BASE}/search?q=${nq.q}&departement=${DEPARTMENT_CODE}&per_page=25&page=1`,
+        url: annuaireSearchUrl({ q: nq.q, ...scopeParams, per_page: 25, page: 1 }),
         error: errMsg(err),
         severity: "warning",
       });
       queries.push({
-        query: { q: nq.q, departement: DEPARTMENT_CODE, per_page: 25, page: 1 },
-        url: `${ANNIAURE_BASE}/search?q=${nq.q}&departement=${DEPARTMENT_CODE}&per_page=25&page=1`,
+        query: { q: nq.q, ...scopeParams, per_page: 25, page: 1 },
+        url: annuaireSearchUrl({ q: nq.q, ...scopeParams, per_page: 25, page: 1 }),
         status: "error",
         error: errMsg(err),
         recordCount: 0,
-        body: null,
         sha256: "",
       });
     }
   }
 
-  // Deduplicate records by sourceId (sirene:XXXX)
   const seen = new Set<string>();
   const uniqueRecords: ExtractedBusinessRecord[] = [];
   for (const rec of allRecords) {
@@ -793,6 +681,11 @@ async function acquireSirene(
     }
   }
 
+  const bytesDownloaded = queries.reduce((sum, query) => sum + (query.bytesDownloaded ?? 0), 0);
+  const requestCount = queries.reduce((sum, query) => sum + (query.requestCount ?? 0), 0);
+  const retryCount = queries.reduce((sum, query) => sum + (query.retryCount ?? 0), 0);
+  const rateLimitCount = queries.reduce((sum, query) => sum + (query.rateLimitCount ?? 0), 0);
+  const fromCache = queries.length > 0 && queries.every((query) => query.fromCache === true);
   const rawFile: SireneRawFile = {
     dataset: "businesses-sirene",
     sourceName: "Annuaire des Entreprises / SIRENE (recherche-entreprises.api.gouv.fr)",
@@ -800,18 +693,31 @@ async function acquireSirene(
     version: "2.6",
     license: SIRENE_LICENSE,
     department: { code: DEPARTMENT_CODE, name: TERRITORY_NAME },
+    ...(opts.departement ? {} : { commune: opts.communeCode }),
     acquiredAt: new Date().toISOString(),
     totalQueries: queries.length,
     totalUniqueRecords: uniqueRecords.length,
     truncated,
+    bytesDownloaded,
+    requestCount,
+    retryCount,
+    rateLimitCount,
+    fromCache,
     queries,
     records: uniqueRecords,
   };
+  rawFile.sha256 = sha256(JSON.stringify(rawFile));
 
   const sourceEntry: SourceManifestEntry = {
     source: `recherche-entreprises.api.gouv.fr (${SIRENE_LICENSE})`,
     url: `${ANNIAURE_BASE}/search`,
-    query: `q=&departement=${DEPARTMENT_CODE}&per_page=${perPage}`,
+    sha256: sha256(JSON.stringify(rawFile)),
+    fromCache,
+    bytesDownloaded,
+    requestCount,
+    retryCount,
+    rateLimitCount,
+    query: annuaireQueryString({ q: "", ...scopeParams, per_page: perPage }),
     acquiredAt: rawFile.acquiredAt,
     license: SIRENE_LICENSE,
     recordCount: uniqueRecords.length,
@@ -826,179 +732,252 @@ async function acquireSirene(
   };
 }
 
-// ── OSM business records acquisition ────────────────────────────────────────
-
-/** Build the Overpass QL query text for business records within the bbox. */
-function buildBusinessOverpassQuery(): string {
-  const { south, west, north, east } = BBOX;
-  const bbox = `${south},${west},${north},${east}`;
-  return [
-    "[out:json][timeout:90];",
-    "(",
-    // Shops
-    `  node["shop"]["name"](${bbox});`,
-    `  way["shop"]["name"](${bbox});`,
-    `  relation["shop"]["name"](${bbox});`,
-    // Offices
-    `  node["office"]["name"](${bbox});`,
-    `  way["office"]["name"](${bbox});`,
-    // Craft businesses
-    `  node["craft"]["name"](${bbox});`,
-    `  way["craft"]["name"](${bbox});`,
-    // Commercial amenities with known business category
-    `  node["amenity"]~"^(restaurant|cafe|bar|fast_food|pharmacy|bank|cinema|fuel|hotel|hostel|pub|biergarten|ice_cream|car_rental|car_wash|charging_station|atm|library|theatre|nightclub|casino|clinic|dentist|doctors|veterinary|post_office|marketplace|shopping_centre)$"["name"](${bbox});`,
-    `  way["amenity"]~"^(restaurant|cafe|bar|fast_food|pharmacy|bank|cinema|fuel|hotel|hostel|pub|biergarten|ice_cream|car_rental|car_wash|charging_station|atm|library|theatre|nightclub|casino|clinic|dentist|doctors|veterinary|post_office|marketplace|shopping_centre)$"["name"](${bbox});`,
-    ");",
-    "out center tags;",
-  ].join("\n");
+function isCoordinate(value: unknown): value is [number, number] {
+  return Array.isArray(value) && value.length >= 2 && typeof value[0] === "number" && typeof value[1] === "number";
 }
 
-/**
- * Acquire OSM business records via Overpass.
- * Tries endpoints in order with bounded retries.
- */
-async function acquireOsmBusiness(
+function isCoordinateRing(value: unknown): value is number[][] {
+  return Array.isArray(value) && value.every(isCoordinate);
+}
+
+function isCoordinateRingCollection(value: unknown): value is number[][][] {
+  return Array.isArray(value) && value.every(isCoordinateRing);
+}
+
+function isCoordinateRingNest(value: unknown): value is number[][][][] {
+  return Array.isArray(value) && value.every(isCoordinateRingCollection);
+}
+
+function firstRing(geometry: unknown): number[][] | null {
+  if (typeof geometry !== "object" || geometry === null) return null;
+  const record = geometry as Record<string, unknown>;
+  const coordinates = record["coordinates"];
+  if (record["type"] === "Point" && isCoordinate(coordinates)) return [coordinates];
+  if (record["type"] === "LineString" && isCoordinateRing(coordinates)) return coordinates;
+  if (record["type"] === "MultiLineString" && isCoordinateRingCollection(coordinates) && coordinates[0]) return coordinates[0];
+  if (record["type"] === "Polygon" && isCoordinateRingCollection(coordinates) && coordinates[0]) return coordinates[0];
+  if (record["type"] === "MultiPolygon" && isCoordinateRingNest(coordinates) && coordinates[0] && coordinates[0][0]) return coordinates[0][0];
+  return null;
+}
+
+function ringAnchor(ring: number[][]): { lat: number; lon: number } | null {
+  if (ring.length === 0) return null;
+  let lonSum = 0;
+  let latSum = 0;
+  for (const coordinate of ring) {
+    lonSum += coordinate[0]!;
+    latSum += coordinate[1]!;
+  }
+  return { lat: latSum / ring.length, lon: lonSum / ring.length };
+}
+
+function osmElementType(
+  feature: Record<string, unknown>,
+  properties: Record<string, unknown>,
+): "node" | "way" | "relation" | null {
+  const declared = properties["@type"] ?? properties["type"];
+  if (declared === "node" || declared === "way" || declared === "relation") return declared;
+  const uniqueId = feature["id"];
+  if (typeof uniqueId !== "string") return null;
+  const prefix = uniqueId.split("/")[0];
+  if (prefix === "node" || prefix === "way" || prefix === "relation") return prefix;
+  if (prefix === "n") return "node";
+  if (prefix === "w") return "way";
+  if (prefix === "r") return "relation";
+  return null;
+}
+
+function osmElementId(
+  feature: Record<string, unknown>,
+  properties: Record<string, unknown>,
+): number | null {
+  const declared = properties["@id"] ?? properties["id"];
+  if (typeof declared === "number" && Number.isInteger(declared)) return declared;
+  if (typeof declared === "string") {
+    const value = Number.parseInt(declared, 10);
+    if (Number.isInteger(value)) return value;
+  }
+  const uniqueId = feature["id"];
+  if (typeof uniqueId !== "string") return null;
+  const suffix = uniqueId.includes("/") ? uniqueId.split("/")[1] : uniqueId.slice(1);
+  const value = Number.parseInt(suffix ?? "", 10);
+  return Number.isInteger(value) ? value : null;
+}
+
+function toOsmBusinessElement(feature: unknown): OsmBusinessElement | null {
+  if (typeof feature !== "object" || feature === null) return null;
+  const record = feature as Record<string, unknown>;
+  const properties = record["properties"];
+  if (typeof properties !== "object" || properties === null) return null;
+
+  const tags: Record<string, string> = {};
+  for (const [key, value] of Object.entries(properties)) {
+    if (key === "type" || key === "id") continue;
+    if (typeof value === "string") tags[key] = value;
+  }
+
+  const name = tags["name"];
+  if (name === undefined || name === "") return null;
+  const shop = tags["shop"];
+  const office = tags["office"];
+  const craft = tags["craft"];
+  const amenity = tags["amenity"];
+  const commercial =
+    (shop !== undefined && shop !== "") ||
+    (office !== undefined && office !== "") ||
+    (craft !== undefined && craft !== "") ||
+    (amenity !== undefined && COMMERCIAL_AMENITIES.has(amenity));
+  if (!commercial) return null;
+
+  const osmType = osmElementType(record, properties);
+  if (osmType === null) return null;
+  const osmId = osmElementId(record, properties);
+  if (osmId === null) return null;
+  const anchor = ringAnchor(firstRing(record["geometry"]) ?? []);
+  if (anchor === null) return null;
+
+  const element: OsmBusinessElement = { type: osmType, id: osmId, tags };
+  if (osmType === "node") {
+    element.lat = anchor.lat;
+    element.lon = anchor.lon;
+  } else {
+    element.center = { lat: anchor.lat, lon: anchor.lon };
+  }
+  return element;
+}
+
+function elementAnchor(element: OsmBusinessElement): { lat: number; lon: number } | null {
+  if (element.type === "node" && element.lat !== undefined && element.lon !== undefined) {
+    return { lat: element.lat, lon: element.lon };
+  }
+  if (element.center) return element.center;
+  return null;
+}
+
+function elementsBbox(elements: OsmBusinessElement[]): { west: number; east: number; south: number; north: number } | null {
+  let west = Infinity;
+  let south = Infinity;
+  let east = -Infinity;
+  let north = -Infinity;
+  for (const element of elements) {
+    const anchor = elementAnchor(element);
+    if (!anchor) continue;
+    west = Math.min(west, anchor.lon);
+    east = Math.max(east, anchor.lon);
+    south = Math.min(south, anchor.lat);
+    north = Math.max(north, anchor.lat);
+  }
+  if (!Number.isFinite(west)) return null;
+  return { west, east, south, north };
+}
+
+async function deriveOsmBusinessesFromExtract(
   rawDir: string,
-  opts: Pick<FetchBusinessesOptions, "offline" | "signal">,
 ): Promise<{
   rawFile: OsmRawFile;
   sources: SourceManifestEntry[];
   failures: FailureEntry[];
   counts: Record<string, number>;
 }> {
+  const extractPath = path.join(rawDir, AUCH_DETAIL_SCOPE.osmGeojsonFile);
   const failures: FailureEntry[] = [];
-  const queryText = buildBusinessOverpassQuery();
-  	const maxRetries = 4; // total across endpoints
-	let lastError: unknown;
-	let responseBody: string | null = null;
+  const acquiredAt = new Date().toISOString();
 
-	for (let attempt = 1; attempt <= maxRetries; attempt++) {
-		if (opts.signal?.aborted) break;
-
-		// Cycle through endpoints
-		const endpoint =
-			OVERPASS_ENDPOINTS[(attempt - 1) % OVERPASS_ENDPOINTS.length]!;
-		const url = endpoint;
-
-		try {
-			const result = await cachedFetch(url, {
-				method: "POST",
-				body: `data=${encodeURIComponent(queryText)}`,
-				headers: { "Content-Type": "application/x-www-form-urlencoded" },
-				timeoutMs: 120_000,
-				retries: 0, // outer loop controls all retry attempts
-			});
-
-      if (!result.body.trim()) {
-        throw new Error("Empty response body");
-      }
-
-      // Validate it's Overpass JSON: must have osm3s timestamp
-      let parsed: Record<string, unknown>;
-      try {
-        parsed = JSON.parse(result.body) as Record<string, unknown>;
-      } catch {
-        throw new Error(`Invalid JSON from Overpass: ${result.body.slice(0, 200)}`);
-      }
-
-      const osm3s = parsed["osm3s"] as Record<string, unknown> | undefined;
-      if (!osm3s?.["timestamp_osm_base"]) {
-        throw new Error(
-          `Missing osm3s timestamp in Overpass response. The response is not valid Overpass data`,
-        );
-      }
-
-      responseBody = result.body;
-      break; // success
-    } catch (err: unknown) {
-      lastError = err;
-      const msg = errMsg(err);
-      failures.push({
-        step: `osm-business-query-${attempt}`,
-        source: endpoint,
-        url,
-        error: msg,
-        severity: "warning",
-      });
-
-      if (attempt < maxRetries) {
-        const delay = backoffDelay(attempt, 2_000, 20_000);
-        await sleep(delay);
-      }
-    }
-  }
-
-  if (responseBody === null) {
-    const msg = `All Overpass endpoints failed for business query: ${errMsg(lastError)}`;
+  const unavailable = (status: "missing" | "error", reason: string): {
+    rawFile: OsmRawFile;
+    sources: SourceManifestEntry[];
+    failures: FailureEntry[];
+    counts: Record<string, number>;
+  } => {
     failures.push({
-      step: "osm-business-final",
-      source: "Overpass",
-      error: msg,
+      step: "osm-business-extract",
+      source: OSM_EXTRACT_SOURCE_NAME,
+      error: reason,
       severity: "warning",
     });
-
-    // Write failure record
     const rawFile: OsmRawFile = {
       dataset: "businesses-osm",
-      sourceName: "OpenStreetMap (Overpass API)",
-      sourceUrls: [...OVERPASS_ENDPOINTS],
+      sourceName: OSM_EXTRACT_SOURCE_NAME,
+      sourceUrls: [extractPath],
       license: OSM_LICENSE,
       department: { code: DEPARTMENT_CODE, name: TERRITORY_NAME },
       bbox: { ...BBOX },
-      queryText,
-      acquiredAt: new Date().toISOString(),
+      queryText: OSM_EXTRACT_DERIVATION,
+      acquiredAt,
       elementCount: 0,
-      status: "error",
-      error: msg,
+      status,
+      error: reason,
       sha256: "",
       body: null,
     };
-    return {
-      rawFile,
-      sources: [
-        {
-          source: `Overpass API, businesses`,
-          query: queryText.slice(0, 200),
-          acquiredAt: rawFile.acquiredAt,
-          license: OSM_LICENSE,
-          recordCount: 0,
-          status: "failed",
-          error: msg,
-        },
-      ],
-      failures,
-      counts: { osmBusinessElements: 0 },
+    const source: SourceManifestEntry = {
+      source: "OpenStreetMap (osm-auch-extract), businesses",
+      url: extractPath,
+      query: OSM_EXTRACT_DERIVATION,
+      acquiredAt,
+      license: OSM_LICENSE,
+      recordCount: 0,
+      status: "failed",
+      error: reason,
     };
-  }
-
-  const parsedBody = JSON.parse(responseBody) as Record<string, unknown>;
-  const elements = (parsedBody["elements"] as Array<Record<string, unknown>>) ?? [];
-
-  const rawFile: OsmRawFile = {
-    dataset: "businesses-osm",
-    sourceName: "OpenStreetMap (Overpass API)",
-    sourceUrls: [...OVERPASS_ENDPOINTS],
-    license: OSM_LICENSE,
-    department: { code: DEPARTMENT_CODE, name: TERRITORY_NAME },
-    bbox: { ...BBOX },
-    queryText,
-    acquiredAt: new Date().toISOString(),
-    elementCount: elements.length,
-    status: "ok",
-    sha256: sha256(responseBody),
-    body: parsedBody,
+    return { rawFile, sources: [source], failures, counts: { osmBusinessElements: 0 } };
   };
 
-  // Determine which endpoint succeeded (the last attempt that didn't error)
+  let content: string;
+  try {
+    content = await readFile(extractPath, "utf-8");
+  } catch {
+    return unavailable(
+      "missing",
+      `Auch OSM extract ${extractPath} not found; run fetch-osm.ts --auch before deriving OSM businesses`,
+    );
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(content);
+  } catch (err: unknown) {
+    return unavailable("error", `Auch OSM extract ${extractPath} is not valid JSON: ${errMsg(err)}`);
+  }
+
+  const features = typeof parsed === "object" && parsed !== null && Array.isArray((parsed as Record<string, unknown>)["features"])
+    ? (parsed as { features: unknown[] })["features"]
+    : null;
+  if (features === null) {
+    return unavailable("error", `Auch OSM extract ${extractPath} does not contain a GeoJSON features array`);
+  }
+
+  const elements: OsmBusinessElement[] = [];
+  for (const feature of features) {
+    const element = toOsmBusinessElement(feature);
+    if (element) elements.push(element);
+  }
+
+  const digest = sha256(content);
+  const rawFile: OsmRawFile = {
+    dataset: "businesses-osm",
+    sourceName: OSM_EXTRACT_SOURCE_NAME,
+    sourceUrls: [extractPath],
+    license: OSM_LICENSE,
+    department: { code: DEPARTMENT_CODE, name: TERRITORY_NAME },
+    bbox: elementsBbox(elements) ?? { ...BBOX },
+    queryText: OSM_EXTRACT_DERIVATION,
+    acquiredAt,
+    elementCount: elements.length,
+    status: "ok",
+    sha256: digest,
+    body: { elements },
+  };
+
   const source: SourceManifestEntry = {
-    source: "OpenStreetMap (Overpass API), businesses",
-    url: OVERPASS_ENDPOINTS[0],
-    query: queryText.slice(0, 300),
-    acquiredAt: rawFile.acquiredAt,
+    source: "OpenStreetMap (osm-auch-extract), businesses",
+    url: extractPath,
+    query: OSM_EXTRACT_DERIVATION,
+    acquiredAt,
     license: OSM_LICENSE,
     recordCount: elements.length,
     status: "ok",
-    sha256: rawFile.sha256,
+    sha256: digest,
   };
 
   return {
@@ -1009,14 +988,9 @@ async function acquireOsmBusiness(
   };
 }
 
-// ── Web page acquisition ───────────────────────────────────────────────────
-
-/**
- * Attempt plain HTTP fetch of a business page, fall back to Moli for rendered pages.
- */
 async function acquireWebBusinessPages(
   rawDir: string,
-  opts: Pick<FetchBusinessesOptions, "offline" | "signal">,
+  opts: Pick<FetchBusinessesOptions, "offline" | "signal" | "forceRefresh">,
 ): Promise<{
   rawFile: WebRawFile;
   sources: SourceManifestEntry[];
@@ -1030,7 +1004,6 @@ async function acquireWebBusinessPages(
   for (const target of KNOWN_BUSINESS_TARGETS) {
     if (opts.signal?.aborted) break;
 
-    // ── Try plain HTTP first ──────────────────────────────
     let pageResult: WebPageResult = {
       sourceId: `web:${target.id}`,
       url: target.url,
@@ -1044,24 +1017,22 @@ async function acquireWebBusinessPages(
     try {
       const httpResult = await cachedFetch(target.url, {
         timeoutMs: 20_000,
-        retries: 2,
         maxBytes: 512_000,
+        forceRefresh: opts.forceRefresh,
         headers: { Accept: "text/html,text/plain,*/*" },
       });
 
       pageResult.httpStatus = httpResult.status;
       pageResult.acquiredAt = new Date().toISOString();
 
-      if (httpResult.ok) {
+      if (httpResult.status >= 200 && httpResult.status < 300) {
         pageResult.fetchedVia = "http";
         pageResult.status = "ok";
 
-        // Extract basic metadata from HTML
         const body = httpResult.body;
         const titleMatch = body.match(/<title>([^<]*)<\/title>/i);
         pageResult.title = titleMatch?.[1]?.trim() ?? "";
 
-        // Look for name, address, and phone patterns.
         const nameMatch = body.match(
           /(?:business-name|company-name|h1|org|brand)[^>]*>([^<]{2,80})</i,
         );
@@ -1069,7 +1040,6 @@ async function acquireWebBusinessPages(
           pageResult.name = nameMatch[1]!.trim();
         }
 
-        // Truncated text excerpt
         const textBody = body
           .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, "")
           .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "")
@@ -1082,7 +1052,6 @@ async function acquireWebBusinessPages(
           target.note ?? `HTTP ${httpResult.status}, ${httpResult.body.length} bytes`;
         pageResult.confidence = target.priority === "high" ? "high" : "medium";
 
-        // For PagesJaunes, check for "Nocibé" in content
         if (target.id.startsWith("nocibe") && /Nocib[éèe]/i.test(body)) {
           pageResult.name = "Nocibé";
         }
@@ -1090,18 +1059,15 @@ async function acquireWebBusinessPages(
         pageResult.status = "not-found";
         pageResult.note = `HTTP 404`;
       } else {
-        // A non-ok response may need Moli for client-rendered content.
         pageResult.status = "blocked";
         pageResult.note = `HTTP ${httpResult.status}`;
       }
     } catch (err: unknown) {
-      // Plain HTTP failed: try Moli.
       pageResult.fetchedVia = "none";
       pageResult.status = "error";
       pageResult.note = `HTTP fetch error: ${errMsg(err)}`;
     }
 
-    // ── Fall back to Moli (rendered page) if http failed or blocked ────
     if (
       pageResult.status !== "ok" &&
       pageResult.status !== "not-found" &&
@@ -1114,7 +1080,6 @@ async function acquireWebBusinessPages(
           pageResult.fetchedVia = "moli";
           pageResult.status = "ok";
 
-          // Extract markdown title (first #-heading or first line)
           const lines = moliResult.stdout.split("\n").filter((l) => l.trim());
           pageResult.textTruncated = moliResult.stdout.slice(0, 8_000);
           if (lines.length > 0) {
@@ -1125,7 +1090,6 @@ async function acquireWebBusinessPages(
           pageResult.note = `Moli fetch OK (${moliResult.stdout.length}B)`;
           pageResult.confidence = target.priority === "high" ? "high" : "medium";
         } else {
-          // Moli failed: record the limitation.
           pageResult.fetchedVia = "moli";
           pageResult.status = "crashed";
           pageResult.moliError = moliResult.error ?? `exit ${moliResult.exitCode}`;
@@ -1185,14 +1149,6 @@ async function acquireWebBusinessPages(
   return { rawFile, sources: [source], failures, counts };
 }
 
-// ── Main orchestrator ──────────────────────────────────────────────────────
-
-/**
- * Fetch all business records for Gers and write raw files.
- *
- * @param options  Configuration overrides.
- * @returns Summary with source entries, failures, and counts.
- */
 export async function fetchBusinesses(
   options: FetchBusinessesOptions = {},
 ): Promise<FetchBusinessesResult> {
@@ -1202,13 +1158,12 @@ export async function fetchBusinesses(
 
   await ensureDir(rawDir);
 
-  	const allSources: SourceManifestEntry[] = [];
+	const allSources: SourceManifestEntry[] = [];
 	const allFailures: FailureEntry[] = [];
 	const allCounts: Record<string, number> = {};
 	const rawFiles: string[] = [];
 
 	if (mode === "offline") {
-		// Offline mode: read existing raw files, skip all network.
 		const requiredFiles = [
 			"businesses-sirene.json",
 		];
@@ -1242,7 +1197,6 @@ export async function fetchBusinesses(
 						`Offline mode: required raw file ${p} is missing. Run data:refresh without --offline first.`,
 					);
 				}
-				// Optional file missing: record but do not fail.
 				allFailures.push({
 					step: `offline-missing-${name}`,
 					source: `raw:${name}`,
@@ -1261,26 +1215,28 @@ export async function fetchBusinesses(
 		};
 	}
 
-	// ── 1. SIRENE / Annuaire ─────────────────────────────────
+	const departementScan = options.departement === true;
+	const communeCode = options.communeCode ?? DEFAULT_COMMUNE_CODE;
+  {
+    const result = await acquireSirene(rawDir, {
+      maxSirenePages: options.maxSirenePages ?? 30,
+      signal: options.signal ?? undefined,
+      communeCode,
+      departement: departementScan,
+      forceRefresh: options.forceRefresh,
+    });
+
+    const outPath = path.join(rawDir, "businesses-sirene.json");
+    await writeFile(outPath, JSON.stringify(result.rawFile, null, 2), "utf-8");
+    rawFiles.push(outPath);
+
+    allSources.push(...result.sources);
+    allFailures.push(...result.failures);
+    Object.assign(allCounts, result.counts);
+  }
+
 	{
-		const result = await acquireSirene(rawDir, {
-			maxSirenePages: options.maxSirenePages ?? 30,
-			offline: false,
-			signal: options.signal ?? undefined,
-		});
-
-		const outPath = path.join(rawDir, "businesses-sirene.json");
-		await writeFile(outPath, JSON.stringify(result.rawFile, null, 2), "utf-8");
-		rawFiles.push(outPath);
-
-		allSources.push(...result.sources);
-		allFailures.push(...result.failures);
-		Object.assign(allCounts, result.counts);
-	}
-
-	// ── 2. OSM business records ─────────────────────────────
-	{
-		const result = await acquireOsmBusiness(rawDir, {});
+		const result = await deriveOsmBusinessesFromExtract(rawDir);
 
 		const outPath = path.join(rawDir, "businesses-osm.json");
 		await writeFile(outPath, JSON.stringify(result.rawFile, null, 2), "utf-8");
@@ -1291,9 +1247,8 @@ export async function fetchBusinesses(
 		Object.assign(allCounts, result.counts);
 	}
 
-	// ── 3. Web business pages ───────────────────────────────
 	{
-		const result = await acquireWebBusinessPages(rawDir, {});
+		const result = await acquireWebBusinessPages(rawDir, { signal: options.signal, forceRefresh: options.forceRefresh });
 
 		const outPath = path.join(rawDir, "businesses-web.json");
 		await writeFile(outPath, JSON.stringify(result.rawFile, null, 2), "utf-8");
@@ -1308,7 +1263,6 @@ export async function fetchBusinesses(
   const status: "ok" | "partial" | "failed" =
     totalErrors > 0 ? "failed" : allFailures.length > 0 ? "partial" : "ok";
 
-  // If SIRENE returned no records, the entire acquisition is failed.
   if (!allCounts["sireneRecords"]) {
     allFailures.push({
       step: "final",
@@ -1334,25 +1288,14 @@ export async function fetchBusinesses(
   };
 }
 
-// ── Standalone runner ───────────────────────────────────────────────────────
-
-/**
- * Detect if this module is executed directly (vs imported).
- */
 function isDirectRun(): boolean {
   try {
     const selfPath = fileURLToPath(import.meta.url);
     const arg = process.argv[1];
     return !!arg && path.resolve(arg) === selfPath;
   } catch {
-    // Fallback when import.meta.url is unavailable (CommonJS via tsx)
     const arg = process.argv[1];
-    return (
-      !!arg &&
-      (arg.endsWith("/fetch-businesses.ts") ||
-        arg.endsWith("\\fetch-businesses.ts") ||
-        arg.endsWith("fetch-businesses.js"))
-    );
+    return !!arg && (arg.endsWith("/fetch-businesses.ts") || arg.endsWith("\\fetch-businesses.ts") || arg.endsWith("fetch-businesses.js"));
   }
 }
 
@@ -1360,44 +1303,34 @@ if (isDirectRun()) {
   const argv = process.argv.slice(2);
   const flags = {
     offline: argv.includes("--offline"),
+    departement: argv.includes("--departement"),
+    forceRefresh: argv.includes("--force"),
     dataDir: undefined as string | undefined,
+    communeCode: undefined as string | undefined,
   };
-
   const dataIdx = argv.indexOf("--data-dir");
-  if (dataIdx !== -1 && dataIdx + 1 < argv.length) {
-    flags.dataDir = argv[dataIdx + 1]!;
-  }
-
+  if (dataIdx !== -1 && dataIdx + 1 < argv.length) flags.dataDir = argv[dataIdx + 1]!;
+  const communeIdx = argv.indexOf("--commune");
+  if (communeIdx !== -1 && communeIdx + 1 < argv.length) flags.communeCode = argv[communeIdx + 1]!;
   const maxPagesIdx = argv.indexOf("--max-pages");
-  if (maxPagesIdx !== -1 && maxPagesIdx + 1 < argv.length) {
-    const val = parseInt(argv[maxPagesIdx + 1]!, 10);
-    if (!isNaN(val)) {
-      process.env["_MAX_SIRENE_PAGES"] = String(val);
-    }
-  }
-
+  const maxPagesValue = maxPagesIdx !== -1 && maxPagesIdx + 1 < argv.length ? Number.parseInt(argv[maxPagesIdx + 1]!, 10) : 30;
   fetchBusinesses({
     dataDir: flags.dataDir,
     offline: flags.offline,
-    maxSirenePages: parseInt(process.env["_MAX_SIRENE_PAGES"] ?? "30", 10),
+    maxSirenePages: Number.isFinite(maxPagesValue) ? maxPagesValue : 30,
+    departement: flags.departement,
+    communeCode: flags.communeCode,
+    forceRefresh: flags.forceRefresh,
   })
     .then((result) => {
       console.log(JSON.stringify(result, null, 2));
-      const errorCount = result.failures.filter((f) => f.severity === "error").length;
-      if (errorCount > 0) {
-        process.exit(1);
-      }
-      const warningCount = result.failures.length;
-      if (warningCount > 0) {
-        console.error(
-          `Completed with ${warningCount} warning(s):`,
-          result.failures.map((f) => `  ${f.step}: ${f.error}`).join("\n"),
-        );
-      }
+      const errorCount = result.failures.filter((failure) => failure.severity === "error").length;
+      if (errorCount > 0) process.exit(1);
+      if (result.failures.length > 0) console.error(`Completed with ${result.failures.length} warning(s):`, result.failures.map((failure) => `  ${failure.step}: ${failure.error}`).join("\n"));
       process.exit(0);
     })
-    .catch((err: unknown) => {
-      console.error("Fatal error:", errMsg(err));
+    .catch((error: unknown) => {
+      console.error("Fatal error:", errMsg(error));
       process.exit(1);
     });
 }

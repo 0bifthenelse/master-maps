@@ -15,9 +15,9 @@ const SOURCE_PRIORITY: Record<string, number> = {
   "sirene": 80,
   "annuaire-entreprises": 75,
   "ban": 70,
+  "osm-auch": 65,
   "osm": 60,
   "osm-bulk": 55,
-  "official-website": 90,
   "pagesjaunes": 40,
 };
 
@@ -58,7 +58,32 @@ function sourcePriority(feature: MapFeature): number {
   return SOURCE_PRIORITY[sourceName(feature)] ?? 50;
 }
 
+function hasUsableGeometry(feature: MapFeature): boolean {
+  const geometry = feature.geometry;
+  const hasFiniteCoordinate = (coordinate: readonly number[]): boolean =>
+    coordinate.length >= 2 && Number.isFinite(coordinate[0]) && Number.isFinite(coordinate[1]);
+  const hasLine = (line: readonly (readonly number[])[]): boolean =>
+    line.length >= 2 && line.every(hasFiniteCoordinate);
+  const hasPolygon = (polygon: readonly (readonly (readonly number[])[])[]): boolean =>
+    polygon.length >= 1 && polygon.every((ring) => ring.length >= 4 && ring.every(hasFiniteCoordinate));
+
+  switch (geometry.type) {
+    case "Point":
+      return hasFiniteCoordinate(geometry.coordinates);
+    case "LineString":
+      return hasLine(geometry.coordinates);
+    case "MultiLineString":
+      return geometry.coordinates.length >= 1 && geometry.coordinates.every(hasLine);
+    case "Polygon":
+      return hasPolygon(geometry.coordinates);
+    case "MultiPolygon":
+      return geometry.coordinates.length >= 1 && geometry.coordinates.every(hasPolygon);
+  }
+  return false;
+}
+
 function geometryPriority(feature: MapFeature): number {
+  if (["building", "road", "water"].includes(feature.kind) && sourceName(feature) === "osm-auch" && hasUsableGeometry(feature)) return 110;
   if (["building", "road", "water"].includes(feature.kind) && sourceName(feature) === "IGN BD TOPO") return 100;
   return sourcePriority(feature);
 }
@@ -313,10 +338,22 @@ function mergeGroup(group: MapFeature[]): MapFeature {
     }
   }
   const refs = appendUniqueReferences(group);
-  const geometryWinner = ordered.find((feature) => feature.geometry !== undefined) ?? winner;
+  const geometryWinner = ordered.find(hasUsableGeometry) ?? winner;
   merged.geometry = geometryWinner.geometry;
   merged.localGeometry = geometryWinner.localGeometry;
   merged.sourceGeometry = geometryWinner.sourceGeometry;
+  if (geometryWinner.lon !== undefined) merged.lon = geometryWinner.lon;
+  if (geometryWinner.lat !== undefined) merged.lat = geometryWinner.lat;
+  if (geometryWinner.x !== undefined) merged.x = geometryWinner.x;
+  if (geometryWinner.z !== undefined) merged.z = geometryWinner.z;
+  provenance.push({
+    featureId: winner.stableId,
+    property: "geometry",
+    winner: sourceName(geometryWinner),
+    contenders: [...new Set(group.map(sourceName))],
+    priority: geometryPriority(geometryWinner),
+    timestamp: geometryWinner.sourceRefs[0]?.timestamp ?? new Date().toISOString(),
+  });
   merged.sourceRefs = refs;
   merged.provenance = provenance;
   merged.confidence = group.length > 1 ? "medium" : winner.confidence;

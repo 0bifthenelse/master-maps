@@ -22,7 +22,7 @@ src/
     api/map/
       manifest/route.ts serves /api/map/manifest
       tile/[tileId]/    serves /api/map/tile/{tileId}
-      search/route.ts   serves /api/map/search?q={query}
+      search/route.ts   serves /api/map/search?q={query}&limit={n} bounded results
   lib/
     data/
       schema.ts         Zod schemas and TypeScript types
@@ -51,7 +51,6 @@ src/
     MapCamera.tsx        orthographic camera controller
     MapControls.tsx      pan, zoom, rotate, HJKL navigation
     MapHud.tsx           heads-up overlay
-    SearchPanel.tsx      search with keyboard navigation
     FeatureInspector.tsx selected-feature metadata
     LayerControls.tsx    theme-layer toggles
     SourceAttribution.tsx source and licence footer

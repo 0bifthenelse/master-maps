@@ -2,17 +2,9 @@
 
 import { type CSSProperties, type FormEvent, type ReactNode, useCallback, useRef, useState } from 'react';
 
-/* ------------------------------------------------------------------ */
-/*  Design tokens - prefer CSS custom properties when available        */
-/* ------------------------------------------------------------------ */
-
 const ACCENT = '#ff7d27';
 const INK = '#000000';
 const PAPER = '#ffffff';
-
-/* ------------------------------------------------------------------ */
-/*  Styles                                                             */
-/* ------------------------------------------------------------------ */
 
 const overlay: CSSProperties = {
   position: 'absolute',
@@ -36,7 +28,6 @@ const topBar: CSSProperties = {
   backdropFilter: 'blur(6px)',
   WebkitBackdropFilter: 'blur(6px)',
   borderBottom: `1px solid color-mix(in srgb, ${INK} 10%, transparent)`,
-  /* Keep left-aligned but centred in space */
   justifyContent: 'center',
 };
 
@@ -98,24 +89,13 @@ const linkStyle: CSSProperties = {
   textUnderlineOffset: '2px',
 };
 
-/* ------------------------------------------------------------------ */
-/*  Component                                                          */
-/* ------------------------------------------------------------------ */
-
 export interface MapHudProps {
-  /** Current search query (controlled) */
   query?: string;
-  /** Called when user types in the search field */
   onQueryChange?: (q: string) => void;
-  /** Called when user submits the search (Enter) */
   onSearch?: (q: string) => void;
-  /** Called to reset the map view */
   onResetView?: () => void;
-  /** Search results dropdown renderer */
   results?: ReactNode;
-  /** Additional content for the top bar (e.g. layer toggle button) */
   extra?: ReactNode;
-  /** Data attribution lines */
   attributions?: string[];
 }
 
@@ -145,7 +125,6 @@ export function MapHud({
 
   return (
     <div style={overlay} role="region" aria-label="Carte">
-      {/* ---- Top bar ---- */}
       <div style={topBar}>
         <div style={searchContainer}>
           <form
@@ -186,7 +165,6 @@ export function MapHud({
         </div>
       </div>
 
-      {/* ---- Results dropdown ---- */}
       {results && (
         <div
           style={{
@@ -209,7 +187,6 @@ export function MapHud({
         </div>
       )}
 
-      {/* ---- Attribution footer ---- */}
       {attributions && attributions.length > 0 && (
         <div style={attributionStrip}>
           <span>Sources: </span>
@@ -219,7 +196,6 @@ export function MapHud({
         </div>
       )}
 
-      {/* Default attribution shown when no props passed */}
       {(!attributions || attributions.length === 0) && (
         <div style={attributionStrip}>
           <span>

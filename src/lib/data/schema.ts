@@ -215,6 +215,7 @@ export const RoadFeatureSchema = FeatureBaseSchema.extend({
   layer: z.string().optional(),
   stratum: z.enum(["tunnel", "normal", "bridge"]).optional(),
   oneway: z.boolean().optional(),
+  lanes: z.number().int().positive().optional(),
   lit: z.boolean().optional(),
   sidewalk: z.string().optional(),
 }).strict();

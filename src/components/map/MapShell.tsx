@@ -9,18 +9,17 @@ import SourceAttribution from "@/components/map/SourceAttribution";
 import LoadingState from "@/components/map/LoadingState";
 import WebGPUUnsupported from "@/components/map/WebGPUUnsupported";
 import { publishSceneDiagnostics, sceneMetrics } from "@/lib/scene/sceneMetrics";
-import { searchIndex as runSearchIndex } from "@/lib/data/search";
+import { normalizeSearchText } from "@/lib/data/search";
+import { wgs84ToRender } from "@/lib/geo/crs";
 import { computeLocalFocus, type LocalGeometry } from "@/lib/geo/focus";
 import {
   DatasetManifestSchema,
-  SearchRecordSchema,
-  TileDataSchema,
   type DatasetManifest,
   type FeatureKind,
   type MapFeature,
-  type SearchRecord,
   type TileData,
 } from "@/lib/data/schema";
+import { SearchHitSchema, SEARCH_MIN_QUERY_LENGTH, type SearchHit } from "@/lib/data/searchTypes";
 import { loadTile } from "@/lib/data/loadTile";
 import type { SceneFeature } from "./CityScene";
 
@@ -179,8 +178,9 @@ export default function MapShell() {
   const [layers, setLayers] = useState<LayerState>(DEFAULT_LAYERS);
   const [manifest, setManifest] = useState<DatasetManifest | null>(null);
   const [tiles, setTiles] = useState<Map<string, TileData>>(new Map());
-  const [viewport, setViewport] = useState<ViewportSnapshot | null>(null);
-  const [searchRecords, setSearchRecords] = useState<SearchRecord[]>([]);
+  const [searchHits, setSearchHits] = useState<SearchHit[]>([]);
+  const [searchPending, setSearchPending] = useState(false);
+  const [desiredKey, setDesiredKey] = useState("");
   const [searchQuery, setSearchQuery] = useState("");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -190,10 +190,32 @@ export default function MapShell() {
   const inFlightRef = useRef<Map<string, AbortController>>(new Map());
   const desiredIdsRef = useRef<string[]>([]);
   const desiredGenerationRef = useRef(0);
+  const viewportRef = useRef<ViewportSnapshot | null>(null);
+  const desiredKeyRef = useRef("");
+  const searchAbortRef = useRef<AbortController | null>(null);
+  const searchGenerationRef = useRef(0);
+
+  const syncDesiredTiles = useCallback((source: DatasetManifest, snapshot: ViewportSnapshot | null): void => {
+    const ids = visibleTileIds(source, snapshot);
+    desiredIdsRef.current = ids;
+    const key = ids.join("|");
+    if (key === desiredKeyRef.current) return;
+    desiredKeyRef.current = key;
+    setDesiredKey(key);
+  }, []);
+
+  const handleViewportChange = useCallback((snapshot: ViewportSnapshot): void => {
+    viewportRef.current = snapshot;
+    if (manifest) syncDesiredTiles(manifest, snapshot);
+  }, [manifest, syncDesiredTiles]);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
-    try { window.localStorage.setItem(LS_THEME_KEY, theme); } catch { /* storage is optional */ }
+    try {
+      window.localStorage.setItem(LS_THEME_KEY, theme);
+    } catch {
+      return;
+    }
   }, [theme]);
 
   useEffect(() => {
@@ -204,13 +226,8 @@ export default function MapShell() {
         const manifestResponse = await fetch("/api/map/manifest", { signal: controller.signal, headers: { Accept: "application/json" } });
         if (!manifestResponse.ok) throw new Error(`Manifest load failed: ${manifestResponse.status}`);
         const parsedManifest = DatasetManifestSchema.parse(await manifestResponse.json() as unknown);
-        const searchResponse = await fetch("/api/map/search", { signal: controller.signal, headers: { Accept: "application/json" } });
-        if (!searchResponse.ok) throw new Error(`Search index load failed: ${searchResponse.status}`);
-        const body = await searchResponse.json() as unknown;
-        if (!Array.isArray(body)) throw new Error("Search index response is not an array");
-        const records = body.map((entry) => SearchRecordSchema.parse(entry));
         setManifest(parsedManifest);
-        setSearchRecords(records);
+        syncDesiredTiles(parsedManifest, viewportRef.current);
         setWebGpuStatus(typeof navigator !== "undefined" && navigator.gpu ? "supported" : "unsupported");
         setLoading(false);
       } catch (cause) {
@@ -221,13 +238,45 @@ export default function MapShell() {
     };
     void loadMetadata();
     return () => controller.abort();
+  }, [syncDesiredTiles]);
+
+  const runSearch = useCallback(async (query: string): Promise<void> => {
+    searchGenerationRef.current += 1;
+    const generation = searchGenerationRef.current;
+    searchAbortRef.current?.abort();
+    searchAbortRef.current = null;
+    const normalizedQuery = normalizeSearchText(query);
+    if (normalizedQuery.length < SEARCH_MIN_QUERY_LENGTH) {
+      setSearchHits([]);
+      setSearchPending(false);
+      return;
+    }
+    const controller = new AbortController();
+    searchAbortRef.current = controller;
+    setSearchPending(true);
+    try {
+      const response = await fetch(`/api/map/search?q=${encodeURIComponent(query)}&limit=10`, { signal: controller.signal, headers: { Accept: "application/json" } });
+      if (!response.ok) throw new Error(`Search request failed: ${response.status}`);
+      const hits = SearchHitSchema.array().parse((await response.json()) as unknown);
+      if (searchGenerationRef.current !== generation) return;
+      setSearchHits(hits);
+    } catch (cause) {
+      if (searchGenerationRef.current !== generation || isAbortError(cause)) return;
+      console.warn("Search request failed", cause);
+    } finally {
+      if (searchGenerationRef.current === generation) {
+        setSearchPending(false);
+        if (searchAbortRef.current === controller) searchAbortRef.current = null;
+      }
+    }
   }, []);
 
-  const desiredIds = useMemo(() => manifest ? visibleTileIds(manifest, viewport) : [], [manifest, viewport]);
-  const desiredKey = desiredIds.join("|");
   useEffect(() => {
-    desiredIdsRef.current = desiredIds;
-  }, [desiredIds]);
+    const timer = setTimeout(() => void runSearch(searchQuery), 150);
+    return () => clearTimeout(timer);
+  }, [runSearch, searchQuery]);
+
+  useEffect(() => () => searchAbortRef.current?.abort(), []);
 
   useEffect(() => {
     if (!manifest) return;
@@ -252,7 +301,7 @@ export default function MapShell() {
           tileRuntimeDiagnostics().aborted.push(tileId);
         }, { once: true });
         try {
-          const tile = TileDataSchema.parse(await loadTile(tileId, controller.signal));
+          const tile = await loadTile(tileId, controller.signal);
           if (desiredGenerationRef.current === generation && desiredIdsRef.current.includes(tileId)) {
             setTiles((previous) => {
               const next = new Map(previous);
@@ -295,40 +344,40 @@ export default function MapShell() {
     publishSceneDiagnostics(true);
   }, [tiles, error, webGpuStatus]);
 
-  const handleSearchResultSelect = useCallback(async (featureId: string): Promise<void> => {
-    const indexed = searchRecords.find((record) => record.featureId === featureId);
-    if (!indexed) return;
+  const handleSearchResultSelect = useCallback(async (hit: SearchHit): Promise<void> => {
     let raw: MapFeature | undefined;
     for (const tile of tilesRef.current.values()) {
-      raw = tile.features.find((feature) => feature.stableId === featureId);
+      raw = tile.features.find((feature) => feature.stableId === hit.featureId);
       if (raw) break;
     }
     if (!raw) {
-      tileRuntimeDiagnostics().requested.push(indexed.tileId);
+      tileRuntimeDiagnostics().requested.push(hit.tileId);
       try {
-        const tile = TileDataSchema.parse(await loadTile(indexed.tileId));
-        tileRuntimeDiagnostics().loaded.push(indexed.tileId);
+        const tile = await loadTile(hit.tileId);
+        tileRuntimeDiagnostics().loaded.push(hit.tileId);
         setTiles((previous) => {
           const next = new Map(previous).set(tile.manifest.tileId, tile);
           tilesRef.current = next;
           return next;
         });
-        raw = tile.features.find((feature) => feature.stableId === featureId);
+        raw = tile.features.find((feature) => feature.stableId === hit.featureId);
       } catch (cause) {
-        tileRuntimeDiagnostics().failed.push(indexed.tileId);
-        console.warn(`Search tile ${indexed.tileId} load failed`, cause);
+        tileRuntimeDiagnostics().failed.push(hit.tileId);
+        console.warn(`Search tile ${hit.tileId} load failed`, cause);
       }
     }
-    if (!raw) return;
-    const focus = focusFromFeature(raw);
-    if (!focus) return;
-    setSelectedFeature(raw);
-    setCameraFocus({ ...focus, zoom: 80 });
-    if (raw.kind === "business" && /nocibe/i.test(raw.businessName)) setLayers((previous) => ({ ...previous, commercialAudit: true }));
+    const [focusX, focusZ] = wgs84ToRender([hit.focusLon, hit.focusLat]);
+    const fallbackFocus = { x: focusX, z: focusZ };
+    const focus = raw ? focusFromFeature(raw) : fallbackFocus;
+    setCameraFocus({ ...(focus ?? fallbackFocus), zoom: 80 });
+    if (raw) {
+      setSelectedFeature(raw);
+      if (raw.kind === "business" && /nocibe/i.test(raw.businessName)) setLayers((previous) => ({ ...previous, commercialAudit: true }));
+    }
     setSearchQuery("");
-  }, [searchRecords]);
+    setSearchHits([]);
+  }, []);
 
-  const searchResults = useMemo(() => searchQuery.trim() ? runSearchIndex(searchQuery, searchRecords) : [], [searchQuery, searchRecords]);
   const sceneFeatures = useMemo(() => deduplicateSceneFeatures(tiles), [tiles]);
   const hasCriticalError = error !== null && manifest === null;
   const attributionData = useMemo(() => manifest ? {
@@ -349,12 +398,12 @@ export default function MapShell() {
     setCameraReset((counter) => counter + 1);
   }, []);
   const handleCameraMoved = useCallback((): void => setCameraFocus(null), []);
-  const searchResultsNode: ReactNode = searchResults.length > 0 ? (
-    <div role="listbox" aria-label="Résultats de recherche">
-      {searchResults.map(({ record }, index) => (
-        <button key={record.featureId} type="button" role="option" data-testid={`search-result-${record.featureId}`} data-feature-kind={record.kind} aria-selected={index === 0} onClick={() => void handleSearchResultSelect(record.featureId)}>
-          <span>{record.canonicalName}</span>
-          <span>{record.kind}</span>
+  const searchResultsNode: ReactNode = searchHits.length > 0 ? (
+    <div role="listbox" aria-label="Résultats de recherche" aria-busy={searchPending}>
+      {searchHits.map((hit, index) => (
+        <button key={hit.featureId} type="button" role="option" data-testid={`search-result-${hit.featureId}`} data-feature-kind={hit.kind} aria-selected={index === 0} onClick={() => void handleSearchResultSelect(hit)}>
+          <span>{hit.canonicalName}</span>
+          <span>{hit.kind}</span>
         </button>
       ))}
     </div>
@@ -366,12 +415,12 @@ export default function MapShell() {
       {hasCriticalError && !loading ? <div className="map-shell__error"><h2>Impossible de charger la carte</h2><p>{error}</p><code>npm run data:refresh</code></div> : null}
       <div className="map-shell__canvas" style={{ flex: 1, position: "relative", overflow: "hidden" }}>
         {!hasCriticalError && manifest && webGpuStatus === "supported" ? (
-          <WebGPUCityCanvas bounds={manifestBounds(manifest)} cameraFocus={cameraFocus} cameraReset={cameraReset} onCameraMoved={handleCameraMoved} onViewportChange={setViewport}>
+          <WebGPUCityCanvas bounds={manifestBounds(manifest)} cameraFocus={cameraFocus} cameraReset={cameraReset} onCameraMoved={handleCameraMoved} onViewportChange={handleViewportChange}>
             <CityScene features={sceneFeatures} layers={layers} />
           </WebGPUCityCanvas>
         ) : !hasCriticalError && webGpuStatus === "unsupported" ? <WebGPUUnsupported error={sceneMetrics.rendererError} /> : null}
       </div>
-      {!hasCriticalError && !loading ? <MapHud query={searchQuery} onQueryChange={setSearchQuery} onSearch={setSearchQuery} onResetView={resetView} results={searchResultsNode} /> : null}
+      {!hasCriticalError && !loading ? <MapHud query={searchQuery} onQueryChange={setSearchQuery} onSearch={(query) => void runSearch(query)} onResetView={resetView} results={searchResultsNode} /> : null}
       {!hasCriticalError && !loading ? <LayerControls layers={layers} onToggle={handleLayerToggle} onReset={resetView} /> : null}
       {!hasCriticalError && !loading ? <FeatureInspector feature={selectedFeature} onClose={() => setSelectedFeature(null)} /> : null}
       {!hasCriticalError && !loading && attributionData ? <SourceAttribution data={attributionData} /> : null}

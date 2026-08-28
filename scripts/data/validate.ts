@@ -17,6 +17,13 @@ const MAX_HEIGHT_METRES = 100;
 const MAX_TILE_BYTES = 2 * 1024 * 1024;
 const REQUIRED_KINDS = ["boundary", "building", "road", "water", "business", "address"] as const;
 
+export interface ValidationScope {
+  territoryCode: string;
+  boundaryRawFile: string;
+  root?: string;
+  rawDir?: string;
+}
+
 interface ValidationIssue {
   severity: "error" | "warning";
   message: string;
@@ -96,17 +103,16 @@ function sourceIssues(feature: MapFeature): ValidationIssue[] {
   return issues;
 }
 
-function requiredSourceIssues(features: MapFeature[]): ValidationIssue[] {
+function requiredSourceIssues(features: MapFeature[], scope?: ValidationScope): ValidationIssue[] {
   const issues: ValidationIssue[] = [];
   const kinds = new Set(features.map((feature) => feature.kind));
   for (const kind of REQUIRED_KINDS) if (!kinds.has(kind)) issues.push({ severity: "error", message: `required layer ${kind} is absent` });
   for (const kind of ["building", "road", "water"] as const) {
-    const canonical = features.some((feature) => feature.kind === kind && feature.sourceRefs.some((reference) => reference.source === "IGN BD TOPO"));
-    if (!canonical) issues.push({ severity: "error", message: `${kind} has no IGN BD TOPO geometry` });
+    const canonical = features.some((feature) => feature.kind === kind && feature.sourceRefs.some((reference) => reference.source === "IGN BD TOPO" || (scope?.territoryCode === "32013" && reference.source === "osm-auch")));
+    if (!canonical) issues.push({ severity: "error", message: scope === undefined ? `${kind} has no IGN BD TOPO geometry` : `${kind} has no canonical geometry source` });
   }
   return issues;
 }
-
 function tileIdentityIssues(tile: TileManifest, features: MapFeature[]): ValidationIssue[] {
   const issues: ValidationIssue[] = [];
   if (tile.featureCount !== features.length) issues.push({ severity: "error", message: "manifest featureCount does not match payload", tileId: tile.tileId });
@@ -191,16 +197,17 @@ function lodIssues(manifests: TileManifest[]): ValidationIssue[] {
   if (regional > 0 && overview >= regional) issues.push({ severity: "error", message: "LOD2 is not reduced from LOD1" });
   return issues;
 }
-
-export async function validate(generatedDir?: string): Promise<void> {
-  const root = dataRoot();
+export async function validate(generatedDir?: string, scope?: ValidationScope): Promise<void> {
+  const defaultRoot = dataRoot();
+  const root = scope?.root ?? defaultRoot;
+  const rawDir = scope?.rawDir ?? defaultRoot;
   const outputDir = generatedDir ?? path.join(root, "generated");
   const issues: ValidationIssue[] = [];
   const manifest = DatasetManifestSchema.parse(JSON.parse(await fs.readFile(path.join(outputDir, "manifest.json"), "utf8")) as unknown);
-  if (manifest.territoryCode !== GERS_TERRITORY.code || manifest.processingCrs !== GERS_TERRITORY.processingCrs || manifest.interchangeCrs !== GERS_TERRITORY.interchangeCrs) {
+  if (manifest.territoryCode !== (scope?.territoryCode ?? GERS_TERRITORY.code) || manifest.processingCrs !== GERS_TERRITORY.processingCrs || manifest.interchangeCrs !== GERS_TERRITORY.interchangeCrs) {
     issues.push({ severity: "error", message: "dataset manifest territory or CRS contract is incorrect" });
   }
-  const boundaryGeometry = await readBoundaryGeometry(root);
+  const boundaryGeometry = await readBoundaryGeometry(rawDir, scope);
   const boundaryIndex = createBoundaryIndex(boundaryGeometry);
   const loaded = await loadTiles(outputDir);
   issues.push(...loaded.issues);
@@ -210,7 +217,7 @@ export async function validate(generatedDir?: string): Promise<void> {
     issues.push(...sourceIssues(feature));
     if (feature.kind === "road" && feature.localGeometry && ![ "LineString", "MultiLineString", "Polygon", "MultiPolygon" ].includes(feature.localGeometry.type)) issues.push({ severity: "error", message: "road geometry is neither linear nor areal", featureId: feature.stableId });
   }
-  issues.push(...requiredSourceIssues(uniqueFeatures));
+  issues.push(...requiredSourceIssues(uniqueFeatures, scope));
   issues.push(...await validateSearch(root, loaded.manifests));
   issues.push(...lodIssues(loaded.manifests));
   const report = { checkedAt: new Date().toISOString(), featureCount: uniqueFeatures.length, tileCount: loaded.manifests.length, issues };
@@ -221,10 +228,10 @@ export async function validate(generatedDir?: string): Promise<void> {
   if (errors.length > 0) throw new ValidationErrors(issues);
 }
 
-async function readBoundaryGeometry(root: string): Promise<number[][][][]> {
-  const parsed = JSON.parse(await fs.readFile(path.join(root, "raw", GERS_TERRITORY.boundaryRawFile), "utf8")) as { features?: Array<{ geometry?: { type?: string; coordinates?: unknown } }> };
+async function readBoundaryGeometry(root: string, scope?: ValidationScope): Promise<number[][][][]> {
+  const parsed = JSON.parse(await fs.readFile(path.join(root, scope?.boundaryRawFile ?? GERS_TERRITORY.boundaryRawFile), "utf8")) as { features?: Array<{ geometry?: { type?: string; coordinates?: unknown } }> };
   const geometry = parsed.features?.[0]?.geometry;
-  if (!geometry || !Array.isArray(geometry.coordinates)) throw new Error("raw Gers boundary is unavailable");
+  if (!geometry || !Array.isArray(geometry.coordinates)) throw new Error(`raw ${scope?.territoryCode ?? GERS_TERRITORY.name} boundary is unavailable`);
   if (geometry.type === "Polygon") return [geometry.coordinates as number[][][]];
   if (geometry.type === "MultiPolygon") return geometry.coordinates as number[][][][];
   throw new Error(`unsupported boundary geometry ${geometry.type}`);

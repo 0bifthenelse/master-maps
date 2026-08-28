@@ -15,6 +15,12 @@ const MAX_ROUND_TRIP_METRES = 0.05;
 const MAX_NORMALIZED_RESIDUAL_METRES = 0.1;
 const MAX_TILE_RENDER_RESIDUAL_METRES = 0.1;
 
+export interface SpatialQaScope {
+  territoryCode: string;
+  boundaryRawFile: string;
+  root?: string;
+}
+
 type Point = [number, number];
 interface SamplePoint {
   feature: MapFeature;
@@ -176,19 +182,18 @@ function pointOnTileEdge(point: Point, bounds: [number, number, number, number],
 }
 
 
-async function loadIntermediateFeatures(): Promise<MapFeature[]> {
+async function loadIntermediateFeatures(root: string): Promise<MapFeature[]> {
   const result: MapFeature[] = [];
   const ignored = new Set(["provenance.json", "boundary-source.json", "bdtopo-manifest.json", "ign-unavailable.json", "osm-manifest.json", "osm-bulk-manifest.json", "relation-issues.json", "normalization-issues.json"]);
-  for (const entry of await fs.readdir(path.join(ROOT, "intermediate"), { withFileTypes: true })) {
+  for (const entry of await fs.readdir(path.join(root, "intermediate"), { withFileTypes: true })) {
     if (!entry.isFile() || !entry.name.endsWith(".json") || ignored.has(entry.name)) continue;
-    const parsed = JSON.parse(await fs.readFile(path.join(ROOT, "intermediate", entry.name), "utf8")) as unknown;
+    const parsed = JSON.parse(await fs.readFile(path.join(root, "intermediate", entry.name), "utf8")) as unknown;
     if (!Array.isArray(parsed)) continue;
     for (const value of parsed) result.push(MapFeatureSchema.parse(value));
   }
   return result;
 }
-
-async function checkTileFragments(samples: SamplePoint[], featuresById: Map<string, MapFeature>): Promise<{ worst: ErrorRecord | undefined; count: number; fragmentsById: Map<string, number> }> {
+async function checkTileFragments(samples: SamplePoint[], featuresById: Map<string, MapFeature>, root: string): Promise<{ worst: ErrorRecord | undefined; count: number; fragmentsById: Map<string, number> }> {
   const ids = new Set(samples.map((sample) => sample.feature.stableId));
   const fragmentsById = new Map<string, number>();
   let worst: ErrorRecord | undefined;
@@ -198,7 +203,7 @@ async function checkTileFragments(samples: SamplePoint[], featuresById: Map<stri
   if (boundaryPoints.length === 0) throw new Error("Spatial QA cannot derive tile origin without boundary geometry");
   const originX = Math.floor(Math.min(...boundaryPoints.map((point) => point[0])) / 2048) * 2048;
   const originZ = Math.floor(Math.min(...boundaryPoints.map((point) => point[1])) / 2048) * 2048;
-  const tileDir = path.join(ROOT, "generated", "tiles");
+  const tileDir = path.join(root, "generated", "tiles");
   for (const entry of await fs.readdir(tileDir, { withFileTypes: true })) {
     if (!entry.isFile() || !entry.name.startsWith("l0_") || !entry.name.endsWith(".json")) continue;
     const tileId = entry.name.slice(0, -5);
@@ -257,11 +262,12 @@ function rendererDebug(features: MapFeature[]): SpatialReport["rendererInput"] {
   return result;
 }
 
-export async function runSpatialQa(requestedId?: string): Promise<SpatialReport> {
-  const features = await loadIntermediateFeatures();
+export async function runSpatialQa(requestedId?: string, scope?: SpatialQaScope): Promise<SpatialReport> {
+  const root = scope?.root ?? ROOT;
+  const features = await loadIntermediateFeatures(root);
   const uniqueFeatures = [...new Map(features.map((feature) => [feature.stableId, feature])).values()];
   const boundary = uniqueFeatures.find((feature) => feature.kind === "boundary");
-  if (!boundary || (boundary.geometry.type !== "Polygon" && boundary.geometry.type !== "MultiPolygon")) throw new Error("Spatial QA requires the canonical Gers boundary");
+  if (!boundary || (boundary.geometry.type !== "Polygon" && boundary.geometry.type !== "MultiPolygon")) throw new Error(`Spatial QA requires the canonical ${scope?.territoryCode ?? GERS_TERRITORY.name} boundary`);
   const { samples, groups } = selectDistributedSamples(uniqueFeatures);
   if (samples.length < MINIMUM_SAMPLE_COUNT) throw new Error(`Spatial QA sampled only ${samples.length} source vertices`);
   let worstRoundTrip: ErrorRecord | undefined;
@@ -296,12 +302,12 @@ export async function runSpatialQa(requestedId?: string): Promise<SpatialReport>
   if (!worstRoundTrip || worstRoundTrip.metres >= MAX_ROUND_TRIP_METRES) throw new Error(`CRS round-trip threshold exceeded: ${worstRoundTrip?.metres ?? Infinity} metres`);
   if (worstNormalized && worstNormalized.metres >= MAX_NORMALIZED_RESIDUAL_METRES) throw new Error(`Source-to-normalized threshold exceeded: ${worstNormalized.metres} metres`);
   const featuresById = new Map(uniqueFeatures.map((feature) => [feature.stableId, feature]));
-  const fragments = await checkTileFragments(samples, featuresById);
+  const fragments = await checkTileFragments(samples, featuresById, root);
   const sampledFeatureIds = new Set(samples.map((sample) => sample.feature.stableId));
   const rendererInput = rendererDebug(uniqueFeatures.filter((feature) => sampledFeatureIds.has(feature.stableId)).slice(0, 400));
   const report: SpatialReport = {
     checkedAt: new Date().toISOString(),
-    territory: { code: GERS_TERRITORY.code, name: GERS_TERRITORY.name },
+    territory: { code: scope?.territoryCode ?? GERS_TERRITORY.code, name: boundary.name ?? GERS_TERRITORY.name },
     sampledSourceVertices: samples.length,
     sampleGroups: groups,
     worstCrsRoundTripMetres: worstRoundTrip.metres,
@@ -320,10 +326,10 @@ export async function runSpatialQa(requestedId?: string): Promise<SpatialReport>
     if (!feature) throw new Error(`Stable ID not found: ${requestedId}`);
     report.offendingFeature = { stableId: requestedId, sourceGeometry: feature.geometry, localGeometry: feature.localGeometry, tileFragmentCount: fragments.fragmentsById.get(requestedId) ?? 0 };
   }
-  await fs.mkdir(path.join(ROOT, "qa"), { recursive: true });
-  await fs.writeFile(path.join(ROOT, "qa", "spatial-report.json"), JSON.stringify(report, null, 2) + "\n", "utf8");
-  await fs.writeFile(path.join(ROOT, "qa", "scene-geometry-debug.json"), JSON.stringify({ checkedAt: report.checkedAt, rendererInput: report.rendererInput }, null, 2) + "\n", "utf8");
-  console.log(JSON.stringify({ ok: true, report: path.join(ROOT, "qa", "spatial-report.json"), ...report }, null, 2));
+  await fs.mkdir(path.join(root, "qa"), { recursive: true });
+  await fs.writeFile(path.join(root, "qa", "spatial-report.json"), JSON.stringify(report, null, 2) + "\n", "utf8");
+  await fs.writeFile(path.join(root, "qa", "scene-geometry-debug.json"), JSON.stringify({ checkedAt: report.checkedAt, rendererInput: report.rendererInput }, null, 2) + "\n", "utf8");
+  console.log(JSON.stringify({ ok: true, report: path.join(root, "qa", "spatial-report.json"), ...report }, null, 2));
   return report;
 }
 

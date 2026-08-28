@@ -18,7 +18,8 @@
     "data:refresh": "NODE_OPTIONS=--max-old-space-size=12288 tsx scripts/data/refresh.ts",
     "data:validate": "NODE_OPTIONS=--max-old-space-size=12288 tsx scripts/data/validate.ts",
     "data:qa": "NODE_OPTIONS=--max-old-space-size=12288 tsx scripts/data/qa-spatial.ts",
-    "data:build": "NODE_OPTIONS=--max-old-space-size=12288 tsx scripts/data/refresh.ts --offline"
+    "data:build": "NODE_OPTIONS=--max-old-space-size=12288 tsx scripts/data/refresh.ts --offline",
+    "data:verify-cache": "tsx scripts/data/verify-cache.ts"
   },
   "dependencies": {
     "@react-three/drei": "10.7.8",

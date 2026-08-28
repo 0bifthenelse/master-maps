@@ -48,6 +48,7 @@ let cacheByteSize = 0;
 let maxCacheSize = DEFAULT_MAX_CACHE_SIZE_MB * 1024 * 1024;
 let maxTileSize = DEFAULT_MAX_TILE_SIZE_BYTES;
 let maxEntries = DEFAULT_MAX_CACHE_ENTRIES;
+const inFlight = new Map<string, Promise<TileData>>();
 
 export function configureTileLoader(options: { maxCacheSizeMb?: number; maxTileSizeBytes?: number; maxEntries?: number }): void {
   if (options.maxCacheSizeMb !== undefined) maxCacheSize = options.maxCacheSizeMb * 1024 * 1024;
@@ -61,6 +62,7 @@ export function configureTileLoader(options: { maxCacheSizeMb?: number; maxTileS
 
 export function clearTileCache(): void {
   cache?.clear();
+  inFlight.clear();
   cacheByteSize = 0;
 }
 
@@ -86,7 +88,19 @@ export async function loadTile(tileId: string, signal?: AbortSignal): Promise<Ti
   if (!cache) cache = new LruCache<string, CacheEntry>();
   const cached = cache.get(tileId);
   if (cached) return cached.data;
+  const pending = inFlight.get(tileId);
+  if (pending && !(signal?.aborted ?? false)) return pending;
+  const request = fetchTile(tileId, signal);
+  inFlight.set(tileId, request);
+  try {
+    return await request;
+  } finally {
+    if (inFlight.get(tileId) === request) inFlight.delete(tileId);
+  }
+}
 
+async function fetchTile(tileId: string, signal?: AbortSignal): Promise<TileData> {
+  if (!cache) cache = new LruCache<string, CacheEntry>();
   let response: Response;
   try {
     response = await fetch(`/api/map/tile/${encodeURIComponent(tileId)}`, { signal, headers: { Accept: "application/json" } });
