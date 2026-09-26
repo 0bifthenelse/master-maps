@@ -31,7 +31,10 @@ type LanduseScene = Omit<Extract<MapFeature, { kind: "landuse" }>, "geometry"> &
 type PoiScene = Omit<Extract<MapFeature, { kind: "poi" }>, "geometry"> & { geometry: PointGeometry };
 type BusinessScene = Omit<Extract<MapFeature, { kind: "business" }>, "geometry"> & { geometry: PointGeometry };
 type BoundaryScene = Omit<Extract<MapFeature, { kind: "boundary" }>, "geometry"> & { geometry: AreaGeometry };
-export type SceneFeature = BuildingScene | RoadScene | WaterScene | LanduseScene | PoiScene | BusinessScene | BoundaryScene;
+export type TransportScene = Omit<Extract<MapFeature, { kind: "transport" }>, "geometry"> & { geometry: Geometry };
+export type StructureScene = Omit<Extract<MapFeature, { kind: "structure" }>, "geometry"> & { geometry: Geometry };
+export type PlaceScene = Omit<Extract<MapFeature, { kind: "place" }>, "geometry"> & { geometry: Extract<Geometry, { type: "Point" | "Polygon" | "MultiPolygon" }> };
+export type SceneFeature = BuildingScene | RoadScene | WaterScene | LanduseScene | PoiScene | BusinessScene | BoundaryScene | TransportScene | StructureScene | PlaceScene;
 
 export interface CitySceneProps {
   features: SceneFeature[];
@@ -46,6 +49,9 @@ function visible(feature: SceneFeature, layers: Record<string, boolean>): boolea
   if (feature.kind === "water") return layers.water !== false;
   if (feature.kind === "landuse") return layers.landuse !== false;
   if (feature.kind === "boundary") return layers.boundary !== false;
+  if (feature.kind === "transport") return layers.transport !== false;
+  if (feature.kind === "structure") return layers.structures !== false;
+  if (feature.kind === "place") return layers.places !== false;
   return layers.pois !== false;
 }
 

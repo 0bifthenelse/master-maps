@@ -221,6 +221,22 @@ export const RoadFeatureSchema = FeatureBaseSchema.extend({
 }).strict();
 export type RoadFeature = z.infer<typeof RoadFeatureSchema>;
 
+export const StructureFeatureSchema = FeatureBaseSchema.extend({
+  kind: z.literal("structure"),
+  structureType: z.string().min(1),
+  height: FINITE_NUMBER.nonnegative().optional(),
+  heightSource: HeightSourceEnum.optional(),
+}).strict();
+export type StructureFeature = z.infer<typeof StructureFeatureSchema>;
+
+export const PlaceFeatureSchema = FeatureBaseSchema.extend({
+  kind: z.literal("place"),
+  placeType: z.string().min(1),
+  importance: z.number().int().min(1).max(6).optional(),
+  population: z.number().int().nonnegative().optional(),
+}).strict();
+export type PlaceFeature = z.infer<typeof PlaceFeatureSchema>;
+
 export const WaterFeatureSchema = FeatureBaseSchema.extend({
   kind: z.literal("water"),
   waterType: z.string().optional(),
@@ -309,9 +325,11 @@ export const MapFeatureSchema = z.discriminatedUnion("kind", [
   BusinessFeatureSchema,
   AddressFeatureSchema,
   TransportFeatureSchema,
+  StructureFeatureSchema,
+  PlaceFeatureSchema,
 ]);
 export type MapFeature = z.infer<typeof MapFeatureSchema>;
-export const FEATURE_KINDS = ["boundary", "building", "road", "water", "landuse", "poi", "business", "address", "transport"] as const;
+export const FEATURE_KINDS = ["boundary", "building", "road", "water", "landuse", "poi", "business", "address", "transport", "structure", "place"] as const;
 export type FeatureKind = (typeof FEATURE_KINDS)[number];
 
 export const TileManifestSchema = z.object({
@@ -453,3 +471,5 @@ export function isPoiFeature(feature: MapFeature): feature is PoiFeature { retur
 export function isBusinessFeature(feature: MapFeature): feature is BusinessFeature { return feature.kind === "business"; }
 export function isAddressFeature(feature: MapFeature): feature is AddressFeature { return feature.kind === "address"; }
 export function isTransportFeature(feature: MapFeature): feature is TransportFeature { return feature.kind === "transport"; }
+export function isStructureFeature(feature: MapFeature): feature is StructureFeature { return feature.kind === "structure"; }
+export function isPlaceFeature(feature: MapFeature): feature is PlaceFeature { return feature.kind === "place"; }

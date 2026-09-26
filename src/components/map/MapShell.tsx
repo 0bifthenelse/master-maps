@@ -62,7 +62,9 @@ const RENDERABLE_KINDS: Record<FeatureKind, boolean> = {
   poi: true,
   business: true,
   address: false,
-  transport: false,
+  transport: true,
+  structure: true,
+  place: true,
 };
 
 const TILE_LOAD_CONCURRENCY = 8;
@@ -138,6 +140,8 @@ function sceneFeature(feature: MapFeature): SceneFeature | null {
   if (feature.kind === "landuse" && (geometry.type === "Polygon" || geometry.type === "MultiPolygon")) return { ...feature, geometry } as SceneFeature;
   if ((feature.kind === "poi" || feature.kind === "business") && geometry.type === "Point") return { ...feature, geometry } as SceneFeature;
   if (feature.kind === "boundary" && (geometry.type === "Polygon" || geometry.type === "MultiPolygon")) return { ...feature, geometry } as SceneFeature;
+  if (feature.kind === "transport" || feature.kind === "structure") return { ...feature, geometry } as SceneFeature;
+  if (feature.kind === "place" && (geometry.type === "Point" || geometry.type === "Polygon" || geometry.type === "MultiPolygon")) return { ...feature, geometry } as SceneFeature;
   return null;
 }
 
