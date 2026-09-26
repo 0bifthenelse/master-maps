@@ -293,17 +293,14 @@ async function splitOversizedTile(accumulator: TileAccumulator, level: 0 | 1 | 2
   const parsed = JSON.parse(await fs.readFile(path.join(outDir, `${accumulator.tileId}.json`), "utf8")) as unknown;
   if (!Array.isArray(parsed)) throw new Error(`Generated tile ${accumulator.tileId} is not an array`);
   const features = parsed.map((value) => MapFeatureSchema.parse(value));
-  const match = accumulator.tileId.match(new RegExp(`^l${level}_(-?\\d+)_(-?\\d+)`));
-  if (!match) throw new Error(`Invalid generated tile ID ${accumulator.tileId}`);
   const childSize = size / 2;
-  const baseSize = level === 0 ? 2048 : level === 1 ? 8192 : 32768;
   const splitLimit = level === 0 ? DETAILED_TARGET_BYTES : DETAILED_HARD_LIMIT_BYTES;
-  const subdivision = Math.round(Math.log2(baseSize / size)) + 1;
+  const subdivision = Math.round(Math.log2((level === 0 ? 2048 : level === 1 ? 8192 : 32768) / size)) + 1;
   const childAccumulators: TileAccumulator[] = [];
   for (let rowOffset = 0; rowOffset < 2; rowOffset += 1) {
     for (let colOffset = 0; colOffset < 2; colOffset += 1) {
-      const col = Number(match[1]) * 2 + colOffset;
-      const row = Number(match[2]) * 2 + rowOffset;
+      const col = Math.round((accumulator.bounds[0] - originX) / childSize) + colOffset;
+      const row = Math.round((accumulator.bounds[1] - originZ) / childSize) + rowOffset;
       const childId = `${tileId(level, col, row)}_s${subdivision}_${rowOffset}_${colOffset}`;
       const childBounds = tileBounds(childSize, col, row, originX, originZ);
       const childFeatures = features.flatMap((feature) => {

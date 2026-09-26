@@ -200,7 +200,7 @@ function lodIssues(manifests: TileManifest[]): ValidationIssue[] {
 export async function validate(generatedDir?: string, scope?: ValidationScope): Promise<void> {
   const defaultRoot = dataRoot();
   const root = scope?.root ?? defaultRoot;
-  const rawDir = scope?.rawDir ?? defaultRoot;
+  const rawDir = scope?.rawDir ?? path.join(defaultRoot, "raw");
   const outputDir = generatedDir ?? path.join(root, "generated");
   const issues: ValidationIssue[] = [];
   const manifest = DatasetManifestSchema.parse(JSON.parse(await fs.readFile(path.join(outputDir, "manifest.json"), "utf8")) as unknown);
