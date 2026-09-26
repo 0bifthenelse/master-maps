@@ -8,6 +8,7 @@ import {
   deduplicateFeatures,
   DEDUP_TEMP_ROOT,
   type DedupAccounting,
+  DEDUP_REACH_CELLS,
 } from "../../scripts/data/deduplicate";
 import { MapFeatureSchema, type Geometry, type MapFeature } from "@/lib/data/schema";
 import { DROP_REASONS, STAGES, type ExclusionReason, type SourceLayerAccounting } from "../../scripts/data/exclusion-report";
@@ -276,6 +277,58 @@ describe("scan band replication safety", () => {
     const east = feature("building", "ign-bdtopo:building/200", "IGN BD TOPO", square(1, minZ - 1, 19, minZ + 17), centred(0, minZ - 2, 20, minZ + 18));
     const streamed = await expectEquivalent([west, east]);
     expect(streamed).toHaveLength(1);
+  });
+});
+
+describe("retirement horizon reaches every candidate the merge predicate can accept", () => {
+  it("derives the horizon from the widest gate and the 3x3 cell neighbourhood", () => {
+    const widestGate = 150;
+    const bucketMetres = 100;
+    const widestGateCells = Math.ceil(widestGate / bucketMetres);
+    const neighbourhoodRadius = 1;
+    const reach = Math.max(widestGateCells, neighbourhoodRadius);
+    expect(DEDUP_REACH_CELLS).toBe(reach);
+  });
+
+  it("merges a dz plus one partner that arrives exactly on the retirement horizon", async () => {
+    const south = feature("business", "business:siret/300", "sirene", { type: "Point", coordinates: [10, 10] }, { x: 10, z: 10, businessName: "Boulangerie", address: "1 Rue A" });
+    const north = feature("business", "business:osm/node/300", "osm", { type: "Point", coordinates: [10, 110] }, { x: 10, z: 110, businessName: "Boulangerie", address: "1 Rue A" });
+    expect(Math.floor(10 / 100)).toBe(0);
+    expect(Math.floor(110 / 100)).toBe(1);
+    const streamed = await expectEquivalent([south, north]);
+    expect(streamed).toHaveLength(1);
+    expect(streamed[0]?.stableId).toBe("business:siret/300");
+  });
+
+  it("merges a cross band pair whose second member sits one cell past the band edge", async () => {
+    const south = feature("business", "business:siret/310", "sirene", { type: "Point", coordinates: [10, 350] }, { x: 10, z: 350, businessName: "Boulangerie", address: "1 Rue A" });
+    const north = feature("business", "business:osm/node/310", "osm", { type: "Point", coordinates: [10, 450] }, { x: 10, z: 450, businessName: "Boulangerie", address: "1 Rue A" });
+    expect(Math.floor(350 / 100)).toBe(3);
+    expect(Math.floor(450 / 100)).toBe(4);
+    expect(Math.floor(350 / 400)).toBe(0);
+    expect(Math.floor(450 / 400)).toBe(1);
+    const streamed = await expectEquivalent([south, north]);
+    expect(streamed).toHaveLength(1);
+    expect(streamed[0]?.stableId).toBe("business:siret/310");
+  });
+
+  it("emits every group that no later candidate can reach", async () => {
+    const features: MapFeature[] = [];
+    for (let index = 0; index < 6; index += 1) {
+      const minZ = index * 5 * 100;
+      features.push(feature("building", `osm:way/320/${index}`, "osm", square(0, minZ, 20, minZ + 20), centred(0, minZ, 20, minZ + 20)));
+    }
+    const streamed = await expectEquivalent(features);
+    expect(streamed).toHaveLength(6);
+    expect(streamed.map((item) => item.stableId).sort()).toEqual(features.map((item) => item.stableId).sort());
+  });
+
+  it("books an identity repeat that is scanned long after its group retired as an exact identity merge", async () => {
+    const first = feature("building", "osm:way/330", "osm", square(0, 0, 20, 20), centred(0, 0, 20, 20));
+    const repeat = feature("building", "osm:way/330", "osm", square(0, 900, 20, 920), centred(0, 900, 20, 920));
+    const streamed = await expectEquivalent([first, repeat]);
+    expect(streamed).toHaveLength(1);
+    expect(streamed[0]?.sourceRefs).toHaveLength(1);
   });
 });
 

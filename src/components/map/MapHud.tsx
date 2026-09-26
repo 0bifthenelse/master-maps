@@ -241,16 +241,17 @@ export function MapHud({
             style={{
               pointerEvents: 'auto',
               position: 'absolute',
-              top: '82px',
+              top: '100%',
               left: '50%',
               transform: 'translateX(-50%)',
               width: '100%',
               maxWidth: '480px',
+              maxHeight: 'calc(60vh - 6rem)',
+              overflowY: 'auto',
               background: PAPER,
               border: `1px solid color-mix(in srgb, ${INK} 12%, transparent)`,
               borderRadius: '0 0 2px 2px',
               boxShadow: '0 4px 12px color-mix(in srgb, var(--color-ink, #000) 12%, transparent)',
-              overflow: 'hidden',
               zIndex: 10,
             }}
           >

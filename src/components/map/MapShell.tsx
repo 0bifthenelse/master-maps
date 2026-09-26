@@ -289,12 +289,22 @@ export default function MapShell() {
       const current = (): boolean => desiredGenerationRef.current === generation && desiredIdsRef.current.includes(tileId);
       try {
         const decoded = await loadRenderTile(tileId, controller.signal);
-        if (!current()) return;
+        if (!current()) {
+          tileRuntimeDiagnostics().aborted.push(tileId);
+          return;
+        }
         putDecodedTile(decoded);
         tileRuntimeDiagnostics().loaded.push(tileId);
         applyTileState((previous) => mergeTileSlot(previous, decoded));
       } catch (cause) {
-        if (isAbortError(cause) || !current()) return;
+        if (isAbortError(cause)) {
+          tileRuntimeDiagnostics().aborted.push(tileId);
+          return;
+        }
+        if (!current()) {
+          tileRuntimeDiagnostics().aborted.push(tileId);
+          return;
+        }
         showTileFailureRef.current = true;
         tileRuntimeDiagnostics().failed.push(tileId);
         console.warn(`Tile ${tileId} fetch failed`, cause);
@@ -478,8 +488,11 @@ export default function MapShell() {
   const handleCameraMoved = useCallback((): void => setCameraFocus(null), []);
   const searchResultsNode: ReactNode = searchHits.length > 0 ? (
     <div role="listbox" aria-label="Résultats de recherche" aria-busy={searchPending}>
-      {searchHits.map((hit, index) => (
-        <button key={hit.featureId} type="button" role="option" data-testid={`search-result-${hit.featureId}`} data-feature-kind={hit.kind} aria-selected={index === 0} onClick={() => void handleSearchResultSelect(hit)}>
+      <p role="status" aria-live="polite" style={{ margin: 0, padding: "0.35rem 0.6rem", fontSize: "0.7rem", opacity: 0.7 }}>
+        {searchPending ? "Recherche en cours" : `${searchHits.length} résultat${searchHits.length > 1 ? "s" : ""}`}
+      </p>
+      {searchHits.map((hit) => (
+        <button key={hit.featureId} type="button" role="option" data-testid={`search-result-${hit.featureId}`} data-feature-kind={hit.kind} aria-selected={false} onClick={() => void handleSearchResultSelect(hit)}>
           <span>{hit.canonicalName}</span>
           <span>{hit.kind}</span>
         </button>

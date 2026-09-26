@@ -118,6 +118,19 @@ export function SourceAttribution({ data }: SourceAttributionProps) {
           gap: 4px 12px;
         }
 
+        @media (max-width: 30rem) {
+          .source-attribution {
+            font-size: 0.625rem;
+            line-height: 1.35;
+            max-height: 4.5rem;
+            overflow-y: auto;
+          }
+
+          .attribution-sources {
+            overflow-wrap: anywhere;
+          }
+        }
+
         .attribution-sources,
         .attribution-osm,
         .attribution-licenses,

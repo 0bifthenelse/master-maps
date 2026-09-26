@@ -251,9 +251,9 @@ a:hover {
 /* Layer panel: bottom left, above the attribution */
 .map-shell .layer-controls-panel {
   position: absolute;
-  z-index: 20;
+  z-index: 21;
   left: var(--hud-gap);
-  bottom: calc(var(--hud-gap) + 2.75rem);
+  bottom: calc(var(--hud-gap) + 5.5rem);
   max-width: min(20rem, calc(100vw - 2 * var(--hud-gap)));
   max-height: calc(100vh - 12rem);
   overflow-y: auto;

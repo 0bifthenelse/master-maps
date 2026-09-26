@@ -1623,10 +1623,13 @@ function normalizeIgn(raw: { features: Record<string, unknown>[]; unavailable: b
   return result;
 }
 
-async function writeNormalizedFeatures(outDir: string, writer: FeatureChunkWriter): Promise<void> {
+async function clearStaleIntermediateFiles(outDir: string): Promise<void> {
   for (const entry of await fs.readdir(outDir, { withFileTypes: true })) {
     if (entry.isFile() && entry.name.endsWith(".json") && !PRESERVED_INTERMEDIATE_FILES.has(entry.name)) await fs.unlink(path.join(outDir, entry.name));
   }
+}
+
+async function writeNormalizedFeatures(outDir: string, writer: FeatureChunkWriter): Promise<void> {
   await writer.close();
   const pending: ProvenanceRecord[] = [];
   for (const kind of writer.kinds()) {
@@ -1666,6 +1669,7 @@ export async function normalizeAll(rawDir?: string, outDir?: string, scope?: Nor
   await fs.writeFile(path.join(destinationDir, "relation-issues.json"), `${JSON.stringify(osmResult.relationIssues, null, 2)}\n`, "utf8");
   logPhase("sources ready", rss);
 
+  await clearStaleIntermediateFiles(destinationDir);
   const writer = new FeatureChunkWriter(destinationDir);
   const invalidFeatures: Array<{ stableId: string; kind: string; error: string }> = [];
   let invalidTruncated = false;

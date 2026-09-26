@@ -83,10 +83,41 @@ const KIND_FIELDS: Readonly<Record<string, ReadonlySet<string>>> = {
   landuse: new Set(["landuseType", "area"]),
   poi: new Set(["poiType", "category", "website", "phone", "openingHours", "wheelchair", "operator"]),
   business: new Set(["businessName", "poiType", "category", "siret", "siren", "businessId", "brand", "legalName", "website", "phone", "openingHours", "operator", "wheelchair", "nafCode", "nafLabel", "administrativeStatus", "creationDate"]),
+  address: new Set(["street", "housenumber", "postcode", "city", "source", "banId"]),
   transport: new Set(["transportType", "line", "route", "network", "operator", "ref", "publicTransport", "wheelchair"]),
   structure: new Set(["structureType", "height", "heightSource"]),
   place: new Set(["placeType", "importance", "population"]),
 };
+
+function parseFeatureRecords(text: string): MapFeature[] {
+  const records: MapFeature[] = [];
+  let depth = 0;
+  let start = -1;
+  let inString = false;
+  let escaped = false;
+  for (let index = 0; index < text.length; index += 1) {
+    const character = text.charCodeAt(index);
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (character === 92) escaped = true;
+      else if (character === 34) inString = false;
+      continue;
+    }
+    if (character === 34) inString = true;
+    else if (character === 123) {
+      if (depth === 0) start = index;
+      depth += 1;
+    } else if (character === 125) {
+      depth -= 1;
+      if (depth === 0 && start >= 0) {
+        records.push(JSON.parse(text.slice(start, index + 1)) as MapFeature);
+        start = -1;
+      }
+    }
+  }
+  if (depth !== 0 || start >= 0) throw new SyntaxError("unterminated JSON record in intermediate feature file");
+  return records;
+}
 
 function dataRoot(): string { return process.env.MASTER_MAPS_DATA_DIR ?? "data"; }
 
@@ -383,44 +414,36 @@ function clipLineToBounds(line: Point[], bounds: Bounds, bleed: number): Point[]
     const last = current[current.length - 1];
     if (last === undefined || last[0] !== x || last[1] !== z) current.push([x, z]);
   };
-  let previousInside: boolean | undefined;
-  let previousX = 0;
-  let previousZ = 0;
-  for (let index = 0; index < line.length; index += 1) {
-    const point = line[index]!;
-    const inside = point[0] >= minX && point[0] <= maxX && point[1] >= minZ && point[1] <= maxZ;
-    if (index > 0 && inside !== previousInside) {
-      const directionX = point[0] - previousX;
-      const directionZ = point[1] - previousZ;
-      let from = 0;
-      let to = 1;
-      if (directionX !== 0) {
-        const first = (minX - previousX) / directionX;
-        const second = (maxX - previousX) / directionX;
-        from = Math.max(from, Math.min(first, second));
-        to = Math.min(to, Math.max(first, second));
-      }
-      if (directionZ !== 0) {
-        const first = (minZ - previousZ) / directionZ;
-        const second = (maxZ - previousZ) / directionZ;
-        from = Math.max(from, Math.min(first, second));
-        to = Math.min(to, Math.max(first, second));
-      }
-      if (inside) {
-        pushDistinct(previousX + directionX * from, previousZ + directionZ * from);
-        current.push(point);
-      } else {
-        pushDistinct(previousX + directionX * to, previousZ + directionZ * to);
-        flush();
-      }
-    } else if (index > 0 && inside) {
-      current.push(point);
-    } else if (index > 0) {
-      flush();
+  for (let index = 1; index < line.length; index += 1) {
+    const start = line[index - 1]!;
+    const end = line[index]!;
+    const directionX = end[0] - start[0];
+    const directionZ = end[1] - start[1];
+    let from = 0;
+    let to = 1;
+    if (directionX !== 0) {
+      const first = (minX - start[0]) / directionX;
+      const second = (maxX - start[0]) / directionX;
+      from = Math.max(from, Math.min(first, second));
+      to = Math.min(to, Math.max(first, second));
     }
-    previousInside = inside;
-    previousX = point[0];
-    previousZ = point[1];
+    if (directionZ !== 0) {
+      const first = (minZ - start[1]) / directionZ;
+      const second = (maxZ - start[1]) / directionZ;
+      from = Math.max(from, Math.min(first, second));
+      to = Math.min(to, Math.max(first, second));
+    }
+    if (to - from <= 1e-10) continue;
+    if (from > 0) pushDistinct(start[0] + directionX * from, start[1] + directionZ * from);
+    else pushDistinct(start[0], start[1]);
+    const leaveX = start[0] + directionX * to;
+    const leaveZ = start[1] + directionZ * to;
+    if (to < 1) {
+      current.push([leaveX, leaveZ]);
+      flush();
+    } else {
+      current.push(end);
+    }
   }
   flush();
   return output;
@@ -670,7 +693,9 @@ async function mergeTileJsonArrays(target: string, parts: string[]): Promise<voi
     const heads: Array<{ iterator: AsyncIterator<string>; pending: string | undefined }> = [];
     for (const part of parts) {
       const iterator = createReadStream(part, { encoding: "utf8", highWaterMark: 1 << 20 })[Symbol.asyncIterator]();
-      heads.push({ iterator, pending: (await iterator.next()).value as string | undefined });
+      let pending = (await iterator.next()).value as string | undefined;
+      if (pending !== undefined && (pending.startsWith("[\n") || pending === "[")) pending = pending.slice(1);
+      heads.push({ iterator, pending });
     }
     let written = 0;
     for (;;) {
@@ -680,7 +705,8 @@ async function mergeTileJsonArrays(target: string, parts: string[]): Promise<voi
         if (best === undefined || head.pending < best.pending!) best = head;
       }
       if (best === undefined) break;
-      await handle.write(written === 0 ? `\n${best.pending}` : `,\n${best.pending}`);
+      const value = best.pending.replace(/\n\]\n?$/, "");
+      await handle.write(written === 0 ? `\n${value}` : `,\n${value}`);
       written += 1;
       const next = await best.iterator.next();
       best.pending = next.done === true ? undefined : (next.value as string);
@@ -795,48 +821,36 @@ async function streamLevel(context: BuildContext, files: string[], level: 0 | 1 
   for (const file of files) {
     const lines = createInterface({ input: createReadStream(file, { encoding: "utf8", highWaterMark: 1 << 20 }), crlfDelay: Number.POSITIVE_INFINITY });
     for await (const line of lines) {
-      const first = line.indexOf("{");
-      if (first < 0) continue;
-      const text = line.slice(first);
-      const parsed = JSON.parse(text.endsWith(",") ? text.slice(0, -1) : text) as MapFeature;
-      pass.featuresRead += 1;
-      if (AUDIT_EVERY > 0 && pass.featuresRead % AUDIT_EVERY === 0) {
-        context.cheapChecked += 1;
-        const problem = structuralCheck(parsed);
-        if (problem !== undefined) {
-          context.cheapFailures += 1;
-          if (context.auditFailures.length < 20) context.auditFailures.push(`${file}: ${problem}`);
+      for (const parsed of parseFeatureRecords(line)) {
+        pass.featuresRead += 1;
+        if (AUDIT_EVERY > 0 && pass.featuresRead % AUDIT_EVERY === 0) {
+          context.cheapChecked += 1;
+          const problem = structuralCheck(parsed);
+          if (problem !== undefined) {
+            context.cheapFailures += 1;
+            if (context.auditFailures.length < 20) context.auditFailures.push(`${file}: ${problem}`);
+          }
         }
-      }
-      const feature = generalizedFeature(parsed, level);
-      if (feature === null) continue;
-      const geometry = featureGeometry(feature);
-      if (geometry === undefined) continue;
-      const bounds = geometryBounds(geometry);
-      if (!Number.isFinite(bounds[0])) continue;
-      const bleed = level === 0 && (feature.kind === "road" || feature.kind === "water") && (geometry.type === "LineString" || geometry.type === "MultiLineString") ? roadWidth(feature) / 2 + 1 : 0;
-      const minCol = Math.floor((bounds[0] - bleed - originX) / size);
-      const maxCol = Math.floor((bounds[2] + bleed - originX) / size);
-      const minRow = Math.floor((bounds[1] - bleed - originZ) / size);
-      const maxRow = Math.floor((bounds[3] + bleed - originZ) / size);
-      if (minCol === maxCol && minRow === maxRow) {
-        const id = tileId(level, minCol, minRow);
-        const fragment = featureFragment(feature, tileBounds(size, minCol, minRow, originX, originZ), id, level, new Map<number, string>());
-        if (fragment !== null) {
+        const feature = generalizedFeature(parsed, level);
+        if (feature === null) continue;
+        const geometry = featureGeometry(feature);
+        if (geometry === undefined) continue;
+        const bounds = geometryBounds(geometry);
+        if (!Number.isFinite(bounds[0])) continue;
+        const bleed = level === 0 && (feature.kind === "road" || feature.kind === "water") && (geometry.type === "LineString" || geometry.type === "MultiLineString") ? roadWidth(feature) / 2 + 1 : 0;
+        const minCol = Math.floor((bounds[0] - bleed - originX) / size);
+        const maxCol = Math.floor((bounds[2] + bleed - originX) / size);
+        const minRow = Math.floor((bounds[1] - bleed - originZ) / size);
+        const maxRow = Math.floor((bounds[3] + bleed - originZ) / size);
+        const memo = new Map<number, string>();
+        for (let row = minRow; row <= maxRow; row += 1) for (let col = minCol; col <= maxCol; col += 1) {
+          const id = tileId(level, col, row);
+          const fragment = featureFragment(feature, tileBounds(size, col, row, originX, originZ), id, level, memo);
+          if (fragment === null) continue;
           const bucket = open.get(id);
           if (bucket === undefined) open.set(id, [fragment]);
           else bucket.push(fragment);
         }
-        continue;
-      }
-      const memo = new Map<number, string>();
-      for (let row = minRow; row <= maxRow; row += 1) for (let col = minCol; col <= maxCol; col += 1) {
-        const id = tileId(level, col, row);
-        const fragment = featureFragment(feature, tileBounds(size, col, row, originX, originZ), id, level, memo);
-        if (fragment === null) continue;
-        const bucket = open.get(id);
-        if (bucket === undefined) open.set(id, [fragment]);
-        else bucket.push(fragment);
       }
     }
     if (open.size >= PASS_BATCH_TILES) await flushOpenTiles(pass, level, size, originX, originZ, entries);

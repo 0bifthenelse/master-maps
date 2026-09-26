@@ -20,6 +20,7 @@ const BUCKET_SIZE_METRES = 100;
 
 const OUTPUT_CHUNK_SIZE = 20_000;
 const SCAN_BAND_CELLS = 4;
+export const DEDUP_REACH_CELLS = 2;
 const TEMP_PREFIX = "master-maps-dedup-";
 const LINE_MATCH_DISTANCE_METRES = 4;
 const BUILDING_MIN_IOU = 0.35;
@@ -533,7 +534,7 @@ async function listFeatureFiles(dir: string): Promise<string[]> {
 interface LiveGroup {
   features: MapFeature[];
   cells: Set<string>;
-  retireOrder: number;
+  retireRow: number;
 }
 
 export interface DedupStreamStats {
@@ -567,7 +568,7 @@ function moveFile(from: string, to: string): Promise<void> {
 }
 
 class BandSpool {
-  private readonly handles = new Map<number, fs.FileHandle>();
+  private readonly appenders = new Map<number, fs.FileHandle>();
   private readonly buffers = new Map<number, string>();
 
   constructor(private readonly dir: string, private readonly openLimit = 48) {}
@@ -583,16 +584,16 @@ class BandSpool {
 
   private async write(band: number, payload: string): Promise<void> {
     this.buffers.set(band, "");
-    let handle = this.handles.get(band);
+    let handle = this.appenders.get(band);
     if (handle === undefined) {
-      if (this.handles.size >= this.openLimit) {
-        const [oldest] = this.handles.keys();
-        const stale = oldest === undefined ? undefined : this.handles.get(oldest);
-        if (oldest !== undefined) this.handles.delete(oldest);
+      if (this.appenders.size >= this.openLimit) {
+        const [oldest] = this.appenders.keys();
+        const stale = oldest === undefined ? undefined : this.appenders.get(oldest);
+        if (oldest !== undefined) this.appenders.delete(oldest);
         if (stale !== undefined) await stale.close();
       }
-      handle = await fs.open(path.join(this.dir, `band-${band}.ndjson`), "w");
-      this.handles.set(band, handle);
+      handle = await fs.open(path.join(this.dir, `band-${band}.ndjson`), "a");
+      this.appenders.set(band, handle);
     }
     await handle.write(payload);
   }
@@ -602,8 +603,8 @@ class BandSpool {
       if (buffer.length > 0) await this.write(band, buffer);
     }
     this.buffers.clear();
-    for (const handle of this.handles.values()) await handle.close();
-    this.handles.clear();
+    for (const handle of this.appenders.values()) await handle.close();
+    this.appenders.clear();
   }
 }
 
@@ -731,8 +732,8 @@ async function runScan(
   workDir: string
 ): Promise<DedupStreamStats> {
   const accounted = new Map<string, number>();
+  const reachById = new Map<string, number>();
   const spool = new BandSpool(workDir);
-  let unanchoredCount = 0;
   let total = 0;
   let inputBytes = 0;
   let minCellX = Infinity;
@@ -748,8 +749,9 @@ async function runScan(
         total += 1;
         inputBytes += raw.length;
         const cell = cellOf(feature);
+        const identity = feature.stableId;
         if (cell === null) {
-          unanchoredCount += 1;
+          reachById.set(identity, Number.MAX_SAFE_INTEGER);
           await spool.append(Number.MAX_SAFE_INTEGER, `${raw}\n`);
           continue;
         }
@@ -757,6 +759,8 @@ async function runScan(
         if (cell[0] > maxCellX) maxCellX = cell[0];
         if (cell[1] < minCellZ) minCellZ = cell[1];
         if (cell[1] > maxCellZ) maxCellZ = cell[1];
+        const known = reachById.get(identity);
+        if (known === undefined || cell[1] > known) reachById.set(identity, cell[1]);
         await spool.append(Math.floor(cell[1] / SCAN_BAND_CELLS), `${total}\t${cell[0]}\t${cell[1]}\t${raw}\n`);
       }
     }
@@ -766,7 +770,11 @@ async function runScan(
 
   const width = Number.isFinite(minCellX) ? maxCellX - minCellX + 1 : 1;
   const depth = Number.isFinite(minCellZ) ? maxCellZ - minCellZ + 1 : 1;
-  const retire = unanchoredCount > 0 ? width + 1 : 0;
+  const retireRowFor = (identity: string, cellZ: number): number => {
+    const reach = reachById.get(identity) ?? cellZ;
+    if (reach >= Number.MAX_SAFE_INTEGER) return Number.MAX_SAFE_INTEGER;
+    return reach + DEDUP_REACH_CELLS;
+  };
 
   for (const entry of await fs.readdir(outDir, { withFileTypes: true })) {
     if (entry.isFile() && entry.name.endsWith(".json") && !DEDUP_PRESERVED_SIDECARS.has(entry.name)) {
@@ -854,10 +862,10 @@ async function runScan(
     return top;
   };
 
-  const sweep = async (order: number): Promise<void> => {
+  const sweep = async (front: number): Promise<void> => {
     for (;;) {
       const next = popRetire();
-      if (next === undefined || next.retire >= order) {
+      if (next === undefined || next.retire > front) {
         if (next !== undefined) pushRetire(next.id, next.retire);
         return;
       }
@@ -865,7 +873,7 @@ async function runScan(
     }
   };
 
-  const accept = async (raw: string, cellX: number, cellZ: number, cellOrder: number, anchored: boolean): Promise<void> => {
+  const accept = async (raw: string, cellX: number, cellZ: number, anchored: boolean): Promise<void> => {
     const feature = MapFeatureSchema.parse(JSON.parse(raw) as unknown);
     const source = sourceKeyOf(feature);
     const layer = layerOf(feature);
@@ -893,8 +901,8 @@ async function runScan(
     if (found === undefined) {
       const id = nextId;
       nextId += 1;
-      const retireOrder = anchored ? cellOrder + retire : Number.MAX_SAFE_INTEGER;
-      groups.set(id, { features: [feature], cells: new Set<string>(), retireOrder });
+      const retireOrder = retireRowFor(feature.stableId, cellZ);
+      groups.set(id, { features: [feature], cells: new Set<string>(), retireRow: retireOrder });
       pushRetire(id, retireOrder);
       acceptedByKey.set(key, (acceptedByKey.get(key) ?? 0) + 1);
       exact.set(feature.stableId, id);
@@ -927,9 +935,10 @@ async function runScan(
     if (!anchored) return;
     group.features.push(feature);
     exact.set(feature.stableId, found);
-    if (cellOrder + retire > group.retireOrder) {
-      group.retireOrder = cellOrder + retire;
-      pushRetire(found, group.retireOrder);
+    const retirement = retireRowFor(feature.stableId, cellZ);
+    if (retirement > group.retireRow) {
+      group.retireRow = retirement;
+      pushRetire(found, retirement);
     }
     const bucket = `${feature.kind}:${cellX}:${cellZ}`;
     const list = buckets.get(bucket) ?? [];
@@ -969,10 +978,15 @@ async function runScan(
       return a === b ? first.order - second.order : a - b;
     });
     peakBands = Math.max(peakBands, records.length);
+    let front = Number.NEGATIVE_INFINITY;
     for (const record of records) {
-      const cellOrder = record.anchored ? (record.cellZ - minCellZ) * width + (record.cellX - minCellX) : Number.MAX_SAFE_INTEGER;
-      if (record.anchored) await sweep(cellOrder);
-      await accept(record.raw, record.cellX, record.cellZ, cellOrder, record.anchored);
+      if (record.anchored) {
+        if (record.cellZ > front) {
+          await sweep(record.cellZ - 1);
+          front = record.cellZ;
+        }
+      }
+      await accept(record.raw, record.cellX, record.cellZ, record.anchored);
     }
   }
   for (const id of [...groups.keys()]) await emit(id);
@@ -1100,7 +1114,7 @@ export async function deduplicateAll(
   const root = dataRoot();
   const sourceDir = inDir ?? path.join(root, "intermediate");
   const destinationDir = outDir ?? path.join(root, "intermediate");
-  if (process.env.MASTER_MAPS_DEDUP_STREAM !== "1") return deduplicateAllInMemory(sourceDir, destinationDir, accounting);
+  if (process.env.MASTER_MAPS_DEDUP_INMEMORY === "1") return deduplicateAllInMemory(sourceDir, destinationDir, accounting);
   const stats = await deduplicateStreaming(sourceDir, destinationDir, accounting);
   console.error(
     `[deduplicate] bounded-memory scan grouped ${stats.input} canonical features into ${stats.groups} identities, emitted ${stats.emitted} ` +
