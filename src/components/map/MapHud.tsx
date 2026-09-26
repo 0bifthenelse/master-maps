@@ -1,10 +1,27 @@
 'use client';
 
-import { type CSSProperties, type FormEvent, type ReactNode, useCallback, useRef, useState } from 'react';
+/**
+ * @file HUD de la carte: recherche, reinitialisation, indications clavier.
+ *
+ * The search field swallows keydown so a global map shortcut can never
+ * fire while the user types: the panel stops propagation before the
+ * window-level handlers in MapControls see the event. That is a second
+ * line of defence behind MapControls.shouldHandle, which already skips
+ * text tags, and it is what makes the hints below true.
+ */
+import {
+  type CSSProperties,
+  type FormEvent,
+  type KeyboardEvent,
+  type ReactNode,
+  useCallback,
+  useRef,
+  useState,
+} from 'react';
 
-const ACCENT = '#ff7d27';
-const INK = '#000000';
-const PAPER = '#ffffff';
+const ACCENT = 'var(--color-accent, #ff7d27)';
+const INK = 'var(--color-ink, #000000)';
+const PAPER = 'var(--color-paper, #ffffff)';
 
 const overlay: CSSProperties = {
   position: 'absolute',
@@ -42,7 +59,7 @@ const searchContainer: CSSProperties = {
 const searchInput: CSSProperties = {
   flex: 1,
   border: `1px solid color-mix(in srgb, ${INK} 20%, ${PAPER})`,
-  borderRadius: '4px',
+  borderRadius: '2px',
   padding: '6px 10px',
   fontSize: '14px',
   background: PAPER,
@@ -58,14 +75,27 @@ const searchInputFocus: CSSProperties = {
 
 const resetBtn: CSSProperties = {
   background: 'transparent',
-  border: 'none',
+  border: `1px solid color-mix(in srgb, ${INK} 20%, transparent)`,
   cursor: 'pointer',
-  color: ACCENT,
+  color: INK,
   fontWeight: 600,
   fontSize: '12px',
-  padding: '4px 8px',
-  borderRadius: '3px',
+  padding: '5px 9px',
+  borderRadius: '2px',
   whiteSpace: 'nowrap',
+};
+
+const hintBar: CSSProperties = {
+  pointerEvents: 'none',
+  display: 'flex',
+  flexWrap: 'wrap',
+  gap: '4px 10px',
+  justifyContent: 'center',
+  padding: '3px 12px',
+  fontSize: '10.5px',
+  color: `color-mix(in srgb, ${INK} 52%, transparent)`,
+  background: `color-mix(in srgb, ${PAPER} 80%, transparent)`,
+  borderBottom: `1px solid color-mix(in srgb, ${INK} 7%, transparent)`,
 };
 
 const attributionStrip: CSSProperties = {
@@ -89,14 +119,34 @@ const linkStyle: CSSProperties = {
   textUnderlineOffset: '2px',
 };
 
+const keyStyle: CSSProperties = {
+  padding: '0 4px',
+  border: `1px solid color-mix(in srgb, ${INK} 22%, transparent)`,
+  borderRadius: '2px',
+  fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+  fontSize: '9.5px',
+  color: INK,
+};
+
+/** Shortcuts the map actually implements, in the order a user meets them. */
+export const MAP_SHORTCUT_HINTS: readonly { keys: string; label: string }[] = [
+  { keys: 'H J K L', label: 'déplacer' },
+  { keys: '← ↑ → ↓', label: 'déplacer' },
+  { keys: '+ −', label: 'zoom' },
+  { keys: 'clic droit', label: 'menu de l\'élément' },
+  { keys: 'Échap', label: 'fermer' },
+];
+
 export interface MapHudProps {
   query?: string;
   onQueryChange?: (q: string) => void;
   onSearch?: (q: string) => void;
+  /** Resets the camera to the full territory view. */
   onResetView?: () => void;
   results?: ReactNode;
   extra?: ReactNode;
   attributions?: string[];
+  showShortcuts?: boolean;
 }
 
 export function MapHud({
@@ -107,6 +157,7 @@ export function MapHud({
   results,
   extra,
   attributions,
+  showShortcuts = true,
 }: MapHudProps) {
   const inputRef = useRef<HTMLInputElement>(null);
   const [focused, setFocused] = useState(false);
@@ -123,80 +174,99 @@ export function MapHud({
     onResetView?.();
   }, [onResetView]);
 
+  const swallowMapKeys = useCallback((event: KeyboardEvent<HTMLInputElement>): void => {
+    if (event.key === 'Escape') return;
+    event.stopPropagation();
+  }, []);
+
   return (
     <div style={overlay} role="region" aria-label="Carte">
-      <div style={topBar}>
-        <div style={searchContainer}>
-          <form
-            onSubmit={handleSubmit}
-            style={{ display: 'contents' }}
-            role="search"
-            aria-label="Rechercher dans le Gers"
-          >
-            <input
-              ref={inputRef}
-              type="search"
-              data-testid="search-input"
-              placeholder="Rechercher dans le Gers..."
+      <div>
+        <div style={topBar}>
+          <div style={searchContainer}>
+            <form
+              onSubmit={handleSubmit}
+              style={{ display: 'contents' }}
+              role="search"
               aria-label="Rechercher dans le Gers"
-              value={query}
-              onChange={(e) => onQueryChange?.(e.target.value)}
-              onFocus={() => setFocused(true)}
-              onBlur={() => setFocused(false)}
-              style={{
-                ...searchInput,
-                ...(focused ? searchInputFocus : {}),
-              }}
-            />
-          </form>
-
-          {onResetView && (
-            <button
-              type="button"
-              style={resetBtn}
-              onClick={handleReset}
-              aria-label="Réinitialiser la vue"
             >
-              Réinitialiser
-            </button>
-          )}
+              <input
+                ref={inputRef}
+                type="search"
+                data-testid="search-input"
+                placeholder="Rechercher dans le Gers..."
+                aria-label="Rechercher dans le Gers"
+                value={query}
+                onChange={(e) => onQueryChange?.(e.target.value)}
+                onKeyDown={swallowMapKeys}
+                onFocus={() => setFocused(true)}
+                onBlur={() => setFocused(false)}
+                style={{
+                  ...searchInput,
+                  ...(focused ? searchInputFocus : {}),
+                }}
+              />
+            </form>
 
-          {extra}
+            {onResetView && (
+              <button
+                type="button"
+                style={resetBtn}
+                onClick={handleReset}
+                data-testid="reset-view"
+                aria-label="Réinitialiser la vue sur l'ensemble du département"
+                title="Vue d'ensemble du département"
+              >
+                Vue d'ensemble
+              </button>
+            )}
+
+            {extra}
+          </div>
         </div>
+
+        {showShortcuts ? (
+          <div style={hintBar} data-testid="map-shortcuts">
+            {MAP_SHORTCUT_HINTS.map((hint) => (
+              <span key={`${hint.keys}-${hint.label}`} style={{ display: 'inline-flex', alignItems: 'center', gap: '4px' }}>
+                <kbd style={keyStyle}>{hint.keys}</kbd>
+                {hint.label}
+              </span>
+            ))}
+          </div>
+        ) : null}
+
+        {results ? (
+          <div
+            style={{
+              pointerEvents: 'auto',
+              position: 'absolute',
+              top: '82px',
+              left: '50%',
+              transform: 'translateX(-50%)',
+              width: '100%',
+              maxWidth: '480px',
+              background: PAPER,
+              border: `1px solid color-mix(in srgb, ${INK} 12%, transparent)`,
+              borderRadius: '0 0 2px 2px',
+              boxShadow: '0 4px 12px color-mix(in srgb, var(--color-ink, #000) 12%, transparent)',
+              overflow: 'hidden',
+              zIndex: 10,
+            }}
+          >
+            {results}
+          </div>
+        ) : null}
       </div>
 
-      {results && (
-        <div
-          style={{
-            pointerEvents: 'auto',
-            position: 'absolute',
-            top: '48px',
-            left: '50%',
-            transform: 'translateX(-50%)',
-            width: '100%',
-            maxWidth: '480px',
-            background: PAPER,
-            border: `1px solid color-mix(in srgb, ${INK} 12%, transparent)`,
-            borderRadius: '0 0 6px 6px',
-            boxShadow: '0 4px 12px rgba(0,0,0,0.10)',
-            overflow: 'hidden',
-            zIndex: 10,
-          }}
-        >
-          {results}
-        </div>
-      )}
-
-      {attributions && attributions.length > 0 && (
+      {attributions && attributions.length > 0 ? (
         <div style={attributionStrip}>
           <span>Sources: </span>
           {attributions.map((a, i) => (
             <span key={i} dangerouslySetInnerHTML={{ __html: a }} />
           ))}
         </div>
-      )}
-
-      {(!attributions || attributions.length === 0) && (
+      ) : (
         <div style={attributionStrip}>
           <span>
             <a
@@ -205,7 +275,7 @@ export function MapHud({
               target="_blank"
               rel="noopener noreferrer"
             >
-              © Contributeurs OpenStreetMap
+              &copy; Contributeurs OpenStreetMap
             </a>
           </span>
           <span>

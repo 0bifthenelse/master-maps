@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { Color, Matrix4, Vector3 } from "three";
 import { buildBusinessInstances } from "@/lib/scene/buildPois";
+import { markerFamilyColor } from "@/lib/scene/materials";
 
 describe("batched business marker picking", () => {
   it("keeps stable feature mapping and updates highlight colours by instance", () => {
@@ -33,7 +34,7 @@ describe("batched business marker picking", () => {
     const original = color.getHexString();
     result.setHighlight(1);
     result.mesh.getColorAt(1, color);
-    expect(color.getHexString()).toBe("ffb000");
+    expect(color.getHexString()).toBe(new Color(markerFamilyColor("highlight")).getHexString());
     result.setHighlight(null);
     result.mesh.getColorAt(1, color);
     expect(color.getHexString()).toBe(original);

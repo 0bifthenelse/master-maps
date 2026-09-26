@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
+import { existsSync, readFileSync } from "node:fs";
 import { access, mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { acquireJson, createRateLimiter } from "./http-cache";
 import { AUCH_DETAIL_SCOPE, GERS_TERRITORY } from "../../src/lib/data/territory";
@@ -15,11 +15,15 @@ interface ExtractedBusinessRecord {
   nafCode?: string;
   nafLabel?: string;
   address?: string;
+  postcode?: string;
+  communeCode?: string;
   coordinate?: { lon: number; lat: number } | null;
   administrativeStatus?: string;
   creationDate?: string;
   confidence: "high" | "medium" | "low";
   nominatedRecord: boolean;
+  geocodedBy?: string;
+  geocodeScore?: number;
   acquiredFromQuery: { q: string; page: number };
 }
 
@@ -36,7 +40,6 @@ interface SireneQueryEntry {
   retryCount?: number;
   rateLimitCount?: number;
   error?: string;
-
 }
 interface SireneRawFile {
   dataset: "businesses-sirene";
@@ -46,10 +49,13 @@ interface SireneRawFile {
   license: string;
   department: { code: string; name: string };
   commune?: string;
+  communes?: string[];
   acquiredAt: string;
   totalQueries: number;
   totalUniqueRecords: number;
   truncated: boolean;
+  pagesFetched?: number;
+  reconciliation?: SireneReconciliation;
   bytesDownloaded: number;
   requestCount: number;
   retryCount: number;
@@ -131,6 +137,7 @@ export interface FetchBusinessesOptions {
   maxSirenePages?: number;
   signal?: AbortSignal;
   communeCode?: string;
+  communeCodes?: string[];
   departement?: boolean;
   forceRefresh?: boolean;
 }
@@ -146,8 +153,8 @@ export interface FetchBusinessesResult {
 interface AcquireSireneOptions {
   maxSirenePages: number;
   signal?: AbortSignal;
-  communeCode: string;
-  departement: boolean;
+  communeCode: string | null;
+  communes: Array<{ code: string; name: string }>;
   forceRefresh?: boolean;
 }
 
@@ -481,6 +488,286 @@ async function querySirene(
   return { body: body as Record<string, unknown>, sha256: result.sha256, status: result.status, fromCache: result.fromCache, bytesDownloaded: result.bytesDownloaded, requestCount: result.requestCount, retryCount: result.retryCount, rateLimitCount: result.rateLimitCount };
 }
 
+export const SIRENE_SECTIONS = [
+  "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K",
+  "L", "M", "N", "O", "P", "Q", "R", "S", "T", "U",
+] as const;
+export const SIRENE_EFFECTIVE_SIZE_CLASSES = ["NN", "00", "01", "02", "03", "11", "12", "21", "22", "31", "32", "41", "42", "51", "52", "53"] as const;
+export const SIRENE_RESULT_CAP = 10_000;
+export const SIRENE_PER_PAGE = 25;
+export const SIRENE_MAX_PAGES = 400;
+export const SIRENE_MATCH_MIN_IOU = 0.2;
+export const SIRENE_MATCH_MAX_CENTROID_METRES = 25;
+
+export interface SirenePartition {
+  kind: "section" | "commune-section" | "commune";
+  section: string | null;
+  commune: string | null;
+  sizeClass: string | null;
+}
+
+export interface SireneQueryPlanEntry extends SirenePartition {
+  params: Record<string, string | number>;
+  label: string;
+}
+
+export function buildSireneQueryPlan(options: {
+  communes: Array<{ code: string }>;
+  sections?: readonly string[];
+}): SireneQueryPlanEntry[] {
+  const sections = options.sections ?? SIRENE_SECTIONS;
+  const plan: SireneQueryPlanEntry[] = [];
+  for (const commune of options.communes) {
+    for (const section of sections) {
+      plan.push({
+        kind: "commune-section",
+        section,
+        commune: commune.code,
+        sizeClass: null,
+        params: {
+          q: "",
+          departement: DEPARTMENT_CODE,
+          code_commune: commune.code,
+          section_activite_principale: section,
+        },
+        label: `commune ${commune.code} section ${section}`,
+      });
+    }
+  }
+  return plan;
+}
+
+export function parseCommuneListArg(argv: string[]): string[] {
+  const index = argv.indexOf("--communes");
+  if (index === -1) return [];
+  const value = argv[index + 1];
+  if (value === undefined) throw new Error("--communes requires a comma separated list of INSEE codes");
+  return value
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter((entry) => entry !== "")
+    .map((entry) => {
+      if (!/^\d{5}$/.test(entry)) throw new Error(`Invalid INSEE commune code ${entry}`);
+      return entry;
+    });
+}
+
+const GERS_COMMUNE_SNAPSHOT = "gers-communes.json";
+const GEO_COMMUNES_URL = `https://geo.api.gouv.fr/communes?codeDepartement=${DEPARTMENT_CODE}&fields=code,nom,codePostal&format=json`;
+
+export async function resolveGersCommunes(
+  rawDir: string,
+  communeCode: string | undefined,
+  communeCodes: string[] | undefined,
+): Promise<Array<{ code: string; name: string }>> {
+  if (communeCode !== undefined) return [{ code: communeCode, name: communeCode }];
+  if (communeCodes !== undefined && communeCodes.length > 0) {
+    return communeCodes.map((code) => ({ code, name: code }));
+  }
+
+  const snapshotPath = path.join(rawDir, GERS_COMMUNE_SNAPSHOT);
+  const fromBan = readGersCommunesFromBan(rawDir);
+  if (fromBan.length > 0) {
+    await writeFile(snapshotPath, `${JSON.stringify(fromBan, null, 2)}\n`, "utf-8");
+    return fromBan;
+  }
+  if (existsSync(snapshotPath)) {
+    const parsed: unknown = JSON.parse(readFileSync(snapshotPath, "utf8"));
+    if (Array.isArray(parsed)) {
+      return parsed.filter((value): value is { code: string; name: string } => {
+        if (typeof value !== "object" || value === null) return false;
+        const record = value as { code?: unknown; name?: unknown };
+        return typeof record.code === "string" && typeof record.name === "string";
+      });
+    }
+  }
+
+  const result = await cachedFetch(GEO_COMMUNES_URL, { timeoutMs: 30_000, maxBytes: 4_000_000 });
+  const parsed: unknown = JSON.parse(result.body);
+  if (!Array.isArray(parsed)) throw new Error("geo.api.gouv.fr commune list is not an array");
+  const communes = parsed
+    .filter((value): value is { code: string; nom: string } => {
+      if (typeof value !== "object" || value === null) return false;
+      const record = value as { code?: unknown; nom?: unknown };
+      return typeof record.code === "string" && typeof record.nom === "string";
+    })
+    .map((value) => ({ code: value.code, name: value.nom }))
+    .filter((value) => value.code.startsWith(DEPARTMENT_CODE));
+  await writeFile(snapshotPath, `${JSON.stringify(communes, null, 2)}\n`, "utf-8");
+  return communes;
+}
+
+function readGersCommunesFromBan(rawDir: string): Array<{ code: string; name: string }> {
+  const banPath = path.join(rawDir, "ban-addresses.json");
+  if (!existsSync(banPath)) return [];
+  const parsed: unknown = JSON.parse(readFileSync(banPath, "utf8"));
+  if (typeof parsed !== "object" || parsed === null) return [];
+  const addresses = (parsed as { addresses?: Array<Record<string, unknown>> }).addresses ?? [];
+  const byCode = new Map<string, string>();
+  for (const record of addresses) {
+    const code = record["inseeCode"];
+    const name = record["city"];
+    if (typeof code !== "string" || !code.startsWith(DEPARTMENT_CODE)) continue;
+    if (typeof name !== "string" || name === "") continue;
+    if (!byCode.has(code)) byCode.set(code, name);
+  }
+  return [...byCode.entries()]
+    .map(([code, name]) => ({ code, name }))
+    .sort((a, b) => a.code.localeCompare(b.code));
+}
+
+function annuaireResultTotal(body: Record<string, unknown>): number {
+  const total = body["total_results"];
+  return typeof total === "number" && Number.isFinite(total) ? total : 0;
+}
+
+function annuaireResultPages(body: Record<string, unknown>, perPage: number): number {
+  const totalPages = body["total_pages"];
+  if (typeof totalPages === "number" && Number.isFinite(totalPages) && totalPages > 0) return totalPages;
+  return Math.ceil(annuaireResultTotal(body) / perPage);
+}
+
+function geocodeKey(postcode: string, streetText: string, houseNumber: string): string {
+  return `${postcode}|${streetText.toUpperCase().replace(/[^A-Z0-9]+/g, " ").trim()}|${houseNumber.toUpperCase()}`;
+}
+
+export function parseSireneAddress(address: string | undefined): { postcode: string; streetText: string; houseNumber: string } | null {
+  if (address === undefined) return null;
+  const trimmed = address.trim();
+  if (trimmed === "") return null;
+  const postcodeMatch = trimmed.match(/\b(\d{5})\b/);
+  if (postcodeMatch === null || postcodeMatch.index === undefined) return null;
+  const postcode = postcodeMatch[1]!;
+  const beforePostcode = trimmed.slice(0, postcodeMatch.index).trim();
+  if (beforePostcode === "") return null;
+  const houseNumberMatch = beforePostcode.match(/^(\d+)\s*(?:BIS|TER|QUATER)?\b/i)
+    ?? beforePostcode.match(/\b(\d+)\s*(?:BIS|TER|QUATER)\b/i);
+  if (houseNumberMatch === null || houseNumberMatch.index === undefined) {
+    return { postcode, streetText: beforePostcode, houseNumber: "" };
+  }
+  const streetText = beforePostcode.slice(houseNumberMatch.index + houseNumberMatch[0].length).trim();
+  if (streetText === "") return null;
+  return { postcode, streetText, houseNumber: houseNumberMatch[1] ?? "" };
+}
+
+export interface BanAddressIndexEntry {
+  lon: number;
+  lat: number;
+  score: number;
+}
+
+export class BanAddressIndex {
+  private readonly cells = new Map<string, BanAddressIndexEntry[]>();
+
+  insert(postcode: string, streetText: string, houseNumber: string, lon: number, lat: number): void {
+    const key = geocodeKey(postcode, streetText, houseNumber);
+    const bucket = this.cells.get(key);
+    if (bucket === undefined) this.cells.set(key, [{ lon, lat, score: 0 }]);
+    else bucket.push({ lon, lat, score: 0 });
+  }
+
+  get size(): number {
+    let total = 0;
+    for (const bucket of this.cells.values()) total += bucket.length;
+    return total;
+  }
+
+  lookup(postcode: string, streetText: string, houseNumber: string): BanAddressIndexEntry | null {
+    const exact = this.cells.get(geocodeKey(postcode, streetText, houseNumber));
+    if (exact !== undefined && exact.length > 0) return exact[0]!;
+    const normalizedStreet = streetText.toUpperCase().replace(/[^A-Z0-9]+/g, " ").trim();
+    for (const [key, entries] of this.cells) {
+      if (!key.startsWith(`${postcode}|`)) continue;
+      const candidateStreet = key.split("|")[1] ?? "";
+      if (candidateStreet === normalizedStreet) return entries[0]!;
+      if (candidateStreet.includes(normalizedStreet) || normalizedStreet.includes(candidateStreet)) return entries[0]!;
+    }
+    return null;
+  }
+}
+
+export function loadBanAddressIndex(rawDir: string): BanAddressIndex {
+  const index = new BanAddressIndex();
+  const candidates = ["ban-addresses.json", "ban-addresses-auch.json"];
+  for (const name of candidates) {
+    const filePath = path.join(rawDir, name);
+    if (!existsSync(filePath)) continue;
+    const parsed: unknown = JSON.parse(readFileSync(filePath, "utf8"));
+    if (typeof parsed !== "object" || parsed === null) continue;
+    const addresses = (parsed as { addresses?: Array<Record<string, unknown>> }).addresses ?? [];
+    for (const record of addresses) {
+      const postcode = typeof record["postalCode"] === "string" ? (record["postalCode"] as string) : "";
+      const street = typeof record["streetName"] === "string" ? (record["streetName"] as string) : "";
+      const number = typeof record["numero"] === "string" ? (record["numero"] as string) : "";
+      const lon = record["lon"];
+      const lat = record["lat"];
+      if (postcode === "" || street === "" || typeof lon !== "number" || typeof lat !== "number") continue;
+      index.insert(postcode, street, number, lon, lat);
+    }
+  }
+  return index;
+}
+
+export interface SireneReconciliation {
+  communesQueried: number;
+  communesDiscovered: number;
+  planEntries: number;
+  queriesExecuted: number;
+  cappedQueries: number;
+  establishedReceived: number;
+  accepted: number;
+  deduplicated: number;
+  excludedNoCoordinate: number;
+  geocodedByBan: number;
+  geocodeFailed: number;
+  bySection: Record<string, number>;
+  queryPlan: Array<{ label: string; totalResults: number; pagesFetched: number; truncated: boolean }>;
+  cappedPartitions: string[];
+  generatedAt: string;
+}
+
+async function expandCappedPartitions(
+  plan: SireneQueryPlanEntry[],
+  forceRefresh: boolean,
+  failures: FailureEntry[],
+): Promise<SireneQueryPlanEntry[]> {
+  const expanded: SireneQueryPlanEntry[] = [];
+  for (const entry of plan) {
+    if (entry.section === null) {
+      expanded.push(entry);
+      continue;
+    }
+    let total: number;
+    try {
+      total = annuaireResultTotal((await querySirene({ ...entry.params, per_page: 1, page: 1 }, forceRefresh)).body);
+    } catch (err: unknown) {
+      failures.push({
+        step: `sirene-cap-probe-${entry.label}`,
+        source: "recherche-entreprises.api.gouv.fr",
+        url: annuaireSearchUrl({ ...entry.params, per_page: 1, page: 1 }),
+        error: errMsg(err),
+        severity: "warning",
+      });
+      expanded.push(entry);
+      continue;
+    }
+    if (total < SIRENE_RESULT_CAP) {
+      expanded.push(entry);
+      continue;
+    }
+    console.log(`[sirene] ${entry.label} returns ${total} which is the API cap; subdividing by effective size class`);
+    for (const sizeClass of SIRENE_EFFECTIVE_SIZE_CLASSES) {
+      expanded.push({
+        ...entry,
+        sizeClass,
+        params: { ...entry.params, tranche_effectif_salarie: sizeClass },
+        label: `${entry.label} tranche ${sizeClass}`,
+      });
+    }
+  }
+  return expanded;
+}
+
 async function acquireSirene(
   rawDir: string,
   opts: AcquireSireneOptions,
@@ -492,200 +779,168 @@ async function acquireSirene(
 }> {
   const failures: FailureEntry[] = [];
   const queries: SireneQueryEntry[] = [];
-  const allRecords: ExtractedBusinessRecord[] = [];
-  let totalResults = 0;
+  const acceptedBySiret = new Map<string, ExtractedBusinessRecord>();
+  const bySection: Record<string, number> = {};
+  const queryPlanLog: SireneReconciliation["queryPlan"] = [];
+  let establishedReceived = 0;
+  let queriesExecuted = 0;
+  let cappedQueries = 0;
+  let pagesFetchedTotal = 0;
+  let geocodedByBan = 0;
+  let geocodeFailed = 0;
+  let excludedNoCoordinate = 0;
   let truncated = false;
 
-  const scopeParams: Record<string, string | number> = opts.departement
-    ? { departement: DEPARTMENT_CODE }
-    : { code_commune: opts.communeCode };
-  const perPage = 25;
-  const maxPages = Math.min(opts.maxSirenePages, 400);
+  const banIndex = loadBanAddressIndex(rawDir);
+  console.log(`BAN geocode index: ${banIndex.size} address keys loaded`);
 
-  try {
-    const firstParams: Record<string, string | number> = { q: "", ...scopeParams, per_page: perPage, page: 1 };
-    const first = await querySirene(firstParams, opts.forceRefresh);
+  const communeScope = opts.communeCode !== null;
+  const plan = communeScope
+    ? buildSireneQueryPlan({ communes: [{ code: opts.communeCode }], sections: [] })
+    : buildSireneQueryPlan({ communes: opts.communes });
 
-    totalResults = (first.body["total_results"] as number) ?? 0;
-    const totalPages = Math.min(
-      (first.body["total_pages"] as number) ?? Math.ceil(totalResults / perPage),
-      400,
-    );
-
-    const results = (first.body["results"] as Array<Record<string, unknown>>) ?? [];
-    for (const r of results) {
-      const rec = extractSireneRecord(r, false, { q: "", page: 1 });
-      if (rec) allRecords.push(rec);
-    }
-
-    queries.push({
-      query: firstParams,
-      url: annuaireSearchUrl(firstParams),
-      status: "ok",
-      httpStatus: first.status,
-      sha256: first.sha256,
-      recordCount: results.length,
-      fromCache: first.fromCache,
-      bytesDownloaded: first.bytesDownloaded,
-      requestCount: first.requestCount,
-      retryCount: first.retryCount,
-      rateLimitCount: first.rateLimitCount,
-    });
-
-    const pagesToFetch = Math.min(maxPages, totalPages);
-    if (totalResults > pagesToFetch * perPage) {
-      truncated = true;
-    }
-
-    for (let page = 2; page <= pagesToFetch; page++) {
-      if (opts.signal?.aborted) break;
-
-      try {
-        const pageParams: Record<string, string | number> = { q: "", ...scopeParams, per_page: perPage, page };
-        const pageResult = await querySirene(pageParams, opts.forceRefresh);
-
-        const pageResults = (pageResult.body["results"] as Array<Record<string, unknown>>) ?? [];
-        for (const r of pageResults) {
-          const rec = extractSireneRecord(r, false, { q: "", page });
-          if (rec) allRecords.push(rec);
-        }
-
-        queries.push({
-          query: pageParams,
-          url: annuaireSearchUrl(pageParams),
-          status: "ok",
-          httpStatus: pageResult.status,
-          sha256: pageResult.sha256,
-          recordCount: pageResults.length,
-          fromCache: pageResult.fromCache,
-          bytesDownloaded: pageResult.bytesDownloaded,
-          requestCount: pageResult.requestCount,
-          retryCount: pageResult.retryCount,
-          rateLimitCount: pageResult.rateLimitCount,
-        });
-      } catch (err: unknown) {
-        failures.push({
-          step: "sirene-scan-pagination",
-          source: "recherche-entreprises.api.gouv.fr",
-          url: annuaireSearchUrl({ q: "", ...scopeParams, per_page: perPage, page }),
-          error: errMsg(err),
-          severity: "warning",
-        });
-        queries.push({
-          query: { q: "", ...scopeParams, per_page: perPage, page },
-          url: annuaireSearchUrl({ q: "", ...scopeParams, per_page: perPage, page }),
-          status: "error",
-          error: errMsg(err),
-          recordCount: 0,
-          sha256: "",
-        });
-      }
-    }
-  } catch (err: unknown) {
-    const msg = errMsg(err);
-    failures.push({
-      step: "sirene-scan-initial",
-      source: "recherche-entreprises.api.gouv.fr",
-      url: annuaireSearchUrl({ q: "", ...scopeParams, per_page: perPage, page: 1 }),
-      error: msg,
-      severity: "error",
-    });
-    throw new Error(`SIRENE scan query failed: ${msg}`);
+  if (plan.length === 0) {
+    throw new Error("No SIRENE query plan entries; pass --communes or a commune list");
   }
+  console.log(`SIRENE plan: ${plan.length} partitions over ${opts.communes.length} communes`);
 
-  const nameQueries = [
-    { q: "NOCIBE", label: "nocibe" },
-    { q: "FANTOCHE", label: "fantoche" },
-    { q: "CRU", label: "cru" },
-  ];
+  const maxPages = Math.min(opts.maxSirenePages, SIRENE_MAX_PAGES);
+  const cappedSectionLabels: string[] = [];
 
-  for (const nq of nameQueries) {
+  const expandedPlan = await expandCappedPartitions(plan, opts.forceRefresh === true, failures);
+  for (const entry of expandedPlan) {
     if (opts.signal?.aborted) break;
-
+    let firstPage: Record<string, unknown>;
     try {
-      const targetedParams: Record<string, string | number> = { q: nq.q, ...scopeParams, per_page: 25, page: 1 };
-      const result = await querySirene(targetedParams, opts.forceRefresh);
-
-      const results = (result.body["results"] as Array<Record<string, unknown>>) ?? [];
-
-      for (const r of results) {
-        const matching = (r["matching_etablissements"] as Array<Record<string, unknown>>) ?? [];
-        for (let i = 0; i < matching.length; i++) {
-          const m = matching[i] as Record<string, unknown>;
-          const siret = m["siret"] as string | undefined;
-          if (!siret) continue;
-
-          const coordLon = m["longitude"] as string | number | undefined;
-          const coordLat = m["latitude"] as string | number | undefined;
-
-          allRecords.push({
-            sourceId: `sirene:${siret}`,
-            siret,
-            siren: r["siren"] as string | undefined,
-            legalName: r["nom_complet"] as string | undefined,
-            tradingName: (m["nom_commercial"] ??
-              m["enseigne_nom_commercial"] ??
-              r["nom_complet"]) as string | undefined,
-            nafCode: m["activite_principale"] as string | undefined,
-            address: m["adresse"] as string | undefined,
-            coordinate:
-              coordLon != null && coordLat != null
-                ? { lon: Number(coordLon), lat: Number(coordLat) }
-                : null,
-            administrativeStatus: m["etat_administratif"] as string | undefined,
-            confidence: "high",
-            nominatedRecord: true,
-            acquiredFromQuery: { q: nq.q, page: 1 },
-          });
-        }
-      }
-
-      queries.push({
-        query: targetedParams,
-        url: annuaireSearchUrl(targetedParams),
-        status: "ok",
-        httpStatus: result.status,
-        sha256: result.sha256,
-        recordCount: results.length,
-        fromCache: result.fromCache,
-        bytesDownloaded: result.bytesDownloaded,
-        requestCount: result.requestCount,
-        retryCount: result.retryCount,
-        rateLimitCount: result.rateLimitCount,
-      });
+      firstPage = (await querySirene({ ...entry.params, per_page: SIRENE_PER_PAGE, page: 1 }, opts.forceRefresh)).body;
     } catch (err: unknown) {
       failures.push({
-        step: `sirene-targeted-query-${nq.label}`,
+        step: `sirene-plan-${entry.label}`,
         source: "recherche-entreprises.api.gouv.fr",
-        url: annuaireSearchUrl({ q: nq.q, ...scopeParams, per_page: 25, page: 1 }),
+        url: annuaireSearchUrl({ ...entry.params, per_page: SIRENE_PER_PAGE, page: 1 }),
         error: errMsg(err),
         severity: "warning",
       });
+      continue;
+    }
+
+    const totalResults = annuaireResultTotal(firstPage);
+    const totalPages = annuaireResultPages(firstPage, SIRENE_PER_PAGE);
+    const isCapped = totalResults >= SIRENE_RESULT_CAP;
+    if (isCapped) {
+      cappedQueries += 1;
+      truncated = true;
+      cappedSectionLabels.push(entry.label);
+    }
+    const pagesToFetch = Math.min(maxPages, totalPages);
+    if (totalResults > pagesToFetch * SIRENE_PER_PAGE) truncated = true;
+
+    let pagesFetched = 0;
+    for (let page = 1; page <= pagesToFetch; page += 1) {
+      if (opts.signal?.aborted) break;
+      const params = { ...entry.params, per_page: SIRENE_PER_PAGE, page };
+      let body: Record<string, unknown>;
+      let outcome: Awaited<ReturnType<typeof querySirene>> | null = null;
+      if (page === 1) {
+        body = firstPage;
+      } else {
+        try {
+          outcome = await querySirene(params, opts.forceRefresh);
+          body = outcome.body;
+        } catch (err: unknown) {
+          failures.push({
+            step: `sirene-page-${entry.label}-${page}`,
+            source: "recherche-entreprises.api.gouv.fr",
+            url: annuaireSearchUrl(params),
+            error: errMsg(err),
+            severity: "warning",
+          });
+          queries.push({ query: params, url: annuaireSearchUrl(params), status: "error", error: errMsg(err), recordCount: 0, sha256: "" });
+          break;
+        }
+      }
+      queriesExecuted += 1;
+      pagesFetched += 1;
+      pagesFetchedTotal += 1;
+
+      const results = (body["results"] as Array<Record<string, unknown>>) ?? [];
+      for (const result of results) {
+        const matching = (result["matching_etablissements"] as Array<Record<string, unknown>>) ?? [];
+        const siege = result["siege"] as Record<string, unknown> | undefined;
+        const establishments = matching.length > 0 ? matching : siege ? [siege] : [];
+        for (const local of establishments) {
+          const siret = local["siret"];
+          if (typeof siret !== "string" || siret === "") continue;
+          establishedReceived += 1;
+          const record = extractSireneRecord({ siege: local, matching_etablissements: [local], nom_complet: result["nom_complet"], siren: result["siren"] }, false, { q: entry.label, page });
+          if (record === null) continue;
+          if (record.coordinate === null) {
+            const parsedAddress = parseSireneAddress(record.address);
+            const hit = parsedAddress === null ? null : banIndex.lookup(parsedAddress.postcode, parsedAddress.streetText, parsedAddress.houseNumber);
+            if (hit !== null) {
+              record.coordinate = { lon: hit.lon, lat: hit.lat };
+              record.geocodedBy = "ban-addresses";
+              record.geocodeScore = hit.score;
+              geocodedByBan += 1;
+            } else {
+              geocodeFailed += 1;
+            }
+          }
+          if (record.coordinate === null) {
+            excludedNoCoordinate += 1;
+            continue;
+          }
+          record.acquiredFromQuery = { q: entry.label, page };
+          acceptedBySiret.set(record.sourceId, record);
+          const section = typeof result["section_activite_principale"] === "string" ? (result["section_activite_principale"] as string) : "unknown";
+          bySection[section] = (bySection[section] ?? 0) + 1;
+        }
+      }
+
       queries.push({
-        query: { q: nq.q, ...scopeParams, per_page: 25, page: 1 },
-        url: annuaireSearchUrl({ q: nq.q, ...scopeParams, per_page: 25, page: 1 }),
-        status: "error",
-        error: errMsg(err),
-        recordCount: 0,
-        sha256: "",
+        query: params,
+        url: annuaireSearchUrl(params),
+        status: "ok",
+        httpStatus: outcome?.status ?? 200,
+        sha256: outcome?.sha256 ?? "",
+        recordCount: results.length,
+        fromCache: outcome?.fromCache,
+        bytesDownloaded: outcome?.bytesDownloaded,
+        requestCount: outcome?.requestCount,
+        retryCount: outcome?.retryCount,
+        rateLimitCount: outcome?.rateLimitCount,
       });
     }
+
+    queryPlanLog.push({ label: entry.label, totalResults, pagesFetched, truncated: isCapped || totalResults > pagesToFetch * SIRENE_PER_PAGE });
   }
 
-  const seen = new Set<string>();
-  const uniqueRecords: ExtractedBusinessRecord[] = [];
-  for (const rec of allRecords) {
-    if (!seen.has(rec.sourceId)) {
-      seen.add(rec.sourceId);
-      uniqueRecords.push(rec);
-    }
-  }
+  const uniqueRecords = [...acceptedBySiret.values()];
 
   const bytesDownloaded = queries.reduce((sum, query) => sum + (query.bytesDownloaded ?? 0), 0);
   const requestCount = queries.reduce((sum, query) => sum + (query.requestCount ?? 0), 0);
   const retryCount = queries.reduce((sum, query) => sum + (query.retryCount ?? 0), 0);
   const rateLimitCount = queries.reduce((sum, query) => sum + (query.rateLimitCount ?? 0), 0);
   const fromCache = queries.length > 0 && queries.every((query) => query.fromCache === true);
+
+  const reconciliation: SireneReconciliation = {
+    communesQueried: communeScope ? 1 : opts.communes.length,
+    communesDiscovered: opts.communes.length,
+    planEntries: plan.length,
+    queriesExecuted,
+    cappedQueries,
+    establishedReceived,
+    accepted: uniqueRecords.length,
+    deduplicated: establishedReceived - excludedNoCoordinate - uniqueRecords.length,
+    excludedNoCoordinate,
+    geocodedByBan,
+    geocodeFailed,
+    bySection,
+    queryPlan: queryPlanLog,
+    cappedPartitions: cappedSectionLabels,
+    generatedAt: new Date().toISOString(),
+  };
+
   const rawFile: SireneRawFile = {
     dataset: "businesses-sirene",
     sourceName: "Annuaire des Entreprises / SIRENE (recherche-entreprises.api.gouv.fr)",
@@ -693,11 +948,14 @@ async function acquireSirene(
     version: "2.6",
     license: SIRENE_LICENSE,
     department: { code: DEPARTMENT_CODE, name: TERRITORY_NAME },
-    ...(opts.departement ? {} : { commune: opts.communeCode }),
+    ...(opts.communeCode === null ? {} : { commune: opts.communeCode }),
+    communes: opts.communes.map((entry) => entry.code),
     acquiredAt: new Date().toISOString(),
     totalQueries: queries.length,
     totalUniqueRecords: uniqueRecords.length,
     truncated,
+    pagesFetched: pagesFetchedTotal,
+    reconciliation,
     bytesDownloaded,
     requestCount,
     retryCount,
@@ -717,20 +975,28 @@ async function acquireSirene(
     requestCount,
     retryCount,
     rateLimitCount,
-    query: annuaireQueryString({ q: "", ...scopeParams, per_page: perPage }),
+    query: `departement=${DEPARTMENT_CODE} partitioned by code_commune and section_activite_principale over ${opts.communes.length} communes`,
     acquiredAt: rawFile.acquiredAt,
     license: SIRENE_LICENSE,
     recordCount: uniqueRecords.length,
-    status: failures.some((f) => f.severity === "error") ? "partial" : "ok",
+    status: failures.some((f) => f.severity === "error") ? "partial" : truncated ? "partial" : "ok",
   };
 
   return {
     rawFile,
     sources: [sourceEntry],
     failures,
-    counts: { sireneRecords: uniqueRecords.length, sireneQueries: queries.length },
+    counts: {
+      sireneRecords: uniqueRecords.length,
+      sireneQueries: queries.length,
+      sireneCappedQueries: cappedQueries,
+      sireneGeocodedByBan: geocodedByBan,
+      sirenePagesFetched: pagesFetchedTotal,
+      sireneExcludedNoCoordinate: excludedNoCoordinate,
+    },
   };
 }
+
 
 function isCoordinate(value: unknown): value is [number, number] {
   return Array.isArray(value) && value.length >= 2 && typeof value[0] === "number" && typeof value[1] === "number";
@@ -1215,14 +1481,17 @@ export async function fetchBusinesses(
 		};
 	}
 
-	const departementScan = options.departement === true;
-	const communeCode = options.communeCode ?? DEFAULT_COMMUNE_CODE;
+	const communes = await resolveGersCommunes(rawDir, options.communeCode, options.communeCodes);
+	if (communes.length === 0) {
+		throw new Error("No Gers communes resolved; pass --communes 32013,32107,32208 or a commune list file");
+	}
+	console.log(`SIRENE scope: ${communes.length} communes`);
   {
     const result = await acquireSirene(rawDir, {
-      maxSirenePages: options.maxSirenePages ?? 30,
+      maxSirenePages: options.maxSirenePages ?? 400,
       signal: options.signal ?? undefined,
-      communeCode,
-      departement: departementScan,
+      communeCode: options.communeCode ?? null,
+      communes,
       forceRefresh: options.forceRefresh,
     });
 
@@ -1307,19 +1576,23 @@ if (isDirectRun()) {
     forceRefresh: argv.includes("--force"),
     dataDir: undefined as string | undefined,
     communeCode: undefined as string | undefined,
+    communeCodes: undefined as string[] | undefined,
   };
   const dataIdx = argv.indexOf("--data-dir");
   if (dataIdx !== -1 && dataIdx + 1 < argv.length) flags.dataDir = argv[dataIdx + 1]!;
   const communeIdx = argv.indexOf("--commune");
   if (communeIdx !== -1 && communeIdx + 1 < argv.length) flags.communeCode = argv[communeIdx + 1]!;
+  const communesIdx = argv.indexOf("--communes");
+  if (communesIdx !== -1 && communesIdx + 1 < argv.length) flags.communeCodes = parseCommuneListArg(argv);
   const maxPagesIdx = argv.indexOf("--max-pages");
-  const maxPagesValue = maxPagesIdx !== -1 && maxPagesIdx + 1 < argv.length ? Number.parseInt(argv[maxPagesIdx + 1]!, 10) : 30;
+  const maxPagesValue = maxPagesIdx !== -1 && maxPagesIdx + 1 < argv.length ? Number.parseInt(argv[maxPagesIdx + 1]!, 10) : 400;
   fetchBusinesses({
     dataDir: flags.dataDir,
     offline: flags.offline,
-    maxSirenePages: Number.isFinite(maxPagesValue) ? maxPagesValue : 30,
+    maxSirenePages: Number.isFinite(maxPagesValue) ? maxPagesValue : 400,
     departement: flags.departement,
     communeCode: flags.communeCode,
+    communeCodes: flags.communeCodes,
     forceRefresh: flags.forceRefresh,
   })
     .then((result) => {

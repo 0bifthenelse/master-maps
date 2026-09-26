@@ -506,6 +506,17 @@ async function osmiumObjectCount(filePath: string): Promise<number> {
     + fileinfoCount(count.relations, "relations", filePath);
 }
 
+const OSM_BULK_POINT_TAGS = [
+  "highway", "railway", "public_transport", "place", "aeroway", "waterway",
+  "man_made", "amenity", "shop", "tourism", "historic", "office", "craft",
+  "healthcare", "emergency", "information", "barrier", "crossing",
+];
+const OSM_BULK_AREA_TAGS = ["highway", "railway", "public_transport", "place", "aeroway", "waterway", "landuse", "natural", "leisure", "man_made", "amenity", "shop", "tourism", "historic", "office", "craft", "barrier"];
+const OSM_BULK_TAG_EXPRESSIONS: string[] = [
+  ...OSM_BULK_AREA_TAGS.flatMap((tag) => [`w/${tag}`, `r/${tag}`]),
+  ...OSM_BULK_POINT_TAGS.map((tag) => `n/${tag}`),
+];
+
 async function fetchBulkOsm(forceRefresh: boolean): Promise<void> {
   const pbfPath = path.join(RAW_DIR, "midi-pyrenees-latest.osm.pbf");
   const boundaryPath = path.join(RAW_DIR, "gers-boundary.geojson");
@@ -525,12 +536,13 @@ async function fetchBulkOsm(forceRefresh: boolean): Promise<void> {
   await execFileAsync("osmium", ["extract", "-p", boundaryPath, pbfPath, "-o", extractPath, "--overwrite"], { maxBuffer: 2 * 1024 * 1024 });
   await execFileAsync("osmium", [
     "tags-filter", extractPath, "-o", filteredPath, "--overwrite",
-    "w/highway=path,footway,cycleway,bridleway,track,pedestrian,steps",
-    "n/amenity", "n/shop", "n/tourism", "n/historic", "n/name",
-    "w/amenity", "w/shop", "w/tourism", "w/historic", "w/name",
-    "r/amenity", "r/shop", "r/tourism", "r/historic", "r/name",
+    ...OSM_BULK_TAG_EXPRESSIONS,
   ], { maxBuffer: 2 * 1024 * 1024 });
-  await execFileAsync("osmium", ["export", filteredPath, "-o", geojsonPath, "--overwrite", "--add-unique-id", "type_id"], { maxBuffer: 2 * 1024 * 1024 });
+  await execFileAsync("osmium", [
+    "export", extractPath, "-o", geojsonPath, "--overwrite",
+    "--add-unique-id", "type_id",
+    "--geometry-types", "point,linestring,polygon",
+  ], { maxBuffer: 2 * 1024 * 1024 });
   const geojson = JSON.parse(await readFile(geojsonPath, "utf8")) as { features?: unknown[] };
   if (!Array.isArray(geojson.features) || geojson.features.length === 0) {
     throw new Error("Geofabrik extract produced no features inside the Gers boundary");

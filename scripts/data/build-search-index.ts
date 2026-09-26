@@ -55,6 +55,22 @@ async function loadDataFromTiles(tilesDir: string): Promise<{ features: MapFeatu
   return { features, tileMap: new Map([...tileMap].map(([stableId, value]) => [stableId, value.tileId])) };
 }
 
+const TILE_INDEX_CANDIDATES = ["tile-index.json", "tile-manifest.json"];
+
+async function resolveTileIndexPath(tilesDir: string): Promise<string> {
+  const generatedDir = path.join(tilesDir, "..");
+  for (const name of TILE_INDEX_CANDIDATES) {
+    const candidate = path.join(generatedDir, name);
+    try {
+      await fs.access(candidate);
+      return candidate;
+    } catch {
+      continue;
+    }
+  }
+  return path.join(generatedDir, "tile-manifest.json");
+}
+
 async function loadData(tilesDir: string): Promise<{ features: MapFeature[]; tileMap: Map<string, string> }> {
   const intermediateDir = path.join(tilesDir, "..", "..", "intermediate");
   try {
@@ -75,12 +91,13 @@ async function loadData(tilesDir: string): Promise<{ features: MapFeature[]; til
       if (!featuresById.has(feature.stableId)) featuresById.set(feature.stableId, feature);
     }
   }
-  const rawManifest = JSON.parse(await fs.readFile(path.join(tilesDir, "..", "tile-manifest.json"), "utf8")) as unknown;
-  if (!Array.isArray(rawManifest)) throw new Error("tile manifest is not an array");
+  const tileIndexPath = await resolveTileIndexPath(tilesDir);
+  const rawManifest = JSON.parse(await fs.readFile(tileIndexPath, "utf8")) as unknown;
+  if (!Array.isArray(rawManifest)) throw new Error("tile manifest must be an array");
   const manifests = rawManifest.map((value) => TileManifestSchema.parse(value)).sort((first, second) => first.lod - second.lod || first.tileId.localeCompare(second.tileId));
   const tileMap = new Map<string, string>();
   for (const manifest of manifests) {
-    for (const stableId of manifest.features) if (featuresById.has(stableId) && !tileMap.has(stableId)) tileMap.set(stableId, manifest.tileId);
+    for (const stableId of manifest.features ?? []) if (featuresById.has(stableId) && !tileMap.has(stableId)) tileMap.set(stableId, manifest.tileId);
   }
   return { features: [...featuresById.values()], tileMap };
 }
@@ -89,13 +106,21 @@ function aliases(feature: MapFeature): string[] {
   const candidates: string[] = [];
   if (feature.address) candidates.push(feature.address);
   if (feature.kind === "business") candidates.push(feature.businessName, feature.brand ?? "", feature.legalName ?? "");
-  if (feature.kind === "road" && feature.name) candidates.push(feature.name);
+  if ((feature.kind === "road" || feature.kind === "transport") && feature.name) candidates.push(feature.name);
+  if (feature.kind === "address") {
+    if (feature.street) candidates.push(feature.street);
+    if (feature.city) candidates.push(feature.city);
+  }
   return [...new Set(candidates.map(normalizedKey).filter((value) => value.length > 0))];
 }
 
 function featureName(feature: MapFeature): string | undefined {
   if (feature.name) return feature.name;
   if (feature.kind === "business") return feature.businessName;
+  if (feature.kind === "address") {
+    const parts = [feature.housenumber, feature.street, feature.postcode, feature.city].filter((part): part is string => typeof part === "string" && part.length > 0);
+    return parts.length > 0 ? parts.join(" ") : undefined;
+  }
   return feature.displayName;
 }
 
@@ -104,14 +129,32 @@ function boostFor(feature: MapFeature): number {
   if (feature.kind === "poi") return 100;
   if (feature.kind === "address") return 50;
   if (feature.kind === "building") return 10;
+  if (feature.kind === "place") return PLACE_IMPORTANCE_BOOST[feature.importance ?? PLACE_IMPORTANCE_UNKNOWN];
+  if (feature.kind === "transport") return TRANSPORT_BOOST[feature.transportType] ?? TRANSPORT_BOOST_DEFAULT;
   return 0;
 }
+
+const PLACE_IMPORTANCE_UNKNOWN = 0;
+const PLACE_IMPORTANCE_BOOST: Record<number, number> = { 0: 20, 1: 40, 2: 60, 3: 80, 4: 100, 5: 120, 6: 140 };
+const TRANSPORT_BOOST_DEFAULT = 15;
+const TRANSPORT_BOOST: Record<string, number> = {
+  station: 40,
+  halt: 30,
+  bus_stop: 25,
+  platform: 25,
+  aerodrome: 35,
+  runway: 20,
+  parking: 20,
+};
 
 function categoryFor(feature: MapFeature): string | undefined {
   if (feature.kind === "business") return feature.category ?? feature.nafLabel ?? feature.nafCode;
   if (feature.kind === "poi") return feature.category ?? feature.poiType;
   if (feature.kind === "road") return feature.roadClass ?? feature.highway;
   if (feature.kind === "water") return feature.waterType;
+  if (feature.kind === "place") return feature.placeType;
+  if (feature.kind === "transport") return feature.publicTransport ?? feature.line ?? feature.route ?? feature.transportType;
+  if (feature.kind === "address") return feature.street;
   return undefined;
 }
 

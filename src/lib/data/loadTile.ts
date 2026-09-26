@@ -1,11 +1,11 @@
-import { TileDataSchema, type TileData } from "./schema";
+import { TileDataSchema, TileMetaDataSchema, type TileData, type TileMetaData } from "./schema";
 
 const DEFAULT_MAX_CACHE_SIZE_MB = 128;
 const DEFAULT_MAX_TILE_SIZE_BYTES = 2 * 1024 * 1024;
 const DEFAULT_MAX_CACHE_ENTRIES = 64;
 
 interface CacheEntry {
-  data: TileData;
+  data: TileData | TileMetaData;
   size: number;
 }
 
@@ -48,7 +48,7 @@ let cacheByteSize = 0;
 let maxCacheSize = DEFAULT_MAX_CACHE_SIZE_MB * 1024 * 1024;
 let maxTileSize = DEFAULT_MAX_TILE_SIZE_BYTES;
 let maxEntries = DEFAULT_MAX_CACHE_ENTRIES;
-const inFlight = new Map<string, Promise<TileData>>();
+const inFlight = new Map<string, Promise<TileMetaData | TileData>>();
 
 export function configureTileLoader(options: { maxCacheSizeMb?: number; maxTileSizeBytes?: number; maxEntries?: number }): void {
   if (options.maxCacheSizeMb !== undefined) maxCacheSize = options.maxCacheSizeMb * 1024 * 1024;
@@ -83,7 +83,23 @@ function isAbortError(error: unknown): boolean {
   return typeof error === "object" && error !== null && "name" in error && error.name === "AbortError";
 }
 
-export async function loadTile(tileId: string, signal?: AbortSignal): Promise<TileData> {
+export async function loadTileMeta(tileId: string, signal?: AbortSignal): Promise<TileMetaData> {
+  if (!/^[a-zA-Z0-9_-]+$/.test(tileId) || tileId.includes("..")) throw new Error(`loadTileMeta: invalid tileId "${tileId}"`);
+  if (!cache) cache = new LruCache<string, CacheEntry>();
+  const cached = cache.get(tileId);
+  if (cached) return cached.data as TileMetaData;
+  const pending = inFlight.get(tileId);
+  if (pending && !(signal?.aborted ?? false)) return pending as Promise<TileMetaData>;
+  const request = fetchTile(tileId, signal);
+  inFlight.set(tileId, request);
+  try {
+    return await request as TileMetaData;
+  } finally {
+    if (inFlight.get(tileId) === request) inFlight.delete(tileId);
+  }
+}
+
+export async function loadTile(tileId: string, signal?: AbortSignal): Promise<TileData | TileMetaData> {
   if (!/^[a-zA-Z0-9_-]+$/.test(tileId) || tileId.includes("..")) throw new Error(`loadTile: invalid tileId "${tileId}"`);
   if (!cache) cache = new LruCache<string, CacheEntry>();
   const cached = cache.get(tileId);
@@ -99,7 +115,7 @@ export async function loadTile(tileId: string, signal?: AbortSignal): Promise<Ti
   }
 }
 
-async function fetchTile(tileId: string, signal?: AbortSignal): Promise<TileData> {
+async function fetchTile(tileId: string, signal?: AbortSignal): Promise<TileMetaData | TileData> {
   if (!cache) cache = new LruCache<string, CacheEntry>();
   let response: Response;
   try {
@@ -123,9 +139,21 @@ async function fetchTile(tileId: string, signal?: AbortSignal): Promise<TileData
   } catch {
     throw new Error(`loadTile: tile ${tileId} response is not valid JSON`);
   }
-  const data = TileDataSchema.parse(parsed);
-  if (data.manifest.tileId !== tileId) throw new Error(`loadTile: tile ID mismatch for ${tileId}`);
-  if (data.manifest.featureCount !== data.features.length) throw new Error(`loadTile: feature count mismatch for ${tileId}`);
+  const data = TileMetaDataSchema.safeParse(parsed);
+  if (data.success) {
+    if (data.data.manifest.tileId !== tileId) throw new Error(`loadTile: tile ID mismatch for ${tileId}`);
+    if (data.data.manifest.featureCount !== data.data.features.length) throw new Error(`loadTile: feature count mismatch for ${tileId}`);
+    return storeTile(tileId, data.data as TileMetaData, byteSize);
+  }
+  const legacy = TileDataSchema.safeParse(parsed);
+  if (!legacy.success) throw new Error(`loadTile: tile ${tileId} matches neither the meta nor the canonical tile schema: ${data.error.issues[0]?.message ?? "unknown"}`);
+  if (legacy.data.manifest.tileId !== tileId) throw new Error(`loadTile: tile ID mismatch for ${tileId}`);
+  if (legacy.data.manifest.featureCount !== legacy.data.features.length) throw new Error(`loadTile: feature count mismatch for ${tileId}`);
+  return storeTile(tileId, legacy.data, byteSize);
+}
+
+function storeTile<T extends TileMetaData | TileData>(tileId: string, data: T, byteSize: number): T {
+  if (!cache) cache = new LruCache<string, CacheEntry>();
   if (cacheByteSize + byteSize > maxCacheSize) evictToLimits();
   if (byteSize <= maxCacheSize) {
     cache.set(tileId, { data, size: byteSize });

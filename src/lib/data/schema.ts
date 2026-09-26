@@ -338,7 +338,7 @@ export const TileManifestSchema = z.object({
   bounds: LocalBoundsSchema,
   featureCount: z.number().int().nonnegative(),
   byteSize: z.number().int().nonnegative(),
-  features: z.array(z.string().min(1)),
+  features: z.array(z.string().min(1)).optional(),
   fragmentIds: z.array(z.string().min(1)).optional(),
   fragmentOf: z.string().min(1).optional(),
   geometryBounds: LocalBoundsSchema.optional(),
@@ -351,6 +351,135 @@ export const TileDataSchema = z.object({
   metadata: z.record(z.string(), z.unknown()).optional(),
 }).strict();
 export type TileData = z.infer<typeof TileDataSchema>;
+const FeatureMetaBaseSchema = FeatureBaseSchema.omit({ geometry: true, localGeometry: true, sourceGeometry: true });
+const BoundaryFeatureMetaSchema = FeatureMetaBaseSchema.extend({
+  kind: z.literal("boundary"),
+  territoryCode: z.string().min(1),
+}).strict();
+const BuildingFeatureMetaSchema = FeatureMetaBaseSchema.extend({
+  kind: z.literal("building"),
+  height: FINITE_NUMBER.nonnegative().optional(),
+  heightInferred: z.boolean().optional(),
+  levels: z.number().int().nonnegative().optional(),
+  heightSource: HeightSourceEnum.optional(),
+  buildingType: z.string().optional(),
+  roofType: z.string().optional(),
+  wallType: z.string().optional(),
+  buildingLevels: z.number().int().nonnegative().optional(),
+  buildingColour: z.string().optional(),
+  roofColour: z.string().optional(),
+  startDate: z.string().optional(),
+  yearConstructed: z.number().int().optional(),
+}).strict();
+const RoadFeatureMetaSchema = FeatureMetaBaseSchema.extend({
+  kind: z.literal("road"),
+  highway: z.string().optional(),
+  roadClass: z.string().optional(),
+  width: FINITE_NUMBER.nonnegative().optional(),
+  widthInferred: z.boolean().optional(),
+  widthSource: WidthSourceEnum.optional(),
+  surface: RoadSurfaceEnum.or(z.string()).optional(),
+  bridge: z.boolean().optional(),
+  tunnel: z.boolean().optional(),
+  maxSpeed: z.number().int().nonnegative().optional(),
+  layer: z.string().optional(),
+  stratum: z.enum(["tunnel", "normal", "bridge"]).optional(),
+  oneway: z.boolean().optional(),
+  lanes: z.number().int().positive().optional(),
+  lit: z.boolean().optional(),
+  sidewalk: z.string().optional(),
+}).strict();
+const WaterFeatureMetaSchema = FeatureMetaBaseSchema.extend({
+  kind: z.literal("water"),
+  waterType: z.string().optional(),
+  isSurface: z.boolean().optional(),
+  fictiveAxis: z.boolean().optional(),
+  width: FINITE_NUMBER.nonnegative().optional(),
+  widthInferred: z.boolean().optional(),
+  widthSource: WidthSourceEnum.optional(),
+}).strict();
+const LanduseFeatureMetaSchema = FeatureMetaBaseSchema.extend({
+  kind: z.literal("landuse"),
+  landuseType: z.string().optional(),
+  category: z.string().optional(),
+}).strict();
+const PoiFeatureMetaSchema = FeatureMetaBaseSchema.extend({
+  kind: z.literal("poi"),
+  category: z.string().optional(),
+  poiType: z.string().optional(),
+}).strict();
+const BusinessFeatureMetaSchema = FeatureMetaBaseSchema.extend({
+  kind: z.literal("business"),
+  businessName: z.string().optional(),
+  category: z.string().optional(),
+  businessId: z.string().optional(),
+  brand: z.string().optional(),
+  legalName: z.string().optional(),
+  website: z.string().optional(),
+  phone: z.string().optional(),
+  openingHours: z.string().optional(),
+  operator: z.string().optional(),
+  wheelchair: z.string().optional(),
+  nafCode: z.string().optional(),
+  nafLabel: z.string().optional(),
+  administrativeStatus: z.string().optional(),
+  creationDate: z.string().optional(),
+}).strict();
+const AddressFeatureMetaSchema = FeatureMetaBaseSchema.extend({
+  kind: z.literal("address"),
+  street: z.string().min(1),
+  housenumber: z.string().optional(),
+  postcode: z.string().optional(),
+  city: z.string().optional(),
+  source: z.string().optional(),
+  banId: z.string().optional(),
+}).strict();
+const TransportFeatureMetaSchema = FeatureMetaBaseSchema.extend({
+  kind: z.literal("transport"),
+  transportType: z.string().min(1),
+  line: z.string().optional(),
+  route: z.string().optional(),
+  network: z.string().optional(),
+  operator: z.string().optional(),
+  ref: z.string().optional(),
+  publicTransport: z.string().optional(),
+  wheelchair: z.string().optional(),
+}).strict();
+const StructureFeatureMetaSchema = FeatureMetaBaseSchema.extend({
+  kind: z.literal("structure"),
+  structureType: z.string().min(1),
+  height: FINITE_NUMBER.nonnegative().optional(),
+  heightSource: HeightSourceEnum.optional(),
+}).strict();
+const PlaceFeatureMetaSchema = FeatureMetaBaseSchema.extend({
+  kind: z.literal("place"),
+  placeType: z.string().min(1),
+  importance: z.number().int().min(1).max(6).optional(),
+  population: z.number().int().nonnegative().optional(),
+}).strict();
+
+export const TileMetaFeatureSchema = z.discriminatedUnion("kind", [
+  BoundaryFeatureMetaSchema,
+  BuildingFeatureMetaSchema,
+  RoadFeatureMetaSchema,
+  WaterFeatureMetaSchema,
+  LanduseFeatureMetaSchema,
+  PoiFeatureMetaSchema,
+  BusinessFeatureMetaSchema,
+  AddressFeatureMetaSchema,
+  TransportFeatureMetaSchema,
+  StructureFeatureMetaSchema,
+  PlaceFeatureMetaSchema,
+]);
+export type TileMetaFeature = z.infer<typeof TileMetaFeatureSchema>;
+
+export const TileMetaDataSchema = z.object({
+  manifest: TileManifestSchema,
+  features: z.array(TileMetaFeatureSchema),
+  metadata: z.record(z.string(), z.unknown()).optional(),
+}).strict();
+export type TileMetaData = z.infer<typeof TileMetaDataSchema>;
+
 
 export const SearchRecordSchema = z.object({
   featureId: z.string().min(1),

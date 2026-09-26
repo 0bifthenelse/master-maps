@@ -1,49 +1,85 @@
 import { NextRequest, NextResponse } from "next/server";
-import { readFile } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
-import { DatasetManifestSchema, TileManifestSchema, type DatasetManifest, type TileManifest } from "@/lib/data/schema";
+import { DatasetManifestSchema } from "@/lib/data/schema";
+import { MappedFileCache, type FileVersion } from "@/lib/data/mappedCache";
+import { parseTileManifestList, slimTileManifestEntries, tileManifestUnionBounds, type SlimTileManifestFields } from "@/lib/data/manifestSlim";
 
 export const dynamic = "force-static";
 const TILE_ID_RE = /^[a-zA-Z0-9_-]+$/;
+const MANIFEST_CACHE_ENTRIES = 4;
 
-export async function GET(_request: NextRequest) {
+interface CachedManifest extends SlimTileManifestFields {
+  datasetVersion: string;
+  body: string;
+}
+
+function isMissing(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
+}
+
+async function manifestVersion(dataRoot: string): Promise<FileVersion> {
+  const [manifestStats, tileStats] = await Promise.all([
+    stat(join(dataRoot, "generated", "manifest.json")),
+    stat(join(dataRoot, "generated", "tile-manifest.json")),
+  ]);
+  return { mtimeMs: Math.max(manifestStats.mtimeMs, tileStats.mtimeMs), size: manifestStats.size + tileStats.size };
+}
+
+async function buildSlimManifest(dataRoot: string): Promise<CachedManifest> {
+  const core = DatasetManifestSchema.parse(JSON.parse(await readFile(join(dataRoot, "generated", "manifest.json"), "utf8")) as unknown);
+  const tiles = parseTileManifestList(JSON.parse(await readFile(join(dataRoot, "generated", "tile-manifest.json"), "utf8")) as unknown);
+  if (!tiles.every((tile) => TILE_ID_RE.test(tile.tileId))) throw new Error("tile manifest contains an unsafe tile ID");
+  if (tiles.length === 0) throw new Error("tile manifest is empty");
+  const slimTiles = slimTileManifestEntries(tiles);
+  const response = DatasetManifestSchema.parse({
+    ...core,
+    tileCount: tiles.length,
+    tiles: slimTiles,
+    layerAvailability: core.layerAvailability ?? {},
+    bounds: tileManifestUnionBounds(tiles),
+    tileIds: undefined,
+    tileBounds: undefined,
+    byteSizes: undefined,
+    tileFeatureCounts: undefined,
+  });
+  return {
+    datasetVersion: response.datasetVersion,
+    tiles: slimTiles,
+    bounds: response.bounds!,
+    tileCount: tiles.length,
+    body: JSON.stringify(response),
+  };
+}
+
+const manifestCache = new MappedFileCache<CachedManifest>({
+  maxEntries: MANIFEST_CACHE_ENTRIES,
+  version: manifestVersion,
+  load: buildSlimManifest,
+  validate: (loaded) => loaded as CachedManifest,
+});
+
+export function resetManifestCache(): void {
+  manifestCache.clear();
+}
+
+export async function GET(request: NextRequest) {
   const dataRoot = process.env.MASTER_MAPS_DATA_DIR ?? "data";
-  const manifestPath = join(dataRoot, "generated", "manifest.json");
-  const tileManifestPath = join(dataRoot, "generated", "tile-manifest.json");
   try {
-    const core = DatasetManifestSchema.parse(JSON.parse(await readFile(manifestPath, "utf8")) as unknown);
-    const rawTiles = JSON.parse(await readFile(tileManifestPath, "utf8")) as unknown;
-    if (!Array.isArray(rawTiles)) throw new Error("tile manifest must be an array");
-    const tiles: TileManifest[] = rawTiles.map((value) => TileManifestSchema.parse(value));
-    const tileIds = tiles.map((tile) => tile.tileId);
-    if (!tileIds.every((tileId) => TILE_ID_RE.test(tileId))) throw new Error("tile manifest contains an unsafe tile ID");
-    if (tiles.length === 0) throw new Error("tile manifest is empty");
-    const bounds = tiles.reduce<[number, number, number, number]>((accumulator, tile) => [
-      Math.min(accumulator[0], tile.bounds[0]),
-      Math.min(accumulator[1], tile.bounds[1]),
-      Math.max(accumulator[2], tile.bounds[2]),
-      Math.max(accumulator[3], tile.bounds[3]),
-    ], tiles[0]!.bounds);
-    const byteSizes = Object.fromEntries(tiles.map((tile) => [tile.tileId, tile.byteSize]));
-    const tileFeatureCounts = Object.fromEntries(tiles.map((tile) => [tile.tileId, tile.featureCount]));
-    const response: DatasetManifest = DatasetManifestSchema.parse({
-      ...core,
-      tileCount: tiles.length,
-      tileIds,
-      tiles,
-      tileBounds: tiles.map((tile) => tile.bounds),
-      byteSizes: { ...(core.byteSizes ?? {}), ...byteSizes },
-      tileFeatureCounts,
-      layerAvailability: core.layerAvailability ?? {},
-      bounds,
-    });
-    return NextResponse.json(response, {
-      status: 200,
-      headers: { "Cache-Control": "public, max-age=3600, must-revalidate", "X-Dataset-Version": response.datasetVersion },
-    });
+    const current = await manifestCache.get(dataRoot);
+    const headers: Record<string, string> = {
+      "Cache-Control": "public, max-age=60",
+      "Content-Type": "application/json",
+      ETag: current.datasetVersion,
+      "X-Dataset-Version": current.datasetVersion,
+      Vary: "Accept-Encoding",
+    };
+    if (request.headers.get("if-none-match") === current.datasetVersion) return new NextResponse(null, { status: 304, headers });
+    return new NextResponse(current.body, { status: 200, headers });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    const status = message.includes("ENOENT") ? 503 : 500;
-    return NextResponse.json({ error: status === 503 ? "DATASET_UNAVAILABLE" : "DATASET_INVALID", code: status === 503 ? "DATASET_UNAVAILABLE" : "DATASET_INVALID" }, { status });
+    const status = isMissing(error) || message.includes("ENOENT") ? 503 : 500;
+    const code = status === 503 ? "DATASET_UNAVAILABLE" : "DATASET_INVALID";
+    return NextResponse.json({ error: code, code }, { status, headers: { "Cache-Control": "no-store" } });
   }
 }

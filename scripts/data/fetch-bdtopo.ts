@@ -1,12 +1,14 @@
 #!/usr/bin/env tsx
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
+import { createReadStream } from "node:fs";
 import { access, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { AUCH_DETAIL_SCOPE, GERS_TERRITORY } from "../../src/lib/data/territory";
 import { toLambert93 } from "../../src/lib/geo/crs";
 import { promisify } from "node:util";
 import { acquireFile } from "./http-cache";
+import { BD_TOPO_LAYERS, type BdtopoAdoption, type BdtopoLayerSpec } from "./bdtopoLayers";
 
 const execFileAsync = promisify(execFile);
 const DATA_DIR = process.env.MASTER_MAPS_DATA_DIR ?? "data";
@@ -21,20 +23,6 @@ const AUCH_SCOPE = "auch";
 const AUCH_RAW_OUTPUT_DIR = path.join(RAW_DIR, AUCH_DETAIL_SCOPE.bdtopoOutputDir);
 const AUCH_INTERMEDIATE_DIR = path.join(DATA_DIR, "auch", "intermediate");
 
-interface GeoJsonFeature {
-  type: "Feature";
-  geometry: { type: string; coordinates: unknown } | null;
-  properties: Record<string, unknown>;
-}
-interface GeoJsonCollection {
-  type: "FeatureCollection";
-  features: GeoJsonFeature[];
-}
-interface LayerSpec {
-  name: "buildings" | "roads" | "water-surfaces" | "water-lines";
-  layer: string;
-  output: string;
-}
 interface SelectedResource {
   title: string;
   edition: string;
@@ -42,13 +30,6 @@ interface SelectedResource {
   downloadUrl: string;
   archiveBytes?: number;
 }
-
-const LAYERS: readonly LayerSpec[] = [
-  { name: "buildings", layer: "batiment", output: "bdtopo-buildings.geojson" },
-  { name: "roads", layer: "troncon_de_route", output: "bdtopo-roads.geojson" },
-  { name: "water-surfaces", layer: "surface_hydrographique", output: "bdtopo-water-surfaces.geojson" },
-  { name: "water-lines", layer: "troncon_hydrographique", output: "bdtopo-water-lines.geojson" },
-];
 
 function decodeXml(value: string): string {
   return value
@@ -162,21 +143,29 @@ function layerNames(listing: string): string[] {
     .filter((name): name is string => name !== undefined);
 }
 
-function validateGeoJson(content: string, label: string): GeoJsonCollection {
-  const parsed = JSON.parse(content) as { type?: unknown; features?: unknown };
-  if (parsed.type !== "FeatureCollection" || !Array.isArray(parsed.features) || parsed.features.length === 0) {
-    throw new Error(`${label} did not produce a non-empty GeoJSON FeatureCollection`);
-  }
-  return parsed as unknown as GeoJsonCollection;
+async function measureGeoJson(filePath: string): Promise<{ count: number; sha256: string }> {
+  const { promise, resolve, reject } = Promise.withResolvers<{ count: number; sha256: string }>();
+  const hash = createHash("sha256");
+  const matcher = /"type"\s*:\s*"Feature"/g;
+  let count = 0;
+  const stream = createReadStream(filePath);
+  stream.on("data", (chunk: Buffer) => {
+    hash.update(chunk);
+    count += [...chunk.toString("utf8").matchAll(matcher)].length;
+  });
+  stream.on("error", reject);
+  stream.on("close", () => resolve({ count, sha256: hash.digest("hex") }));
+  return promise;
 }
 
 interface LayerOutput {
   name: string;
   layer: string;
   file: string;
+  adoption: BdtopoAdoption;
+  filter?: string;
   recordCount: number;
   sha256: string;
-  schema: string;
 }
 interface ExportLayersResult {
   outputs: LayerOutput[];
@@ -192,15 +181,20 @@ async function exportLayers(gpkg: string, bounds: [number, number, number, numbe
   await mkdir(outputDir, { recursive: true });
   const outputs: LayerOutput[] = [];
   let clipFallback = false;
-  for (const spec of LAYERS) {
+  for (const spec of BD_TOPO_LAYERS) {
     const outputPath = path.join(outputDir, spec.output);
     await rm(outputPath, { force: true });
-    const baseArgs = [
-      "-f", "GeoJSON", outputPath, gpkg, spec.layer,
+    const clipArgs = clipPath === null ? [] : ["-clipsrc", clipPath];
+    const sourceArgs = spec.filter === undefined
+      ? [spec.layer]
+      : ["-dialect", "SQLITE", "-sql", `SELECT * FROM ${spec.layer} WHERE ${spec.filter}`];
+    const head = ["-f", "GeoJSON", outputPath, gpkg, ...sourceArgs];
+    const tail = [
       "-spat", ...bounds.map((value) => String(value)),
       "-t_srs", "EPSG:4326", "-lco", "RFC7946=YES",
     ];
-    const args = clipPath === null ? baseArgs : [...baseArgs.slice(0, 10), "-clipsrc", clipPath, ...baseArgs.slice(10)];
+    const baseArgs = [...head, ...tail];
+    const args = clipPath === null ? baseArgs : [...head, ...clipArgs, ...tail];
     try {
       await execFileAsync("ogr2ogr", args, { maxBuffer: 4 * 1024 * 1024 });
     } catch (error: unknown) {
@@ -209,16 +203,16 @@ async function exportLayers(gpkg: string, bounds: [number, number, number, numbe
       await rm(outputPath, { force: true });
       await execFileAsync("ogr2ogr", baseArgs, { maxBuffer: 4 * 1024 * 1024 });
     }
-    const content = await readFile(outputPath, "utf8");
-    const parsed = validateGeoJson(content, spec.layer);
-    const schema = await commandOutput("ogrinfo", ["-ro", "-so", gpkg, spec.layer]);
+    const measured = await measureGeoJson(outputPath);
+    if (measured.count === 0) throw new Error(`${spec.layer} produced no records in ${spec.output}${spec.filter === undefined ? "" : ` for filter ${spec.filter}`}`);
     outputs.push({
       name: spec.name,
       layer: spec.layer,
       file: path.relative(process.cwd(), outputPath),
-      recordCount: parsed.features.length,
-      sha256: createHash("sha256").update(content).digest("hex"),
-      schema,
+      adoption: spec.adoption,
+      filter: spec.filter,
+      recordCount: measured.count,
+      sha256: measured.sha256,
     });
   }
   return { outputs, clipFallback };
@@ -243,6 +237,19 @@ async function locateExistingPackage(): Promise<string> {
   return files[0]!;
 }
 
+function manifestOutput(output: LayerOutput): Record<string, unknown> {
+  return {
+    name: output.name,
+    layer: output.layer,
+    file: output.file,
+    adoption: output.adoption,
+    filter: output.filter,
+    recordCount: output.recordCount,
+    sha256: output.sha256,
+  };
+}
+
+
 function packageEdition(gpkg: string): string {
   const match = gpkg.match(/ED(\d{4}-\d{2}-\d{2})/i) ?? gpkg.match(/(\d{4}-\d{2}-\d{2})/);
   return match?.[1] ?? "unknown";
@@ -252,7 +259,7 @@ async function mainAuch(): Promise<void> {
   const gpkg = await locateExistingPackage();
   const listing = await commandOutput("ogrinfo", ["-ro", "-q", gpkg]);
   const availableLayers = new Set(layerNames(listing));
-  const missing = LAYERS.filter((spec) => !availableLayers.has(spec.layer)).map((spec) => spec.layer);
+  const missing = BD_TOPO_LAYERS.filter((spec) => !availableLayers.has(spec.layer)).map((spec) => spec.layer);
   if (missing.length > 0) throw new Error(`BD TOPO package is missing required canonical layers: ${missing.join(", ")}`);
   const boundaryPath = path.join(RAW_DIR, AUCH_DETAIL_SCOPE.boundaryRawFile);
   try {
@@ -288,7 +295,7 @@ async function mainAuch(): Promise<void> {
       sourceBoundsLambert93: sourceBounds,
       clipFallback: exported.clipFallback,
     },
-    outputs: outputs.map((output) => ({ name: output.name, layer: output.layer, file: output.file, recordCount: output.recordCount, sha256: output.sha256 })),
+    outputs: outputs.map(manifestOutput),
   };
   await mkdir(AUCH_INTERMEDIATE_DIR, { recursive: true });
   await writeFile(path.join(AUCH_INTERMEDIATE_DIR, "bdtopo-manifest.json"), JSON.stringify(manifest, null, 2) + "\n", "utf8");
@@ -326,11 +333,11 @@ async function main(): Promise<void> {
   const gpkg = gpkgFiles[0]!;
   const listing = await commandOutput("ogrinfo", ["-ro", "-q", gpkg]);
   const availableLayers = new Set(layerNames(listing));
-  const missing = LAYERS.filter((spec) => !availableLayers.has(spec.layer)).map((spec) => spec.layer);
+  const missing = BD_TOPO_LAYERS.filter((spec) => !availableLayers.has(spec.layer)).map((spec) => spec.layer);
   if (missing.length > 0) throw new Error(`BD TOPO package is missing required canonical layers: ${missing.join(", ")}`);
   const boundaryPath = path.join(RAW_DIR, GERS_TERRITORY.boundaryRawFile);
   const sourceBounds = await lambertBounds(boundaryPath);
-  const outputs = await exportLayers(gpkg, sourceBounds, RAW_DIR, null);
+  const outputs = (await exportLayers(gpkg, sourceBounds, RAW_DIR, null)).outputs;
   const timestamp = new Date().toISOString();
   const manifest = {
     source: "IGN BD TOPO",
@@ -352,6 +359,7 @@ async function main(): Promise<void> {
     archive: { file: path.relative(process.cwd(), archivePath), ...archive },
     package: { geoPackage: path.relative(process.cwd(), gpkg), layers: availableLayers.size },
     clipping: { method: "ogr2ogr -spat for Lambert-93 envelope, canonical polygon clipping during normalization", boundary: path.relative(process.cwd(), boundaryPath), sourceBoundsLambert93: sourceBounds },
+    outputs: outputs.map(manifestOutput),
   };
   await writeFile(path.join(INTERMEDIATE_DIR, "bdtopo-manifest.json"), JSON.stringify(manifest, null, 2) + "\n", "utf8");
   console.log(JSON.stringify({ ok: true, edition: resource.edition, archive, layers: outputs.map((output) => ({ name: output.name, layer: output.layer, recordCount: output.recordCount })) }, null, 2));

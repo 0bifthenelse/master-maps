@@ -50,7 +50,7 @@ export default function BusinessHoverPopup3D({ business }: BusinessHoverPopup3DP
     <group position={[x, 0, z]}>
       <mesh position={[0, 2.5, 0]}>
         <cylinderGeometry args={[0.25, 0.25, 5, 8]} />
-        <meshBasicMaterial color="#d34f2f" />
+        <meshBasicMaterial color="#ff7d27" />
       </mesh>
       <Html
         position={[0, 5, 0]}
@@ -68,22 +68,22 @@ export default function BusinessHoverPopup3D({ business }: BusinessHoverPopup3DP
           style={{
             width: "190px",
             padding: "9px 11px",
-            border: "1px solid rgba(0, 0, 0, 0.22)",
-            borderRadius: "7px",
-            background: "rgba(255, 252, 246, 0.97)",
-            color: "#171717",
-            boxShadow: "0 5px 18px rgba(0, 0, 0, 0.2)",
+            border: "1px solid color-mix(in srgb, var(--color-ink, #000) 24%, transparent)",
+            borderRadius: "2px",
+            background: "color-mix(in srgb, var(--color-paper, #fff) 96%, transparent)",
+            color: "var(--color-ink, #000000)",
+            boxShadow: "0 5px 18px color-mix(in srgb, var(--color-ink, #000) 22%, transparent)",
             fontFamily: "system-ui, sans-serif",
             fontSize: "11px",
             lineHeight: 1.35,
           }}
         >
-          <strong style={{ display: "block", marginBottom: "5px", fontSize: "13px" }}>
+          <strong style={{ display: "block", marginBottom: "5px", fontSize: "13px", color: "var(--color-ink, #000000)" }}>
             {title}
           </strong>
           {fields.map((field) => (
             <div key={field.label} style={{ display: "grid", gridTemplateColumns: "62px 1fr", gap: "4px" }}>
-              <span style={{ opacity: 0.62 }}>{field.label}</span>
+              <span style={{ color: "color-mix(in srgb, var(--color-ink, #000) 62%, transparent)" }}>{field.label}</span>
               <span style={{ overflowWrap: "anywhere" }}>{field.value}</span>
             </div>
           ))}
@@ -93,7 +93,7 @@ export default function BusinessHoverPopup3D({ business }: BusinessHoverPopup3DP
               target="_blank"
               rel="noreferrer"
               tabIndex={-1}
-              style={{ display: "inline-block", marginTop: "5px", color: "#a43824" }}
+              style={{ display: "inline-block", marginTop: "5px", color: "var(--color-accent, #ff7d27)" }}
             >
               Site web
             </a>

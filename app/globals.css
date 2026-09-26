@@ -1,5 +1,5 @@
 /* =========================================================================
- * Auch Interactive Map — Design tokens & global styles
+ * Auch Interactive Map - Design tokens & global styles
  *
  * Three root tokens power all derived colour values through opacity
  * and lightness adjustments. Light and dark themes are determined by
@@ -11,12 +11,12 @@
  *   --color-paper:  #ffffff  (near-white surface or text)
  *
  * Contrast verified:
- *   paper text on ink surface          → 21.0:1    (AAA)
- *   ink text on paper surface          → 21.0:1    (AAA)
- *   accent fill on ink surface         →  7.5:1    (AA large, pass)
- *   ink text on accent fill            →  7.0:1    (AA normal, pass)
- *   accent text on paper surface       → 10.2:1    (AAA)
- *   muted text (opacity 0.65) on paper →  4.5:1+   (AA normal, pass)
+ *   paper text on ink surface          -> 21.0:1    (AAA)
+ *   ink text on paper surface          -> 21.0:1    (AAA)
+ *   accent fill on ink surface         ->  7.5:1    (AA large, pass)
+ *   ink text on accent fill            ->  7.0:1    (AA normal, pass)
+ *   accent text on paper surface       -> 10.2:1    (AAA)
+ *   muted text (opacity 0.65) on paper ->  4.5:1+   (AA normal, pass)
  * ========================================================================= */
 
 :root {
@@ -34,6 +34,12 @@
   --color-border-strong: rgba(0, 0, 0, 0.3);
   --color-focus-ring: var(--color-accent);
   --color-overlay: rgba(0, 0, 0, 0.5);
+
+  /* --- Map chrome: overlays sit on the paper surface --- */
+  --map-panel: color-mix(in srgb, var(--color-paper) 94%, transparent);
+  --map-panel-solid: var(--color-paper);
+  --map-edge: var(--color-accent);
+  --map-scrim: color-mix(in srgb, var(--color-ink) 6%, transparent);
 
   /* --- Focus --- */
   --focus-ring-width: 2px;
@@ -130,13 +136,13 @@ a:hover {
   outline-offset: var(--focus-ring-offset);
 }
 
-/* Remove focus outline for pointer/click interactions — keep for keyboard */
+/* Remove focus outline for pointer/click interactions - keep for keyboard */
 :focus:not(:focus-visible) {
   outline: none;
 }
 
 /* =========================================================================
- * Utility — accent background with black text (7:1 contrast)
+ * Utility - accent background with black text (7:1 contrast)
  * ========================================================================= */
 
 .accent-bg {
@@ -165,12 +171,168 @@ a:hover {
 }
 
 /* =========================================================================
- * Map shell — full viewport
+ * Map shell - full viewport
  * ========================================================================= */
 
 #__next {
   width: 100vw;
   height: 100vh;
+}
+
+/* =========================================================================
+ * Map layout contract
+ *
+ * One full bleed canvas with absolutely positioned overlays above it. The
+ * shell used to be a flex column, which made the canvas a flex row sibling
+ * of the panels: it collapsed to 139 px of a 900 px viewport as soon as the
+ * inspector opened. Panels are overlays now, so the map box never depends on
+ * what is open.
+ * ========================================================================= */
+
+.map-shell {
+  position: fixed;
+  inset: 0;
+  display: block;
+  overflow: hidden;
+  background: var(--color-surface);
+  color: var(--color-text);
+  isolation: isolate;
+}
+
+.map-canvas,
+.map-shell__canvas {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  overflow: hidden;
+}
+
+.map-canvas canvas,
+.map-shell__canvas canvas {
+  display: block;
+  width: 100% !important;
+  height: 100% !important;
+  outline: none;
+  touch-action: none;
+}
+
+/* Shared edge rhythm for every overlay: one inset token, no per panel tuning */
+:root {
+  --hud-gap: 0.75rem;
+  --hud-panel-radius: 2px;
+  --hud-panel-border: 1px solid var(--color-border-strong);
+  --hud-panel-shadow: 0 1px 0 var(--color-border), 0 8px 24px var(--color-overlay);
+  --hud-accent-edge: 2px solid var(--color-accent);
+}
+
+.map-shell__loading,
+.map-shell__error {
+  position: absolute;
+  inset: 0;
+  z-index: 40;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--color-surface);
+}
+
+.map-shell__error {
+  flex-direction: column;
+  gap: var(--hud-gap);
+  padding: var(--hud-gap);
+  text-align: center;
+}
+
+/* HUD region: spans the map, owns the pointer, children opt back in */
+[role="region"][aria-label="Carte"] {
+  z-index: 10;
+}
+
+/* Layer panel: bottom left, above the attribution */
+.map-shell .layer-controls-panel {
+  position: absolute;
+  z-index: 20;
+  left: var(--hud-gap);
+  bottom: calc(var(--hud-gap) + 2.75rem);
+  max-width: min(20rem, calc(100vw - 2 * var(--hud-gap)));
+  max-height: calc(100vh - 12rem);
+  overflow-y: auto;
+  border: var(--hud-panel-border);
+  border-radius: var(--hud-panel-radius);
+  box-shadow: var(--hud-panel-shadow);
+}
+
+/* Inspector: right rail, independent of the canvas box */
+.map-shell .feature-inspector {
+  position: absolute;
+  z-index: 20;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: min(21rem, 100vw);
+  max-height: none;
+  border-left: var(--hud-accent-edge);
+  border-radius: 0;
+  box-shadow: var(--hud-panel-shadow);
+}
+
+/* Attribution: bottom strip, above the layer panel */
+.map-shell .source-attribution {
+  position: absolute;
+  z-index: 20;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  border-top: 1px solid var(--color-border);
+}
+
+/* Mobile inspector toggle: bottom right, only when something is selected */
+.map-shell__inspector-toggle {
+  position: absolute;
+  z-index: 25;
+  right: var(--hud-gap);
+  bottom: calc(var(--hud-gap) + 2.75rem);
+  padding: 0.5rem 0.75rem;
+  border: var(--hud-accent-edge);
+  border-radius: var(--hud-panel-radius);
+  background: var(--color-surface);
+  color: var(--color-text);
+  font: inherit;
+  font-size: 0.8125rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+/* Diagnostics: dev-only corner strip, never part of the layout */
+#scene-diagnostics {
+  position: absolute;
+  z-index: 15;
+  bottom: 0.25rem;
+  left: 0.5rem;
+  max-width: calc(100vw - 1rem);
+  overflow: hidden;
+  white-space: pre;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10px;
+  color: var(--color-text-muted);
+  pointer-events: none;
+  user-select: none;
+  opacity: 0.6;
+}
+
+@media (max-width: 640px) {
+  .map-shell .feature-inspector {
+    top: auto;
+    left: 0;
+    width: 100%;
+    max-height: 60vh;
+    border-top: var(--hud-accent-edge);
+    border-left: none;
+  }
+
+  .map-shell__inspector-toggle {
+    right: var(--hud-gap);
+  }
 }
 
 /* =========================================================================

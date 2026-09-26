@@ -1,6 +1,6 @@
 import { renderToWgs84, wgs84ToRender } from "../../src/lib/geo/crs";
 import { clipLineStringToPolygon, clipPolygonToPolygon, normalizePolygonGeometry, type PolygonGeometry } from "../../src/lib/geo/polygon";
-import { createBoundaryIndex, type BoundaryIndex } from "./boundaryIndex";
+import type { BoundaryIndex } from "./boundaryIndex";
 import { MapFeatureSchema, type Geometry, type MapFeature } from "../../src/lib/data/schema";
 
 export interface BulkBoundary {
@@ -11,18 +11,17 @@ export interface BulkBoundary {
 type Coordinate = [number, number];
 type AreaGeometry = Extract<Geometry, { type: "Polygon" | "MultiPolygon" }>;
 
-const ENRICHMENT_HIGHWAYS = new Set([
-  "path", "footway", "cycleway", "bridleway", "track", "pedestrian", "steps", "corridor", "via_ferrata",
-]);
 const SOURCE_URL = "https://download.geofabrik.de/europe/france/midi-pyrenees.html";
 const SOURCE_TIMESTAMP = new Date().toISOString();
+
+export type OsmRetention = "complete";
 
 export interface OsmNormalizeConfig {
   sourceName: string;
   sourceUrl: string;
   stableIdPrefix: string;
   priority: number;
-  retention: "enrichment" | "complete";
+  retention: OsmRetention;
 }
 
 const DEFAULT_OSM_NORMALIZE_CONFIG: OsmNormalizeConfig = {
@@ -30,42 +29,205 @@ const DEFAULT_OSM_NORMALIZE_CONFIG: OsmNormalizeConfig = {
   sourceUrl: SOURCE_URL,
   stableIdPrefix: "osm-bulk:",
   priority: 60,
-  retention: "enrichment",
+  retention: "complete",
 };
 
-type CompleteKind = "building" | "water" | "landuse" | "road" | "transport" | "poi";
+export type CompleteKind = "building" | "water" | "landuse" | "road" | "transport" | "poi" | "place";
+
+export type OsmDropReason =
+  | "unclassified_tags"
+  | "excluded_tag"
+  | "unreadable_geometry"
+  | "missing_source_id"
+  | "geometry_kind_mismatch"
+  | "outside_boundary"
+  | "degenerate_local_geometry"
+  | "schema_rejected";
+
+export const OSM_DROP_REASONS: readonly OsmDropReason[] = [
+  "unclassified_tags",
+  "excluded_tag",
+  "unreadable_geometry",
+  "missing_source_id",
+  "geometry_kind_mismatch",
+  "outside_boundary",
+  "degenerate_local_geometry",
+  "schema_rejected",
+];
+
+export interface OsmNormalizeReport {
+  inputTotal: number;
+  keptTotal: number;
+  droppedTotal: number;
+  keptByKind: Record<string, number>;
+  keptByCategory: Record<string, number>;
+  droppedByReason: Record<OsmDropReason, number>;
+}
+
+export interface OsmNormalizeResult {
+  features: MapFeature[];
+  report: OsmNormalizeReport;
+}
+
+type GeometryMode = "areal" | "linear" | "point" | "any";
 
 interface CompleteClassification {
   kind: CompleteKind;
-  subtype?: string;
+  subtype: string;
+  mode: GeometryMode;
 }
 
-function classifyCompleteTags(properties: Record<string, unknown>): CompleteClassification | null {
-  const name = text(properties.name);
+const ROAD_HIGHWAY = new Set([
+  "motorway", "motorway_link", "trunk", "trunk_link", "primary", "primary_link", "secondary", "secondary_link",
+  "tertiary", "tertiary_link", "unclassified", "residential", "living_street", "service", "road", "busway",
+  "track", "path", "footway", "cycleway", "bridleway", "pedestrian", "steps", "corridor", "via_ferrata",
+]);
+const ROAD_POINT_HIGHWAY = new Set(["mini_roundabout", "motorway_junction"]);
+const TRANSPORT_POINT_HIGHWAY = new Set(["bus_stop", "stop"]);
+const TRAFFIC_POLE_HIGHWAY = new Set([
+  "crossing", "give_way", "traffic_signals", "street_lamp", "speed_camera", "turning_circle", "turning_loop", "milestone", "elevator",
+]);
+const EXCLUDED_HIGHWAY = new Set(["construction", "proposed", "raceway", "rest_area", "bus_stop:condition", "platform"]);
+
+const RAILWAY_LINEAR = new Set(["rail", "light_rail", "subway", "tram", "narrow_gauge", "monorail", "funicular", "miniature", "preserved"]);
+const RAILWAY_POINT_TRANSPORT: Record<string, string> = { station: "station", halt: "halt", stop: "halt", train_station_entrance: "station", subway_entrance: "station" };
+const RAILWAY_POINT_POI = new Set(["level_crossing", "crossing", "switch", "signal", "buffer_stop", "derail", "traverser", "turntable", "crane", "signal_box", "gantry", "radio", "siding", "spur", "yard"]);
+const RAILWAY_EXCLUDED = new Set(["abandoned", "disused", "razed", "proposed", "construction", "was", "removed", "demolished", "destroyed", "damaged", "unused", "closed", "obstructed"]);
+
+const PUBLIC_TRANSPORT_TRANSPORT: Record<string, string> = { platform: "platform", stop_position: "platform", station: "station", stop_area: "station" };
+const PUBLIC_TRANSPORT_EXCLUDED = new Set(["proposed", "construction", "disused", "abandoned"]);
+
+const AEROWAY_TRANSPORT: Record<string, string> = { runway: "runway", taxiway: "runway", aerodrome: "aerodrome", airport: "aerodrome", heliport: "aerodrome" };
+const AEROWAY_POINT_POI = new Set(["gate"]);
+const AEROWAY_EXCLUDED = new Set(["apron", "terminal", "hangar", "windsock", "navigationaid", "beacon", "lighting", "windsock"]);
+
+const WATERWAY_LINEAR = new Set(["river", "canal", "stream", "ditch", "drain", "riverbank"]);
+const WATERWAY_POINT_POI = new Set(["dam", "weir", "lock_gate", "waterfall", "spring", "drinking_water", "water_point", "wash"]);
+
+const NATURAL_WATER_AREA = new Set(["water", "wetland"]);
+const NATURAL_AREA: Record<string, string> = { wood: "wood", forest: "forest", scrub: "scrub", heath: "heath", vineyard: "vineyard", orchard: "orchard", grassland: "grassland" };
+const NATURAL_POINT_POI = new Set(["spring", "tree", "cave_entrance", "beach", "sand", "rock", "boulder"]);
+
+const LEISURE_LANDUSE: Record<string, string> = {
+  pitch: "sports",
+  sports_centre: "sports",
+  sports_hall: "sports",
+  stadium: "sports",
+  golf_course: "sports",
+  nature_reserve: "reserve",
+};
+const LEISURE_POINT_POI = new Set(["horse_riding", "fishing", "fitness_station", "picnic_table", "outdoor_seating", "slipway", "swimming_pool", "bird_hide"]);
+const LEISURE_AREAL_ONLY = new Set(Object.keys(LEISURE_LANDUSE));
+
+const MAN_MADE_STRUCTURE = new Set(["bridge", "works"]);
+
+const BARRIER_GATE = new Set(["gate", "stile", "lift_gate", "swing_gate", "kissing_gate", "wicket_gate", "bump_gate"]);
+
+const POI_TAGS = ["shop", "amenity", "tourism", "historic", "office", "craft", "healthcare", "emergency", "information"] as const;
+
+const PLACE_IMPORTANCE: Record<string, number> = {
+  continent: 1, country: 1, state: 2, region: 2, province: 2, county: 3, municipality: 2, city: 1, town: 2,
+  borough: 3, suburb: 4, quarter: 5, village: 3, neighbourhood: 5, city_block: 5, locality: 5, square: 5,
+  islet: 5, hamlet: 6, isolated_dwelling: 6, farm: 6,
+};
+
+const PLACE_KINDS = new Set(Object.keys(PLACE_IMPORTANCE));
+
+interface GeometryOutcome {
+  ok: boolean;
+  geometry?: Geometry;
+  reason: OsmDropReason;
+}
+
+function resolveGeometry(geometry: Geometry, mode: GeometryMode): GeometryOutcome {
+  const keep: GeometryOutcome = { ok: true, geometry, reason: "unclassified_tags" };
+  const reject: GeometryOutcome = { ok: false, reason: "geometry_kind_mismatch" };
+  if (mode === "point" || mode === "any") return keep;
+  if (mode === "linear") {
+    return geometry.type === "LineString" || geometry.type === "MultiLineString" ? keep : reject;
+  }
+  if (geometry.type === "Polygon" || geometry.type === "MultiPolygon") return keep;
+  if (geometry.type !== "LineString") return reject;
+  const ring = closedRing(geometry.coordinates);
+  return ring === null ? reject : { ok: true, geometry: { type: "Polygon", coordinates: [ring] }, reason: "unclassified_tags" };
+}
+
+function classifyCompleteTags(properties: Record<string, unknown>): CompleteClassification | OsmDropReason {
   const building = text(properties.building);
-  const buildingPart = text(properties["building:part"]);
-  if (building !== undefined || buildingPart !== undefined) return { kind: "building", subtype: building };
+  if (building !== undefined || text(properties["building:part"]) !== undefined) return { kind: "building", subtype: building ?? "part", mode: "areal" };
+  const place = text(properties.place);
+  if (place !== undefined) {
+    return PLACE_KINDS.has(place) ? { kind: "place", subtype: place, mode: "any" } : "excluded_tag";
+  }
+  if (text(properties.boundary) !== undefined) return "excluded_tag";
+  const highway = text(properties.highway);
+  if (highway !== undefined && TRANSPORT_POINT_HIGHWAY.has(highway)) return { kind: "transport", subtype: "bus_stop", mode: "point" };
+  if (highway !== undefined && EXCLUDED_HIGHWAY.has(highway)) return "excluded_tag";
+  const railway = text(properties.railway);
+  if (railway !== undefined) {
+    if (RAILWAY_LINEAR.has(railway)) return { kind: "transport", subtype: "rail", mode: "linear" };
+    const station = RAILWAY_POINT_TRANSPORT[railway];
+    if (station !== undefined) return { kind: "transport", subtype: station, mode: "point" };
+    if (RAILWAY_POINT_POI.has(railway)) return { kind: "poi", subtype: railway, mode: "point" };
+    return RAILWAY_EXCLUDED.has(railway) ? "excluded_tag" : "unclassified_tags";
+  }
+  const publicTransport = text(properties["public_transport"]);
+  if (publicTransport !== undefined) {
+    const transport = PUBLIC_TRANSPORT_TRANSPORT[publicTransport];
+    if (transport !== undefined) return { kind: "transport", subtype: transport, mode: "any" };
+    return PUBLIC_TRANSPORT_EXCLUDED.has(publicTransport) ? "excluded_tag" : "unclassified_tags";
+  }
+  const aeroway = text(properties.aeroway);
+  if (aeroway !== undefined) {
+    const transport = AEROWAY_TRANSPORT[aeroway];
+    if (transport !== undefined) return { kind: "transport", subtype: transport, mode: "any" };
+    if (AEROWAY_POINT_POI.has(aeroway)) return { kind: "poi", subtype: aeroway, mode: "point" };
+    return AEROWAY_EXCLUDED.has(aeroway) ? "excluded_tag" : "unclassified_tags";
+  }
   const waterway = text(properties.waterway);
-  const natural = text(properties.natural);
+  if (waterway !== undefined) {
+    if (WATERWAY_LINEAR.has(waterway)) return { kind: "water", subtype: waterway, mode: "any" };
+    if (WATERWAY_POINT_POI.has(waterway)) return { kind: "poi", subtype: waterway, mode: "point" };
+    return "excluded_tag";
+  }
   const landuse = text(properties.landuse);
-  if (waterway !== undefined || natural === "water" || natural === "wetland" || landuse === "reservoir") {
-    return { kind: "water", subtype: waterway ?? (natural === "water" ? "water" : natural ?? "reservoir") };
+  if (landuse !== undefined) {
+    if (landuse === "reservoir" || landuse === "basin") return { kind: "water", subtype: landuse, mode: "areal" };
+    return { kind: "landuse", subtype: landuse, mode: "areal" };
+  }
+  const natural = text(properties.natural);
+  if (natural !== undefined) {
+    if (NATURAL_WATER_AREA.has(natural)) return { kind: "water", subtype: natural, mode: "areal" };
+    const area = NATURAL_AREA[natural];
+    if (area !== undefined) return { kind: "landuse", subtype: area, mode: "areal" };
+    if (NATURAL_POINT_POI.has(natural)) return { kind: "poi", subtype: natural, mode: "point" };
+    return "excluded_tag";
   }
   const leisure = text(properties.leisure);
-  if (landuse !== undefined || leisure !== undefined) return { kind: "landuse", subtype: landuse ?? leisure };
-  const highway = text(properties.highway);
-  if (highway !== undefined) return { kind: "road", subtype: highway };
-  const railway = text(properties.railway);
-  const publicTransport = text(properties.public_transport);
-  if (railway !== undefined || publicTransport !== undefined) {
-    return { kind: "transport", subtype: railway ?? publicTransport ?? "other" };
+  if (leisure !== undefined) {
+    if (LEISURE_AREAL_ONLY.has(leisure)) return { kind: "landuse", subtype: LEISURE_LANDUSE[leisure]!, mode: "areal" };
+    return LEISURE_POINT_POI.has(leisure) ? { kind: "poi", subtype: leisure, mode: "point" } : { kind: "landuse", subtype: leisure, mode: "any" };
   }
-  if (name !== undefined) {
-    const poiType = text(properties.place) ?? text(properties.shop) ?? text(properties.amenity) ?? text(properties.tourism)
-      ?? text(properties.historic) ?? text(properties.office) ?? text(properties.craft);
-    if (poiType !== undefined) return { kind: "poi", subtype: poiType };
+  const manMade = text(properties["man_made"]);
+  if (manMade !== undefined) {
+    return MAN_MADE_STRUCTURE.has(manMade) ? { kind: "poi", subtype: manMade, mode: "any" } : "excluded_tag";
   }
-  return null;
+  if (highway !== undefined) {
+    if (ROAD_HIGHWAY.has(highway)) return { kind: "road", subtype: highway, mode: "linear" };
+    if (ROAD_POINT_HIGHWAY.has(highway)) return { kind: "road", subtype: highway, mode: "point" };
+    if (TRAFFIC_POLE_HIGHWAY.has(highway)) return { kind: "poi", subtype: highway, mode: "point" };
+    return "unclassified_tags";
+  }
+  const barrier = text(properties.barrier);
+  if (barrier !== undefined) {
+    return BARRIER_GATE.has(barrier) ? { kind: "poi", subtype: barrier, mode: "point" } : "excluded_tag";
+  }
+  if (text(properties.power) !== undefined) return "excluded_tag";
+  for (const key of POI_TAGS) {
+    const value = text(properties[key]);
+    if (value !== undefined) return { kind: "poi", subtype: value, mode: "point" };
+  }
+  return "unclassified_tags";
 }
 
 function clipGeometryToBoundary(sourceGeometry: Geometry, boundary: BulkBoundary | undefined): Geometry | null {
@@ -105,33 +267,32 @@ function parseMaxSpeed(value: unknown): number | undefined {
   return Number.isInteger(candidate) && candidate >= 0 ? candidate : undefined;
 }
 
-function parseCompleteFeature(value: unknown): MapFeature | null {
-  const result = MapFeatureSchema.safeParse(value);
-  return result.success ? result.data : null;
+function parsePopulation(value: unknown): number | undefined {
+  if (typeof value === "number") return Number.isInteger(value) && value >= 0 ? value : undefined;
+  if (typeof value !== "string") return undefined;
+  const candidate = Number.parseInt(value.trim().replace(/[^\d]/g, ""), 10);
+  return Number.isInteger(candidate) && candidate >= 0 ? candidate : undefined;
 }
+
 function completeFeature(
   raw: Record<string, unknown>,
   properties: Record<string, unknown>,
   sourceGeometry: Geometry,
   boundary: BulkBoundary | undefined,
   config: OsmNormalizeConfig,
-): MapFeature | null {
+): { feature: MapFeature | null; reason: OsmDropReason } {
   const classification = classifyCompleteTags(properties);
-  if (!classification) return null;
-  const areal = sourceGeometry.type === "Polygon" || sourceGeometry.type === "MultiPolygon";
-  const linear = sourceGeometry.type === "LineString" || sourceGeometry.type === "MultiLineString";
-  if ((classification.kind === "building" || classification.kind === "landuse") && !areal) return null;
-  if (classification.kind === "water" && !areal && !linear) return null;
-  if (classification.kind === "road" && !linear) return null;
-  if (classification.kind === "transport" && sourceGeometry.type !== "Point" && !linear) return null;
+  if (typeof classification === "string") return { feature: null, reason: classification };
+  const resolved = resolveGeometry(sourceGeometry, classification.mode);
+  if (!resolved.ok || !resolved.geometry) return { feature: null, reason: resolved.reason };
   const sourceId = stableSourceId(raw, properties);
-  if (!sourceId) return null;
-  const effective = clipGeometryToBoundary(sourceGeometry, boundary);
-  if (!effective) return null;
-  const local = localize(effective);
-  if (!local) return null;
-  const geometryLocalAnchor = geometryAnchor(local);
-  const anchor = anchorFor(effective, geometryLocalAnchor, boundary);
+  if (!sourceId) return { feature: null, reason: "missing_source_id" };
+  const effective = clipGeometryToBoundary(resolved.geometry, boundary);
+  if (!effective) return { feature: null, reason: "outside_boundary" };
+  const isPoint = classification.mode === "point";
+  const anchor = isPoint && effective.type === "Point"
+    ? effective.coordinates
+    : anchorFor(effective, geometryAnchor(localize(effective) ?? effective), boundary);
   const localAnchor = wgs84ToRender(anchor);
   const stableId = `${config.stableIdPrefix}${sourceId}`;
   const objectUrl = sourceObjectUrl(sourceId);
@@ -149,18 +310,40 @@ function completeFeature(
     sourceRefs: [{ source: config.sourceName, url: objectUrl ?? config.sourceUrl, timestamp: SOURCE_TIMESTAMP, license: "ODbL-1.0" }],
     provenance: [{ featureId: stableId, property: "geometry", winner: config.sourceName, contenders: [config.sourceName], priority: config.priority, timestamp: SOURCE_TIMESTAMP }],
   };
-  const sourceMetadata = metadata({ sourceId, sourceObjectUrl: objectUrl, tags: text(properties["@id"]) ?? text(raw.id), highway: properties.highway, amenity: properties.amenity, shop: properties.shop, tourism: properties.tourism });
+  const sourceMetadata = metadata({
+    sourceId,
+    sourceObjectUrl: objectUrl,
+    tags: text(properties["@id"]) ?? text(raw.id),
+    highway: properties.highway,
+    railway: properties.railway,
+    publicTransport: properties["public_transport"],
+    place: properties.place,
+    aeroway: properties.aeroway,
+    waterway: properties.waterway,
+    natural: properties.natural,
+    landuse: properties.landuse,
+    leisure: properties.leisure,
+    manMade: properties["man_made"],
+    barrier: properties.barrier,
+    amenity: properties.amenity,
+    shop: properties.shop,
+    tourism: properties.tourism,
+  });
+  const geometry: Geometry = isPoint ? { type: "Point", coordinates: anchor } : effective;
+  const localGeometry: Geometry = isPoint
+    ? { type: "Point", coordinates: localAnchor }
+    : localize(effective) ?? geometry;
   if (classification.kind === "building") {
     const height = parseWidth(properties.height);
     const levels = Number.parseInt(text(properties["building:levels"]) ?? "", 10);
     const validLevels = Number.isFinite(levels) && levels >= 0 ? levels : undefined;
     const inferredHeight = height ?? (validLevels !== undefined && validLevels > 0 ? validLevels * 3 : 3);
     const heightSource = height !== undefined ? "explicit" : validLevels !== undefined && validLevels > 0 ? "inferred_from_levels" : "inferred_default";
-    return parseCompleteFeature({
+    return { feature: parseCompleteFeature({
       ...base,
       kind: "building",
-      geometry: effective,
-      localGeometry: local,
+      geometry,
+      localGeometry,
       height: inferredHeight,
       heightInferred: height === undefined,
       heightSource,
@@ -172,45 +355,45 @@ function completeFeature(
       roofColour: text(properties["roof:colour"]),
       startDate: text(properties["start_date"]),
       sourceMetadata,
-    });
+    }), reason: "unclassified_tags" };
   }
   if (classification.kind === "water") {
     const width = parseWidth(properties.width ?? properties["water:width"]);
     const salt = text(properties.salt);
-    return parseCompleteFeature({
+    return { feature: parseCompleteFeature({
       ...base,
       kind: "water",
-      geometry: effective,
-      localGeometry: local,
+      geometry,
+      localGeometry,
       waterType: classification.subtype,
       width,
       widthInferred: width === undefined,
-      isSurface: areal,
+      isSurface: geometry.type === "Polygon" || geometry.type === "MultiPolygon",
       intermittent: parseBoolean(properties.intermittent),
       salt: salt === "yes" || salt === "no" ? salt : undefined,
       tidal: parseBoolean(properties.tidal),
       sourceMetadata,
-    });
+    }), reason: "unclassified_tags" };
   }
   if (classification.kind === "landuse") {
-    return parseCompleteFeature({
+    return { feature: parseCompleteFeature({
       ...base,
       kind: "landuse",
-      geometry: effective,
-      localGeometry: local,
-      landuseType: classification.subtype ?? "other",
+      geometry,
+      localGeometry,
+      landuseType: classification.subtype,
       sourceMetadata,
-    });
+    }), reason: "unclassified_tags" };
   }
   if (classification.kind === "road") {
     const width = parseWidth(properties.width);
     const bridge = parseBoolean(properties.bridge);
     const tunnel = parseBoolean(properties.tunnel);
-    return parseCompleteFeature({
+    return { feature: parseCompleteFeature({
       ...base,
       kind: "road",
-      geometry: effective,
-      localGeometry: local,
+      geometry,
+      localGeometry,
       highway: classification.subtype,
       roadClass: classification.subtype,
       width,
@@ -227,39 +410,51 @@ function completeFeature(
       lit: parseBoolean(properties.lit),
       sidewalk: text(properties.sidewalk),
       sourceMetadata,
-    });
+    }), reason: "unclassified_tags" };
   }
   if (classification.kind === "transport") {
-    return parseCompleteFeature({
+    return { feature: parseCompleteFeature({
       ...base,
       kind: "transport",
-      geometry: effective,
-      localGeometry: local,
-      transportType: classification.subtype ?? "other",
+      geometry,
+      localGeometry,
+      transportType: classification.subtype,
       line: text(properties.line),
       route: text(properties.route),
       network: text(properties.network),
       operator: text(properties.operator),
       ref: text(properties.ref),
-      publicTransport: text(properties.public_transport),
+      publicTransport: text(properties["public_transport"]),
+      wheelchair: text(properties.wheelchair),
       sourceMetadata,
-    });
+    }), reason: "unclassified_tags" };
   }
-  return parseCompleteFeature({
+  if (classification.kind === "place") {
+    return { feature: parseCompleteFeature({
+      ...base,
+      kind: "place",
+      geometry,
+      localGeometry,
+      placeType: classification.subtype,
+      importance: PLACE_IMPORTANCE[classification.subtype],
+      population: parsePopulation(properties.population),
+      sourceMetadata,
+    }), reason: "unclassified_tags" };
+  }
+  return { feature: parseCompleteFeature({
     ...base,
     kind: "poi",
-    geometry: { type: "Point", coordinates: anchor },
-    sourceGeometry,
-    localGeometry: { type: "Point", coordinates: localAnchor },
-    poiType: classification.subtype ?? "poi",
-    category: text(properties.shop) ?? text(properties.amenity) ?? text(properties.tourism) ?? text(properties.historic) ?? text(properties.office) ?? text(properties.craft) ?? text(properties.place),
+    geometry,
+    localGeometry,
+    poiType: classification.subtype,
+    category: text(properties.amenity) ?? text(properties.shop) ?? text(properties.tourism) ?? text(properties.historic) ?? text(properties.office) ?? text(properties.craft) ?? text(properties.healthcare),
     website: text(properties.website) ?? text(properties["contact:website"]),
     phone: text(properties.phone) ?? text(properties["contact:phone"]),
-    openingHours: text(properties.opening_hours),
+    openingHours: text(properties["opening_hours"]),
     wheelchair: text(properties.wheelchair),
     operator: text(properties.operator),
     sourceMetadata,
-  });
+  }), reason: "unclassified_tags" };
 }
 
 function record(value: unknown): value is Record<string, unknown> {
@@ -284,6 +479,15 @@ function line(value: unknown): Coordinate[] | null {
   return points.length >= 2 && points.every((point): point is Coordinate => point !== null)
     ? points
     : null;
+}
+
+function closedRing(value: unknown): Coordinate[] | null {
+  const points = line(value);
+  if (!points || points.length < 4) return null;
+  const first = points[0]!;
+  const last = points[points.length - 1]!;
+  if (first[0] !== last[0] || first[1] !== last[1]) return null;
+  return points;
 }
 
 function ring(value: unknown): Coordinate[] | null {
@@ -330,6 +534,7 @@ function parseGeometry(value: unknown): Geometry | null {
   return null;
 }
 
+
 function localize(geometry: Geometry): Geometry | null {
   const mapPoint = (point: Coordinate): Coordinate => wgs84ToRender(point);
   if (geometry.type === "Point") return { type: "Point", coordinates: mapPoint(geometry.coordinates) };
@@ -340,6 +545,7 @@ function localize(geometry: Geometry): Geometry | null {
     : { type: "MultiPolygon", coordinates: geometry.coordinates.map((polygon) => polygon.map((points) => points.map(mapPoint))) };
   return normalizePolygonGeometry(mapped);
 }
+
 
 function lineLength(points: Coordinate[]): number {
   let total = 0;
@@ -434,6 +640,7 @@ function geometryAnchor(geometry: Geometry): Coordinate {
   return totalArea > 1e-9 ? [x / totalArea, y / totalArea] : geometry.coordinates[0]?.[0]?.[0] ?? [0, 0];
 }
 
+
 function geometryPoints(geometry: Geometry): Coordinate[] {
   const points: Coordinate[] = [];
   const visit = (value: unknown): void => {
@@ -476,11 +683,6 @@ function stableSourceId(raw: Record<string, unknown>, properties: Record<string,
   return text(raw.id) ?? text(properties["@id"]) ?? text(properties.osm_id) ?? null;
 }
 
-function isNamedPoi(properties: Record<string, unknown>): boolean {
-  return text(properties.name) !== undefined
-    && ["amenity", "shop", "tourism", "historic", "office", "craft", "leisure", "public_transport", "railway", "building", "place"].some((key) => text(properties[key]) !== undefined);
-}
-
 function sourceObjectUrl(sourceId: string): string | undefined {
   const compact = sourceId.match(/^([nwr](\d+))$/i);
   if (compact) {
@@ -490,85 +692,76 @@ function sourceObjectUrl(sourceId: string): string | undefined {
   }
   return /^(node|way|relation)\/\d+$/.test(sourceId) ? `https://www.openstreetmap.org/${sourceId}` : undefined;
 }
-export function normalizeOsmBulk(features: Record<string, unknown>[], boundary?: BulkBoundary, config?: OsmNormalizeConfig): MapFeature[] {
+
+function parseCompleteFeature(value: unknown): MapFeature | null {
+  const result = MapFeatureSchema.safeParse(value);
+  return result.success ? result.data : null;
+}
+
+export function emptyOsmNormalizeReport(): OsmNormalizeReport {
+  const droppedByReason = {} as Record<OsmDropReason, number>;
+  for (const reason of OSM_DROP_REASONS) droppedByReason[reason] = 0;
+  return { inputTotal: 0, keptTotal: 0, droppedTotal: 0, keptByKind: {}, keptByCategory: {}, droppedByReason };
+}
+
+export function featureCategory(feature: MapFeature): string {
+  if (feature.kind === "road") return `road:${feature.roadClass ?? feature.highway ?? "unknown"}`;
+  if (feature.kind === "landuse") return `landuse:${feature.landuseType}`;
+  if (feature.kind === "water") return `water:${feature.waterType ?? "water"}`;
+  if (feature.kind === "transport") return `transport:${feature.transportType}`;
+  if (feature.kind === "place") return `place:${feature.placeType}`;
+  if (feature.kind === "poi") return `poi:${feature.poiType}`;
+  if (feature.kind === "building") return `building:${feature.buildingType ?? "yes"}`;
+  return feature.kind;
+}
+
+export interface BulkFeatureOutcome {
+  feature: MapFeature | null;
+  reason: OsmDropReason;
+}
+
+export function normalizeOsmBulkFeature(
+  raw: Record<string, unknown>,
+  boundary: BulkBoundary | undefined,
+  config: OsmNormalizeConfig | undefined,
+  report: OsmNormalizeReport,
+): BulkFeatureOutcome {
   const resolved = config ?? DEFAULT_OSM_NORMALIZE_CONFIG;
-  const result: MapFeature[] = [];
-  for (const raw of features) {
-    const sourceGeometry = parseGeometry(raw.geometry);
-    const properties = record(raw.properties) ? raw.properties : {};
-    if (!sourceGeometry) continue;
-    if (resolved.retention === "complete") {
-      const feature = completeFeature(raw, properties, sourceGeometry, boundary, resolved);
-      if (feature !== null) result.push(feature);
-      continue;
-    }
-    const highway = text(properties.highway);
-    const namedRoad = highway !== undefined && text(properties.name) !== undefined;
-    const isRoad = highway !== undefined && (ENRICHMENT_HIGHWAYS.has(highway) || namedRoad);
-    const isPoi = isNamedPoi(properties);
-    if (!isRoad && !isPoi) continue;
-    const sourceId = stableSourceId(raw, properties);
-    if (!sourceId) continue;
-    const effectiveSourceGeometry = clipGeometryToBoundary(sourceGeometry, boundary);
-    if (!effectiveSourceGeometry) continue;
-    const localSourceGeometry = localize(effectiveSourceGeometry);
-    if (!localSourceGeometry) continue;
-    const geometryLocalAnchor = geometryAnchor(localSourceGeometry);
-    const anchor = anchorFor(effectiveSourceGeometry, geometryLocalAnchor, boundary);
-    const localAnchor = wgs84ToRender(anchor);
-    const stableId = `${resolved.stableIdPrefix}${sourceId}`;
-    const reference = { source: resolved.sourceName, url: sourceObjectUrl(sourceId) ?? resolved.sourceUrl, timestamp: SOURCE_TIMESTAMP, license: "ODbL-1.0" };
-    const common = {
-      stableId,
-      sourceId,
-      name: text(properties.name),
-      lon: anchor[0],
-      lat: anchor[1],
-      x: localAnchor[0],
-      z: localAnchor[1],
-      confidence: "medium" as const,
-      status: "active" as const,
-      sourceRefs: [reference],
-      provenance: [{ featureId: stableId, property: "geometry", winner: resolved.sourceName, contenders: [resolved.sourceName], priority: resolved.priority, timestamp: SOURCE_TIMESTAMP }],
-      sourceMetadata: metadata({ sourceId, sourceObjectUrl: sourceObjectUrl(sourceId), enrichmentOnly: namedRoad && !ENRICHMENT_HIGHWAYS.has(highway ?? ""), tags: properties["@id"], highway, amenity: properties.amenity, shop: properties.shop, tourism: properties.tourism }),
-    };
-    if (isRoad && localSourceGeometry.type !== "Point") {
-      const width = parseWidth(properties.width);
-      const bridge = parseBoolean(properties.bridge);
-      const tunnel = parseBoolean(properties.tunnel);
-      const layer = text(properties.layer);
-      result.push({
-        ...common,
-        kind: "road",
-        geometry: effectiveSourceGeometry,
-        localGeometry: localSourceGeometry,
-        highway,
-        roadClass: highway,
-        width,
-        widthInferred: width === undefined,
-        widthSource: width === undefined ? "inferred_default" : "explicit",
-        bridge,
-        tunnel,
-        stratum: tunnel ? "tunnel" : bridge ? "bridge" : "normal",
-        layer,
-      });
-      continue;
-    }
-    const poiGeometry = { type: "Point", coordinates: anchor } as const;
-    const poiLocal = { type: "Point", coordinates: localAnchor } as const;
-    result.push({
-      ...common,
-      kind: "poi",
-      geometry: poiGeometry,
-      sourceGeometry,
-      localGeometry: poiLocal,
-      poiType: text(properties.place) ?? text(properties.amenity) ?? text(properties.shop) ?? text(properties.tourism) ?? text(properties.historic) ?? text(properties.railway) ?? "poi",
-      category: text(properties.amenity) ?? text(properties.shop) ?? text(properties.tourism) ?? text(properties.place),
-      website: text(properties.website) ?? text(properties["contact:website"]),
-      phone: text(properties.phone) ?? text(properties["contact:phone"]),
-      openingHours: text(properties.opening_hours),
-      operator: text(properties.operator),
-    });
+  report.inputTotal += 1;
+  const sourceGeometry = parseGeometry(raw.geometry);
+  const properties = record(raw.properties) ? raw.properties : {};
+  if (!sourceGeometry) {
+    report.droppedByReason.unreadable_geometry += 1;
+    report.droppedTotal += 1;
+    return { feature: null, reason: "unreadable_geometry" };
   }
-  return result;
+  const { feature, reason } = completeFeature(raw, properties, sourceGeometry, boundary, resolved);
+  if (feature === null) {
+    report.droppedByReason[reason] += 1;
+    report.droppedTotal += 1;
+    return { feature: null, reason };
+  }
+  report.keptTotal += 1;
+  report.keptByKind[feature.kind] = (report.keptByKind[feature.kind] ?? 0) + 1;
+  const category = featureCategory(feature);
+  report.keptByCategory[category] = (report.keptByCategory[category] ?? 0) + 1;
+  return { feature, reason: "schema_rejected" };
+}
+
+export function normalizeOsmBulkWithReport(
+  features: Record<string, unknown>[],
+  boundary?: BulkBoundary,
+  config?: OsmNormalizeConfig,
+): OsmNormalizeResult {
+  const report = emptyOsmNormalizeReport();
+  const output: MapFeature[] = [];
+  for (const raw of features) {
+    const outcome = normalizeOsmBulkFeature(raw, boundary, config, report);
+    if (outcome.feature !== null) output.push(outcome.feature);
+  }
+  return { features: output, report };
+}
+
+export function normalizeOsmBulk(features: Record<string, unknown>[], boundary?: BulkBoundary, config?: OsmNormalizeConfig): MapFeature[] {
+  return normalizeOsmBulkWithReport(features, boundary, config).features;
 }

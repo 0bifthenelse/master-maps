@@ -3,9 +3,24 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { intersection } from "polygon-clipping";
 import { MapFeatureSchema, type Geometry, type MapFeature, type ProvenanceRecord, type SourceReference } from "../../src/lib/data/schema";
+import {
+  createDropSink,
+  createSourceAccounting,
+  DROP_REASONS,
+  STAGES,
+  type DropSink,
+  type SourceAccounting,
+} from "./exclusion-report";
 import { wgs84ToRender } from "../../src/lib/geo/crs";
+import * as os from "node:os";
+import { createReadStream } from "node:fs";
+import readline from "node:readline";
 
 const BUCKET_SIZE_METRES = 100;
+
+const OUTPUT_CHUNK_SIZE = 20_000;
+const SCAN_BAND_CELLS = 4;
+const TEMP_PREFIX = "master-maps-dedup-";
 const LINE_MATCH_DISTANCE_METRES = 4;
 const BUILDING_MIN_IOU = 0.35;
 const WATER_MIN_IOU = 0.25;
@@ -21,33 +36,62 @@ const SOURCE_PRIORITY: Record<string, number> = {
   "pagesjaunes": 40,
 };
 
-interface DupOptions {
-  inDir: string;
-  outDir: string;
-}
-
 type LocalPoint = [number, number];
 type LocalLine = LocalPoint[];
 type LocalPolygon = LocalLine[];
 
+const SOURCE_LAYER_BY_KIND: Record<string, string> = {
+  building: "batiment",
+  road: "troncon_de_route",
+  water: "troncon_hydrographique",
+};
+
+export interface DedupAccounting {
+  sources: SourceAccounting;
+  drops: DropSink;
+}
+
+export function createDedupAccounting(): DedupAccounting {
+  return { sources: createSourceAccounting(), drops: createDropSink() };
+}
+
+function sourceKeyOf(feature: MapFeature): string {
+  return feature.sourceRefs[0]?.source ?? "unknown";
+}
+
+function layerOf(feature: MapFeature): string {
+  const layer = (feature.sourceMetadata as { layer?: unknown } | undefined)?.layer;
+  return typeof layer === "string" ? layer : SOURCE_LAYER_BY_KIND[feature.kind] ?? "-";
+}
+
 function dataRoot(): string {
   return process.env.MASTER_MAPS_DATA_DIR ?? "data";
+}
+
+interface DupOptions {
+  inDir: string;
+  outDir: string;
+  memoryMode: boolean;
 }
 
 function parseArgs(args: string[]): DupOptions {
   const root = dataRoot();
   let inDir = path.join(root, "intermediate");
   let outDir = path.join(root, "intermediate");
+  let memoryMode = false;
   for (let index = 0; index < args.length; index += 1) {
     const argument = args[index];
     if (argument === "--in-dir" && args[index + 1]) inDir = args[++index]!;
     if (argument === "--out-dir" && args[index + 1]) outDir = args[++index]!;
+    if (argument === "--memory") memoryMode = true;
     if (argument === "--help" || argument === "-h") {
-      console.log("Usage: tsx scripts/data/deduplicate.ts [--in-dir <path>] [--out-dir <path>]");
+      console.log("Usage: tsx scripts/data/deduplicate.ts [--in-dir <path>] [--out-dir <path>] [--memory]");
+      console.log("  default    bounded memory spatial scan, temp bands under os.tmpdir()");
+      console.log("  --memory   legacy single pass in RAM, kept as the equivalence reference");
       process.exit(0);
     }
   }
-  return { inDir, outDir };
+  return { inDir, outDir, memoryMode };
 }
 
 function sourceName(feature: MapFeature): string {
@@ -314,6 +358,7 @@ function mergeGroup(group: MapFeature[]): MapFeature {
   const scalarFields = [
     "name", "address", "lon", "lat", "x", "z", "height", "heightInferred", "heightSource", "levels",
     "roadClass", "highway", "width", "widthInferred", "widthSource", "waterType", "fictiveAxis", "poiType",
+    "buildingType", "roofType", "wallType", "landuseType", "transportType", "structureType", "placeType", "importance",
     "businessName", "legalName", "brand", "category", "nafCode", "nafLabel", "siret", "siren", "businessId",
     "website", "phone", "openingHours", "operator", "wheelchair", "administrativeStatus", "creationDate",
   ] as const;
@@ -365,13 +410,27 @@ function bucketKey(kind: string, x: number, z: number): string {
   return `${kind}:${Math.floor(x / BUCKET_SIZE_METRES)}:${Math.floor(z / BUCKET_SIZE_METRES)}`;
 }
 
-export function deduplicateFeatures(features: MapFeature[]): MapFeature[] {
+export function deduplicateFeatures(features: MapFeature[], accounting?: DedupAccounting): MapFeature[] {
   const groups: MapFeature[][] = [];
   const exact = new Map<string, number>();
   const buckets = new Map<string, number[]>();
+  const inputByKey = new Map<string, number>();
+  const acceptedByKey = new Map<string, number>();
+  const mergedByKey = new Map<string, number>();
+  const exactIdentities = new Map<string, Set<string>>();
+  const count = (store: Map<string, number>, source: string, layer: string, kind: string, delta: number): void => {
+    if (accounting === undefined || delta === 0) return;
+    const key = `${source}::${layer}::${kind}`;
+    store.set(key, (store.get(key) ?? 0) + delta);
+  };
   for (const input of features) {
     const feature = MapFeatureSchema.parse(input);
+    const source = sourceKeyOf(feature);
+    const layer = layerOf(feature);
+    count(inputByKey, source, layer, feature.kind, 1);
     let groupIndex = exact.get(feature.stableId);
+    let exactIdentity = false;
+    let metricConflation = false;
     const coordinateValue = coordinateOf(feature);
     if (groupIndex === undefined && coordinateValue) {
       const xBucket = Math.floor(coordinateValue[0] / BUCKET_SIZE_METRES);
@@ -383,6 +442,7 @@ export function deduplicateFeatures(features: MapFeature[]): MapFeature[] {
             const candidateGroup = groups[candidateIndex];
             if (candidateGroup?.some((candidate) => canConflate(candidate, feature))) {
               groupIndex = candidateIndex;
+              metricConflation = !candidateGroup.some((candidate) => candidate.stableId === feature.stableId);
               break;
             }
           }
@@ -392,8 +452,22 @@ export function deduplicateFeatures(features: MapFeature[]): MapFeature[] {
     if (groupIndex === undefined) {
       groupIndex = groups.length;
       groups.push([feature]);
+      count(acceptedByKey, source, layer, feature.kind, 1);
     } else {
       groups[groupIndex]!.push(feature);
+      count(mergedByKey, source, layer, feature.kind, 1);
+      if (metricConflation) {
+        accounting?.drops.drop(STAGES.deduplicate, DROP_REASONS.dedupMetricConflation, 1, `${feature.stableId} conflated into ${groups[groupIndex]![0]!.stableId}`);
+      } else {
+        exactIdentity = true;
+        accounting?.drops.drop(STAGES.deduplicate, DROP_REASONS.dedupExactIdentity, 1, `${feature.stableId} repeats an identity already grouped`);
+      }
+    }
+    if (exactIdentity) {
+      const key = `${source}::${layer}::${feature.kind}`;
+      const identities = exactIdentities.get(key) ?? new Set<string>();
+      identities.add(feature.stableId);
+      exactIdentities.set(key, identities);
     }
     exact.set(feature.stableId, groupIndex);
     if (coordinateValue) {
@@ -403,15 +477,571 @@ export function deduplicateFeatures(features: MapFeature[]): MapFeature[] {
       buckets.set(key, list);
     }
   }
+  if (accounting !== undefined) {
+    for (const [key, input] of inputByKey) {
+      const [source = "unknown", layer = "-", kind = "unknown"] = key.split("::");
+      const accepted = acceptedByKey.get(key) ?? 0;
+      const merged = mergedByKey.get(key) ?? 0;
+      const identical = exactIdentities.get(key)?.size ?? 0;
+      const metric = Math.max(0, merged - identical);
+      accounting.sources.record(source, layer, kind, input, accepted, { excludedCount: merged, excluded: DROP_REASONS.dedupExactIdentity, reason: "duplicate canonical identity collapsed into the group winner" });
+      if (metric > 0) {
+        accounting.sources.record(source, layer, kind, 0, 0, { excludedCount: metric, excluded: DROP_REASONS.dedupMetricConflation, reason: "metric conflation collapsed a second source record into the group winner" });
+      }
+      accounting.sources.recordMerged(source, layer, kind, merged);
+    }
+  }
   return groups.map(mergeGroup);
+}
+
+export const DEDUP_INPUT_SIDECARS = new Set([
+  "provenance.json",
+  "boundary-source.json",
+  "auch-boundary-source.json",
+  "bdtopo-manifest.json",
+  "ign-unavailable.json",
+  "osm-manifest.json",
+  "auch-osm-manifest.json",
+  "osm-bulk-manifest.json",
+  "relation-issues.json",
+  "normalization-issues.json",
+]);
+
+export const DEDUP_PRESERVED_SIDECARS = new Set([
+  "boundary-source.json",
+  "auch-boundary-source.json",
+  "bdtopo-manifest.json",
+  "ign-unavailable.json",
+  "osm-manifest.json",
+  "auch-osm-manifest.json",
+  "osm-bulk-manifest.json",
+  "relation-issues.json",
+  "normalization-issues.json",
+]);
+
+export const DEDUP_TEMP_ROOT = process.env.MASTER_MAPS_DEDUP_TMP ?? os.tmpdir();
+
+async function listFeatureFiles(dir: string): Promise<string[]> {
+  const names: string[] = [];
+  for (const entry of await fs.readdir(dir, { withFileTypes: true })) {
+    if (!entry.isFile() || !entry.name.endsWith(".json") || DEDUP_INPUT_SIDECARS.has(entry.name)) continue;
+    names.push(entry.name);
+  }
+  return names.sort();
+}
+
+interface LiveGroup {
+  features: MapFeature[];
+  cells: Set<string>;
+  retireOrder: number;
+}
+
+export interface DedupStreamStats {
+  input: number;
+  groups: number;
+  emitted: number;
+  inputBytes: number;
+  outputBytes: number;
+  peakBands: number;
+  widthCells: number;
+  depthCells: number;
+  bandCells: number;
+}
+
+function cellOf(feature: MapFeature): [number, number] | null {
+  const coordinate = coordinateOf(feature);
+  if (!coordinate) return null;
+  return [Math.floor(coordinate[0] / BUCKET_SIZE_METRES), Math.floor(coordinate[1] / BUCKET_SIZE_METRES)];
+}
+
+function accountKey(source: string, layer: string, kind: string): string {
+  return `${source}::${layer}::${kind}`;
+}
+
+function moveFile(from: string, to: string): Promise<void> {
+  return fs.rename(from, to).catch(async (error: unknown) => {
+    if ((error as NodeJS.ErrnoException).code !== "EXDEV") throw error;
+    await fs.copyFile(from, to);
+    await fs.unlink(from);
+  });
+}
+
+class BandSpool {
+  private readonly handles = new Map<number, fs.FileHandle>();
+  private readonly buffers = new Map<number, string>();
+
+  constructor(private readonly dir: string, private readonly openLimit = 48) {}
+
+  async append(band: number, payload: string): Promise<void> {
+    const buffer = (this.buffers.get(band) ?? "") + payload;
+    if (buffer.length >= 1 << 20) {
+      await this.write(band, buffer);
+      return;
+    }
+    this.buffers.set(band, buffer);
+  }
+
+  private async write(band: number, payload: string): Promise<void> {
+    this.buffers.set(band, "");
+    let handle = this.handles.get(band);
+    if (handle === undefined) {
+      if (this.handles.size >= this.openLimit) {
+        const [oldest] = this.handles.keys();
+        const stale = oldest === undefined ? undefined : this.handles.get(oldest);
+        if (oldest !== undefined) this.handles.delete(oldest);
+        if (stale !== undefined) await stale.close();
+      }
+      handle = await fs.open(path.join(this.dir, `band-${band}.ndjson`), "w");
+      this.handles.set(band, handle);
+    }
+    await handle.write(payload);
+  }
+
+  async close(): Promise<void> {
+    for (const [band, buffer] of [...this.buffers]) {
+      if (buffer.length > 0) await this.write(band, buffer);
+    }
+    this.buffers.clear();
+    for (const handle of this.handles.values()) await handle.close();
+    this.handles.clear();
+  }
+}
+
+class ChunkSink {
+  private readonly open = new Map<string, { chunk: number; handle: fs.FileHandle }>();
+  private readonly nextChunk = new Map<string, number>();
+
+  constructor(private readonly dir: string) {}
+
+  private async openChunk(kind: string): Promise<fs.FileHandle> {
+    const chunk = this.nextChunk.get(kind) ?? 0;
+    this.nextChunk.set(kind, chunk + 1);
+    const previous = this.open.get(kind);
+    if (previous !== undefined) {
+      await previous.handle.write("\n]\n");
+      await previous.handle.close();
+    }
+    const handle = await fs.open(path.join(this.dir, `${kind}#${String(chunk).padStart(6, "0")}.json`), "w");
+    await handle.write("[");
+    this.open.set(kind, { chunk, handle });
+    return handle;
+  }
+
+  async append(feature: MapFeature, sequence: number): Promise<void> {
+    const chunk = Math.floor(sequence / OUTPUT_CHUNK_SIZE);
+    const state = this.open.get(feature.kind);
+    if (state === undefined || state.chunk !== chunk) {
+      const handle = await this.openChunk(feature.kind);
+      await handle.write(JSON.stringify(feature));
+      return;
+    }
+    await state.handle.write(`,\n${JSON.stringify(feature)}`);
+  }
+
+  async close(): Promise<void> {
+    for (const { handle } of this.open.values()) {
+      await handle.write("\n]\n");
+      await handle.close();
+    }
+    this.open.clear();
+  }
+}
+
+async function* featureRecords(file: string): AsyncGenerator<string> {
+  const stream = createReadStream(file, { encoding: "utf8", highWaterMark: 1 << 20 });
+  let buffer = "";
+  let scanned = 0;
+  let depth = 0;
+  let start = -1;
+  let inString = false;
+  let escaped = false;
+  for await (const piece of stream) {
+    buffer += piece as string;
+    while (scanned < buffer.length) {
+      const character = buffer[scanned]!;
+      scanned += 1;
+      if (inString) {
+        if (escaped) escaped = false;
+        else if (character === "\\") escaped = true;
+        else if (character === '"') inString = false;
+        continue;
+      }
+      if (character === '"') {
+        inString = true;
+        continue;
+      }
+      if (character === "{") {
+        if (depth === 0) start = scanned - 1;
+        depth += 1;
+        continue;
+      }
+      if (character === "}") {
+        depth -= 1;
+        if (depth === 0 && start >= 0) {
+          yield buffer.slice(start, scanned);
+          start = -1;
+        }
+      }
+    }
+    if (start >= 0) {
+      buffer = buffer.slice(start);
+      scanned -= start;
+      start = 0;
+    } else {
+      buffer = "";
+      scanned = 0;
+    }
+  }
+}
+
+async function* textLines(file: string): AsyncGenerator<string> {
+  const stream = createReadStream(file, { encoding: "utf8", highWaterMark: 1 << 20 });
+  let pending = "";
+  for await (const piece of stream) {
+    pending += piece as string;
+    let start = 0;
+    for (;;) {
+      const stop = pending.indexOf("\n", start);
+      if (stop < 0) break;
+      yield pending.slice(start, stop);
+      start = stop + 1;
+    }
+    pending = pending.slice(start);
+  }
+  if (pending.length > 0) yield pending;
+}
+
+export async function deduplicateStreaming(
+  inDir: string,
+  outDir: string,
+  accounting: DedupAccounting = createDedupAccounting()
+): Promise<DedupStreamStats> {
+  const workDir = await fs.mkdtemp(path.join(DEDUP_TEMP_ROOT, TEMP_PREFIX));
+  try {
+    return await runScan(inDir, outDir, accounting, workDir);
+  } finally {
+    await fs.rm(workDir, { recursive: true, force: true });
+  }
+}
+
+async function runScan(
+  inDir: string,
+  outDir: string,
+  accounting: DedupAccounting,
+  workDir: string
+): Promise<DedupStreamStats> {
+  const accounted = new Map<string, number>();
+  const spool = new BandSpool(workDir);
+  let unanchoredCount = 0;
+  let total = 0;
+  let inputBytes = 0;
+  let minCellX = Infinity;
+  let maxCellX = -Infinity;
+  let minCellZ = Infinity;
+  let maxCellZ = -Infinity;
+  try {
+    for (const name of await listFeatureFiles(inDir)) {
+      for await (const raw of featureRecords(path.join(inDir, name))) {
+        const feature = MapFeatureSchema.parse(JSON.parse(raw) as unknown);
+        const key = accountKey(sourceKeyOf(feature), layerOf(feature), feature.kind);
+        accounted.set(key, (accounted.get(key) ?? 0) + 1);
+        total += 1;
+        inputBytes += raw.length;
+        const cell = cellOf(feature);
+        if (cell === null) {
+          unanchoredCount += 1;
+          await spool.append(Number.MAX_SAFE_INTEGER, `${raw}\n`);
+          continue;
+        }
+        if (cell[0] < minCellX) minCellX = cell[0];
+        if (cell[0] > maxCellX) maxCellX = cell[0];
+        if (cell[1] < minCellZ) minCellZ = cell[1];
+        if (cell[1] > maxCellZ) maxCellZ = cell[1];
+        await spool.append(Math.floor(cell[1] / SCAN_BAND_CELLS), `${total}\t${cell[0]}\t${cell[1]}\t${raw}\n`);
+      }
+    }
+  } finally {
+    await spool.close();
+  }
+
+  const width = Number.isFinite(minCellX) ? maxCellX - minCellX + 1 : 1;
+  const depth = Number.isFinite(minCellZ) ? maxCellZ - minCellZ + 1 : 1;
+  const retire = unanchoredCount > 0 ? width + 1 : 0;
+
+  for (const entry of await fs.readdir(outDir, { withFileTypes: true })) {
+    if (entry.isFile() && entry.name.endsWith(".json") && !DEDUP_PRESERVED_SIDECARS.has(entry.name)) {
+      await fs.unlink(path.join(outDir, entry.name));
+    }
+  }
+  const sink = new ChunkSink(workDir);
+  const provenance = await fs.open(path.join(workDir, "provenance.ndjson"), "w");
+  const exact = new Map<string, number>();
+  const groups = new Map<number, LiveGroup>();
+  const buckets = new Map<string, number[]>();
+  const acceptedByKey = new Map<string, number>();
+  const mergedByKey = new Map<string, number>();
+  const exactIdentities = new Map<string, Set<string>>();
+  const pending: { retire: number; id: number; generation: number }[] = [];
+  const generations = new Map<number, number>();
+  let nextId = 0;
+  let sequence = 0;
+  let emitted = 0;
+  let outputBytes = 0;
+
+  const emit = async (id: number): Promise<void> => {
+    const group = groups.get(id);
+    if (group === undefined) return;
+    const merged = mergeGroup(group.features);
+    const encoded = JSON.stringify(merged);
+    await sink.append(merged, sequence);
+    outputBytes += encoded.length;
+    sequence += 1;
+    emitted += 1;
+    let provenanceBuffer = "";
+    for (const record of merged.provenance) {
+      provenanceBuffer += `${JSON.stringify(record)}\n`;
+      if (provenanceBuffer.length >= 1 << 20) {
+        await provenance.write(provenanceBuffer);
+        provenanceBuffer = "";
+      }
+    }
+    if (provenanceBuffer.length > 0) await provenance.write(provenanceBuffer);
+    groups.delete(id);
+    for (const cell of group.cells) {
+      const list = buckets.get(cell);
+      if (list === undefined) continue;
+      const at = list.indexOf(id);
+      if (at >= 0) list.splice(at, 1);
+      if (list.length === 0) buckets.delete(cell);
+    }
+  };
+
+  const pushRetire = (id: number, retire: number): void => {
+    const generation = (generations.get(id) ?? 0) + 1;
+    generations.set(id, generation);
+    let at = pending.length;
+    pending.push({ retire, id, generation });
+    while (at > 0) {
+      const parent = (at - 1) >> 1;
+      if (pending[parent]!.retire <= pending[at]!.retire) break;
+      const swap = pending[parent]!;
+      pending[parent] = pending[at]!;
+      pending[at] = swap;
+      at = parent;
+    }
+  };
+
+  const popRetire = (): { retire: number; id: number; generation: number } | undefined => {
+    if (pending.length === 0) return undefined;
+    const top = pending[0]!;
+    const last = pending.pop()!;
+    if (pending.length > 0) {
+      pending[0] = last;
+      let at = 0;
+      for (;;) {
+        const left = at * 2 + 1;
+        const right = left + 1;
+        let smallest = at;
+        if (left < pending.length && pending[left]!.retire < pending[smallest]!.retire) smallest = left;
+        if (right < pending.length && pending[right]!.retire < pending[smallest]!.retire) smallest = right;
+        if (smallest === at) break;
+        const swap = pending[at]!;
+        pending[at] = pending[smallest]!;
+        pending[smallest] = swap;
+        at = smallest;
+      }
+    }
+    return top;
+  };
+
+  const sweep = async (order: number): Promise<void> => {
+    for (;;) {
+      const next = popRetire();
+      if (next === undefined || next.retire >= order) {
+        if (next !== undefined) pushRetire(next.id, next.retire);
+        return;
+      }
+      if (generations.get(next.id) === next.generation) await emit(next.id);
+    }
+  };
+
+  const accept = async (raw: string, cellX: number, cellZ: number, cellOrder: number, anchored: boolean): Promise<void> => {
+    const feature = MapFeatureSchema.parse(JSON.parse(raw) as unknown);
+    const source = sourceKeyOf(feature);
+    const layer = layerOf(feature);
+    const key = accountKey(source, layer, feature.kind);
+    let found = exact.get(feature.stableId);
+    let metricConflation = false;
+    if (found === undefined && anchored) {
+      search: for (let dx = -1; dx <= 1; dx += 1) {
+        for (let dz = -1; dz <= 1; dz += 1) {
+          const candidates = buckets.get(`${feature.kind}:${cellX + dx}:${cellZ + dz}`);
+          if (candidates === undefined) continue;
+          for (const candidateId of candidates) {
+            const group = groups.get(candidateId);
+            if (group === undefined) continue;
+            if (group.features.some((candidate) => canConflate(candidate, feature))) {
+              found = candidateId;
+              metricConflation = !group.features.some((candidate) => candidate.stableId === feature.stableId);
+              break search;
+            }
+          }
+        }
+      }
+    }
+    const group = found === undefined ? undefined : groups.get(found);
+    if (found === undefined) {
+      const id = nextId;
+      nextId += 1;
+      const retireOrder = anchored ? cellOrder + retire : Number.MAX_SAFE_INTEGER;
+      groups.set(id, { features: [feature], cells: new Set<string>(), retireOrder });
+      pushRetire(id, retireOrder);
+      acceptedByKey.set(key, (acceptedByKey.get(key) ?? 0) + 1);
+      exact.set(feature.stableId, id);
+      if (anchored) {
+        const bucket = `${feature.kind}:${cellX}:${cellZ}`;
+        const list = buckets.get(bucket) ?? [];
+        list.push(id);
+        buckets.set(bucket, list);
+        groups.get(id)?.cells.add(bucket);
+      }
+      return;
+    }
+    if (group === undefined) {
+      const identities = exactIdentities.get(key) ?? new Set<string>();
+      identities.add(feature.stableId);
+      exactIdentities.set(key, identities);
+      accounting.drops.drop(STAGES.deduplicate, DROP_REASONS.dedupExactIdentity, 1, `${feature.stableId} repeats an identity already merged and emitted`);
+      mergedByKey.set(key, (mergedByKey.get(key) ?? 0) + 1);
+      return;
+    }
+    if (metricConflation) {
+      accounting.drops.drop(STAGES.deduplicate, DROP_REASONS.dedupMetricConflation, 1, `${feature.stableId} conflated into ${group.features[0]!.stableId}`);
+    } else {
+      const identities = exactIdentities.get(key) ?? new Set<string>();
+      identities.add(feature.stableId);
+      exactIdentities.set(key, identities);
+      accounting.drops.drop(STAGES.deduplicate, DROP_REASONS.dedupExactIdentity, 1, `${feature.stableId} repeats an identity already grouped`);
+    }
+    mergedByKey.set(key, (mergedByKey.get(key) ?? 0) + 1);
+    if (!anchored) return;
+    group.features.push(feature);
+    exact.set(feature.stableId, found);
+    if (cellOrder + retire > group.retireOrder) {
+      group.retireOrder = cellOrder + retire;
+      pushRetire(found, group.retireOrder);
+    }
+    const bucket = `${feature.kind}:${cellX}:${cellZ}`;
+    const list = buckets.get(bucket) ?? [];
+    if (!list.includes(found)) list.push(found);
+    buckets.set(bucket, list);
+    group.cells.add(bucket);
+  };
+
+  const bandNames = (await fs.readdir(workDir)).filter((name) => name.startsWith("band-")).sort((first, second) =>
+    Number(first.slice(5, -6)) - Number(second.slice(5, -6))
+  );
+  let peakBands = 0;
+  for (const name of bandNames) {
+    const records: { order: number; cellX: number; cellZ: number; raw: string; anchored: boolean }[] = [];
+    for await (const line of textLines(path.join(workDir, name))) {
+      if (line.length === 0) continue;
+      if (line[0] === "{") {
+        records.push({ order: 0, cellX: 0, cellZ: 0, raw: line, anchored: false });
+        continue;
+      }
+      const first = line.indexOf("\t");
+      const second = line.indexOf("\t", first + 1);
+      const third = line.indexOf("\t", second + 1);
+      records.push({
+        order: Number(line.slice(0, first)),
+        cellX: Number(line.slice(first + 1, second)),
+        cellZ: Number(line.slice(second + 1, third)),
+        raw: line.slice(third + 1),
+        anchored: true,
+      });
+    }
+    records.sort((first, second) => {
+      if (first.anchored !== second.anchored) return first.anchored ? -1 : 1;
+      if (!first.anchored) return 0;
+      const a = (first.cellZ - minCellZ) * width + (first.cellX - minCellX);
+      const b = (second.cellZ - minCellZ) * width + (second.cellX - minCellX);
+      return a === b ? first.order - second.order : a - b;
+    });
+    peakBands = Math.max(peakBands, records.length);
+    for (const record of records) {
+      const cellOrder = record.anchored ? (record.cellZ - minCellZ) * width + (record.cellX - minCellX) : Number.MAX_SAFE_INTEGER;
+      if (record.anchored) await sweep(cellOrder);
+      await accept(record.raw, record.cellX, record.cellZ, cellOrder, record.anchored);
+    }
+  }
+  for (const id of [...groups.keys()]) await emit(id);
+  await sink.close();
+  await provenance.close();
+
+  for (const [key, input] of accounted) {
+    const [source = "unknown", layer = "-", kind = "unknown"] = key.split("::");
+    const accepted = acceptedByKey.get(key) ?? 0;
+    const merged = mergedByKey.get(key) ?? 0;
+    const identical = exactIdentities.get(key)?.size ?? 0;
+    const metric = Math.max(0, merged - identical);
+    accounting.sources.record(source, layer, kind, input, accepted, {
+      excludedCount: merged,
+      excluded: DROP_REASONS.dedupExactIdentity,
+      reason: "duplicate canonical identity collapsed into the group winner",
+    });
+    if (metric > 0) {
+      accounting.sources.record(source, layer, kind, 0, 0, {
+        excludedCount: metric,
+        excluded: DROP_REASONS.dedupMetricConflation,
+        reason: "metric conflation collapsed a second source record into the group winner",
+      });
+    }
+    accounting.sources.recordMerged(source, layer, kind, merged);
+  }
+
+  const staged = path.join(workDir, "staged");
+  await fs.mkdir(staged, { recursive: true });
+  for (const name of await fs.readdir(workDir)) {
+    if (name.endsWith(".json") && name.includes("#")) {
+      const kind = name.slice(0, name.indexOf("#"));
+      const chunk = Number(name.slice(name.indexOf("#") + 1, name.length - 5));
+      const suffix = chunk === 0 ? "" : `-${String(chunk).padStart(4, "0")}`;
+      await moveFile(path.join(workDir, name), path.join(staged, `${kind}${suffix}.json`));
+    }
+  }
+  for (const name of await fs.readdir(staged)) await moveFile(path.join(staged, name), path.join(outDir, name));
+  await fs.rm(staged, { recursive: true, force: true });
+  await writeProvenance(path.join(workDir, "provenance.ndjson"), path.join(outDir, "provenance.json"));
+
+  return { input: total, groups: nextId, emitted, inputBytes, outputBytes, peakBands, widthCells: width, depthCells: depth, bandCells: SCAN_BAND_CELLS };
+}
+
+async function writeProvenance(source: string, destination: string): Promise<void> {
+  const reader = readline.createInterface({ input: createReadStream(source), crlfDelay: Infinity });
+  const handle = await fs.open(destination, "w");
+  let buffer = "[";
+  let first = true;
+  try {
+    for await (const line of reader) {
+      if (line.length === 0) continue;
+      buffer += `${first ? "" : ",\n"}${line}`;
+      first = false;
+      if (buffer.length >= 1 << 20) {
+        await handle.write(buffer);
+        buffer = "";
+      }
+    }
+    await handle.write(`${buffer}\n]\n`);
+  } finally {
+    await handle.close();
+  }
 }
 
 async function readFeatures(inDir: string): Promise<MapFeature[]> {
   const result: MapFeature[] = [];
-  const ignored = new Set(["provenance.json", "boundary-source.json", "bdtopo-manifest.json", "ign-unavailable.json", "osm-manifest.json", "osm-bulk-manifest.json", "relation-issues.json", "normalization-issues.json"]);
-  for (const entry of await fs.readdir(inDir, { withFileTypes: true })) {
-    if (!entry.isFile() || !entry.name.endsWith(".json") || ignored.has(entry.name)) continue;
-    const parsed: unknown = JSON.parse(await fs.readFile(path.join(inDir, entry.name), "utf8"));
+  for (const name of await listFeatureFiles(inDir)) {
+    const parsed: unknown = JSON.parse(await fs.readFile(path.join(inDir, name), "utf8"));
     if (!Array.isArray(parsed)) continue;
     for (const value of parsed) result.push(MapFeatureSchema.parse(value));
   }
@@ -441,9 +1071,8 @@ async function writeJsonArray(filePath: string, values: Iterable<unknown>): Prom
 }
 
 async function writeFeatures(features: MapFeature[], outDir: string): Promise<void> {
-  const preserved = new Set(["boundary-source.json", "bdtopo-manifest.json", "ign-unavailable.json", "osm-manifest.json", "osm-bulk-manifest.json", "relation-issues.json", "normalization-issues.json"]);
   for (const entry of await fs.readdir(outDir, { withFileTypes: true })) {
-    if (entry.isFile() && entry.name.endsWith(".json") && !preserved.has(entry.name)) await fs.unlink(path.join(outDir, entry.name));
+    if (entry.isFile() && entry.name.endsWith(".json") && !DEDUP_PRESERVED_SIDECARS.has(entry.name)) await fs.unlink(path.join(outDir, entry.name));
   }
   const groups = new Map<string, MapFeature[]>();
   for (const feature of features) {
@@ -452,9 +1081,9 @@ async function writeFeatures(features: MapFeature[], outDir: string): Promise<vo
     groups.set(feature.kind, list);
   }
   for (const [kind, list] of groups) {
-    for (let offset = 0; offset < list.length; offset += 20_000) {
-      const suffix = offset === 0 ? "" : `-${String(offset / 20_000).padStart(4, "0")}`;
-      await writeJsonArray(path.join(outDir, `${kind}${suffix}.json`), list.slice(offset, offset + 20_000));
+    for (let offset = 0; offset < list.length; offset += OUTPUT_CHUNK_SIZE) {
+      const suffix = offset === 0 ? "" : `-${String(offset / OUTPUT_CHUNK_SIZE).padStart(4, "0")}`;
+      await writeJsonArray(path.join(outDir, `${kind}${suffix}.json`), list.slice(offset, offset + OUTPUT_CHUNK_SIZE));
     }
   }
   function* provenanceRecords(): Iterable<unknown> {
@@ -463,20 +1092,49 @@ async function writeFeatures(features: MapFeature[], outDir: string): Promise<vo
   await writeJsonArray(path.join(outDir, "provenance.json"), provenanceRecords());
 }
 
-export async function deduplicateAll(inDir?: string, outDir?: string): Promise<void> {
+export async function deduplicateAll(
+  inDir?: string,
+  outDir?: string,
+  accounting: DedupAccounting = createDedupAccounting()
+): Promise<DedupAccounting> {
   const root = dataRoot();
   const sourceDir = inDir ?? path.join(root, "intermediate");
   const destinationDir = outDir ?? path.join(root, "intermediate");
-  const input = await readFeatures(sourceDir);
-  const output = deduplicateFeatures(input);
-  await writeFeatures(output, destinationDir);
-  console.error(`[deduplicate] Merged ${input.length} canonical features to ${output.length}`);
+  if (process.env.MASTER_MAPS_DEDUP_STREAM !== "1") return deduplicateAllInMemory(sourceDir, destinationDir, accounting);
+  const stats = await deduplicateStreaming(sourceDir, destinationDir, accounting);
+  console.error(
+    `[deduplicate] bounded-memory scan grouped ${stats.input} canonical features into ${stats.groups} identities, emitted ${stats.emitted} ` +
+      `(bands=${stats.bandCells} cells wide=${stats.widthCells} deep=${stats.depthCells}, ${megabytes(stats.inputBytes)} in, ${megabytes(stats.outputBytes)} out)`
+  );
+  return accounting;
+}
+
+function megabytes(bytes: number): string {
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 if (process.argv[1]?.endsWith("deduplicate.ts")) {
   const options = parseArgs(process.argv.slice(2));
-  deduplicateAll(options.inDir, options.outDir).catch((error: unknown) => {
+  const run = options.memoryMode
+    ? deduplicateAllInMemory(options.inDir, options.outDir)
+    : deduplicateAll(options.inDir, options.outDir);
+  run.catch((error: unknown) => {
     console.error("[deduplicate] Fatal:", error);
     process.exit(1);
   });
+}
+
+export async function deduplicateAllInMemory(
+  inDir?: string,
+  outDir?: string,
+  accounting: DedupAccounting = createDedupAccounting()
+): Promise<DedupAccounting> {
+  const root = dataRoot();
+  const sourceDir = inDir ?? path.join(root, "intermediate");
+  const destinationDir = outDir ?? path.join(root, "intermediate");
+  const input = await readFeatures(sourceDir);
+  const output = deduplicateFeatures(input, accounting);
+  await writeFeatures(output, destinationDir);
+  console.error(`[deduplicate] in-memory reference merged ${input.length} canonical features to ${output.length}`);
+  return accounting;
 }

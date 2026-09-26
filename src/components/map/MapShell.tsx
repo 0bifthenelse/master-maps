@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import dynamic from "next/dynamic";
 import MapHud from "@/components/map/MapHud";
-import FeatureInspector from "@/components/map/FeatureInspector";
+import FeatureInspector, { type FeatureDetailRecord } from "@/components/map/FeatureInspector";
 import LayerControls, { DEFAULT_LAYERS as BASE_LAYERS, type LayerId, type LayerState } from "@/components/map/LayerControls";
 import SourceAttribution from "@/components/map/SourceAttribution";
 import LoadingState from "@/components/map/LoadingState";
@@ -11,17 +11,16 @@ import WebGPUUnsupported from "@/components/map/WebGPUUnsupported";
 import { publishSceneDiagnostics, sceneMetrics } from "@/lib/scene/sceneMetrics";
 import { normalizeSearchText } from "@/lib/data/search";
 import { wgs84ToRender } from "@/lib/geo/crs";
-import { computeLocalFocus, type LocalGeometry } from "@/lib/geo/focus";
-import {
-  DatasetManifestSchema,
-  type DatasetManifest,
-  type FeatureKind,
-  type MapFeature,
-  type TileData,
-} from "@/lib/data/schema";
+import { DatasetManifestSchema, type DatasetManifest } from "@/lib/data/schema";
 import { SearchHitSchema, SEARCH_MIN_QUERY_LENGTH, type SearchHit } from "@/lib/data/searchTypes";
-import { loadTile } from "@/lib/data/loadTile";
+import { loadTileMeta } from "@/lib/data/loadTile";
 import type { SceneFeature } from "./CityScene";
+import { loadRenderTile, nextRenderTileGeneration } from "@/lib/render/loadRenderTile";
+import { evictTile, putDecodedTile, resetTileGpuCache, getResidentDecodedTile } from "@/lib/render/tileGpuCache";
+import type { DecodedRenderTile } from "@/lib/render/codec";
+import { resolvePickedFeatureByStableId, type PickedFeature } from "@/lib/scene/highlight";
+import FeatureContextMenu, { attributeLabel, type FeatureContextMenuDetail } from "@/components/map/FeatureContextMenu";
+import FeatureHighlightLayer from "@/components/map/FeatureHighlightLayer";
 
 const WebGPUCityCanvas = dynamic(() => import("@/components/map/WebGPUCityCanvas"), { ssr: false, loading: () => null });
 const CityScene = dynamic(() => import("@/components/map/CityScene"), { ssr: false, loading: () => null });
@@ -53,21 +52,11 @@ function tileRuntimeDiagnostics(): TileRuntimeDiagnostics {
   return window.__masterMapsTileDiagnostics;
 }
 
-const RENDERABLE_KINDS: Record<FeatureKind, boolean> = {
-  boundary: true,
-  building: true,
-  road: true,
-  water: true,
-  landuse: true,
-  poi: true,
-  business: true,
-  address: false,
-  transport: true,
-  structure: true,
-  place: true,
-};
+
+const EMPTY_SCENE_FEATURES: SceneFeature[] = [];
 
 const TILE_LOAD_CONCURRENCY = 8;
+const DATASET_BOUNDARY_TILE_ID = "boundary";
 const DEFAULT_LAYERS: LayerState = { ...BASE_LAYERS, commercialAudit: false };
 const LS_THEME_KEY = "map-theme";
 
@@ -106,9 +95,13 @@ function visibleTileIds(manifest: DatasetManifest, viewport: ViewportSnapshot | 
   const entries = manifest.tiles ?? [];
   if (entries.length === 0) return [];
   const datasetBounds = manifestBounds(manifest);
+  if (viewport === null) {
+    const lod = lodForSpan(Math.max(datasetBounds[2] - datasetBounds[0], datasetBounds[3] - datasetBounds[1]));
+    return entries.filter((entry) => entry.lod === lod).map((entry) => entry.tileId).sort();
+  }
   const view = enclosingBounds(viewport, datasetBounds);
   const span = Math.max(view[2] - view[0], view[3] - view[1]);
-  const lod = viewport ? lodForSpan(span) : 2;
+  const lod = lodForSpan(span);
   const candidates = entries.filter((entry) => entry.lod === lod);
   const tileSize = candidates[0]?.bounds[2] !== undefined ? candidates[0].bounds[2] - candidates[0].bounds[0] : span;
   const margin = tileSize;
@@ -116,58 +109,34 @@ function visibleTileIds(manifest: DatasetManifest, viewport: ViewportSnapshot | 
   return candidates.filter((entry) => entry.bounds[0] <= expanded[2] && entry.bounds[2] >= expanded[0] && entry.bounds[1] <= expanded[3] && entry.bounds[3] >= expanded[1]).map((entry) => entry.tileId).sort();
 }
 
-function countTileFeatures(tiles: Map<string, TileData>): number {
-  let count = 0;
-  for (const tile of tiles.values()) count += tile.features.length;
-  return count;
+type TileStateUpdate = (state: TileState) => TileState;
+
+
+function mergeTileSlot(state: TileState, decoded: DecodedRenderTile): TileState {
+  const slots = new Map(state.slots);
+  slots.set(decoded.header.tileId, decoded);
+  const renderTileIds = [...slots.keys()].sort();
+  return { slots, renderTileIds, version: state.version + 1 };
 }
 
-function focusFromFeature(feature: MapFeature): { x: number; z: number } | null {
-  if (feature.localGeometry) {
-    const [x, z] = computeLocalFocus(feature.localGeometry as LocalGeometry);
-    return Number.isFinite(x) && Number.isFinite(z) ? { x, z } : null;
-  }
-  if (feature.x !== undefined && feature.z !== undefined) return { x: feature.x, z: feature.z };
-  return null;
+function dropTileSlot(state: TileState, tileId: string): TileState {
+  const slots = new Map(state.slots);
+  slots.delete(tileId);
+  return { slots, renderTileIds: state.renderTileIds.filter((id) => id !== tileId), version: state.version + 1 };
 }
 
-function sceneFeature(feature: MapFeature): SceneFeature | null {
-  if (!RENDERABLE_KINDS[feature.kind] || !feature.localGeometry) return null;
-  const geometry = feature.localGeometry;
-  if (feature.kind === "building" && (geometry.type === "Polygon" || geometry.type === "MultiPolygon")) return { ...feature, geometry } as SceneFeature;
-  if (feature.kind === "road" && (geometry.type === "LineString" || geometry.type === "MultiLineString")) return { ...feature, geometry } as SceneFeature;
-  if (feature.kind === "water" && geometry.type !== "Point") return { ...feature, geometry } as SceneFeature;
-  if (feature.kind === "landuse" && (geometry.type === "Polygon" || geometry.type === "MultiPolygon")) return { ...feature, geometry } as SceneFeature;
-  if ((feature.kind === "poi" || feature.kind === "business") && geometry.type === "Point") return { ...feature, geometry } as SceneFeature;
-  if (feature.kind === "boundary" && (geometry.type === "Polygon" || geometry.type === "MultiPolygon")) return { ...feature, geometry } as SceneFeature;
-  if (feature.kind === "transport" || feature.kind === "structure") return { ...feature, geometry } as SceneFeature;
-  if (feature.kind === "place" && (geometry.type === "Point" || geometry.type === "Polygon" || geometry.type === "MultiPolygon")) return { ...feature, geometry } as SceneFeature;
-  return null;
+interface TileState {
+  slots: Map<string, DecodedRenderTile>;
+  renderTileIds: string[];
+  version: number;
 }
 
-function sceneFeatureKey(feature: MapFeature): string {
-  return feature.fragmentId ?? feature.stableId;
-}
+const EMPTY_TILE_STATE: TileState = { slots: new Map(), renderTileIds: [], version: 0 };
 
-function deduplicateSceneFeatures(tiles: Map<string, TileData>): SceneFeature[] {
-  const minimumLod = new Map<string, number>();
-  for (const tile of tiles.values()) {
-    for (const feature of tile.features) {
-      const lod = tile.manifest.lod;
-      const previous = minimumLod.get(feature.stableId);
-      if (previous === undefined || lod < previous) minimumLod.set(feature.stableId, lod);
-    }
-  }
-  const selected = new Map<string, SceneFeature>();
-  for (const tile of tiles.values()) {
-    for (const feature of tile.features) {
-      if (tile.manifest.lod !== minimumLod.get(feature.stableId)) continue;
-      const renderable = sceneFeature(feature);
-      if (renderable) selected.set(sceneFeatureKey(feature), renderable);
-    }
-  }
-  return [...selected.values()];
-}
+
+
+
+
 
 export default function MapShell() {
   const [theme] = useState<"light" | "dark">(() => {
@@ -176,12 +145,13 @@ export default function MapShell() {
     if (stored === "dark" || stored === "light") return stored;
     return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
   });
-  const [selectedFeature, setSelectedFeature] = useState<MapFeature | null>(null);
+  const [selectedFeature, setSelectedFeature] = useState<PickedFeature | null>(null);
   const [cameraFocus, setCameraFocus] = useState<{ x: number; z: number; zoom: number } | null>(null);
   const [cameraReset, setCameraReset] = useState(0);
   const [layers, setLayers] = useState<LayerState>(DEFAULT_LAYERS);
   const [manifest, setManifest] = useState<DatasetManifest | null>(null);
-  const [tiles, setTiles] = useState<Map<string, TileData>>(new Map());
+  const [tileState, setTileState] = useState<TileState>(EMPTY_TILE_STATE);
+  const [datasetBoundaryReady, setDatasetBoundaryReady] = useState(false);
   const [searchHits, setSearchHits] = useState<SearchHit[]>([]);
   const [searchPending, setSearchPending] = useState(false);
   const [desiredKey, setDesiredKey] = useState("");
@@ -190,7 +160,7 @@ export default function MapShell() {
   const [error, setError] = useState<string | null>(null);
   const [webGpuStatus, setWebGpuStatus] = useState<"unknown" | "supported" | "unsupported">("unknown");
   const [mobileInspectorOpen, setMobileInspectorOpen] = useState(false);
-  const tilesRef = useRef<Map<string, TileData>>(new Map());
+  const tileStateRef = useRef<TileState>(EMPTY_TILE_STATE);
   const inFlightRef = useRef<Map<string, AbortController>>(new Map());
   const desiredIdsRef = useRef<string[]>([]);
   const desiredGenerationRef = useRef(0);
@@ -198,6 +168,15 @@ export default function MapShell() {
   const desiredKeyRef = useRef("");
   const searchAbortRef = useRef<AbortController | null>(null);
   const searchGenerationRef = useRef(0);
+  const showTileFailureRef = useRef(false);
+
+  const applyTileState = useCallback((update: TileStateUpdate): void => {
+    setTileState((previous) => {
+      const next = update(previous);
+      tileStateRef.current = next;
+      return next;
+    });
+  }, []);
 
   const syncDesiredTiles = useCallback((source: DatasetManifest, snapshot: ViewportSnapshot | null): void => {
     const ids = visibleTileIds(source, snapshot);
@@ -287,57 +266,77 @@ export default function MapShell() {
     const desired = new Set(desiredIdsRef.current);
     const generation = desiredGenerationRef.current + 1;
     desiredGenerationRef.current = generation;
+    nextRenderTileGeneration();
     for (const [tileId, controller] of inFlightRef.current) {
-      if (!desired.has(tileId)) {
-        controller.abort();
+      if (desired.has(tileId)) continue;
+      controller.abort();
+      inFlightRef.current.delete(tileId);
+    }
+    for (const tileId of tileStateRef.current.slots.keys()) {
+      if (desired.has(tileId)) continue;
+      evictTile(tileId);
+      tileRuntimeDiagnostics().aborted.push(tileId);
+      applyTileState((previous) => dropTileSlot(previous, tileId));
+    }
+    const pending = desiredIdsRef.current.filter(
+      (tileId) => !tileStateRef.current.slots.has(tileId) && !inFlightRef.current.has(tileId),
+    );
+    let cursor = 0;
+    const loadOne = async (tileId: string): Promise<void> => {
+      const controller = new AbortController();
+      inFlightRef.current.set(tileId, controller);
+      tileRuntimeDiagnostics().requested.push(tileId);
+      const current = (): boolean => desiredGenerationRef.current === generation && desiredIdsRef.current.includes(tileId);
+      try {
+        const decoded = await loadRenderTile(tileId, controller.signal);
+        if (!current()) return;
+        putDecodedTile(decoded);
+        tileRuntimeDiagnostics().loaded.push(tileId);
+        applyTileState((previous) => mergeTileSlot(previous, decoded));
+      } catch (cause) {
+        if (isAbortError(cause) || !current()) return;
+        showTileFailureRef.current = true;
+        tileRuntimeDiagnostics().failed.push(tileId);
+        console.warn(`Tile ${tileId} fetch failed`, cause);
+      } finally {
         inFlightRef.current.delete(tileId);
       }
-    }
-    const pending = desiredIdsRef.current.filter((tileId) => !tilesRef.current.has(tileId) && !inFlightRef.current.has(tileId));
-    let cursor = 0;
+    };
     const loadWorker = async (): Promise<void> => {
       while (cursor < pending.length && desiredGenerationRef.current === generation) {
         const tileId = pending[cursor++]!;
-        const controller = new AbortController();
-        inFlightRef.current.set(tileId, controller);
-        tileRuntimeDiagnostics().requested.push(tileId);
-        controller.signal.addEventListener("abort", () => {
-          tileRuntimeDiagnostics().aborted.push(tileId);
-        }, { once: true });
-        try {
-          const tile = await loadTile(tileId, controller.signal);
-          if (desiredGenerationRef.current === generation && desiredIdsRef.current.includes(tileId)) {
-            setTiles((previous) => {
-              const next = new Map(previous);
-              next.set(tileId, tile);
-              tileRuntimeDiagnostics().loaded.push(tileId);
-              const replacementReady = desiredIdsRef.current.some((id) => next.has(id));
-              if (replacementReady) for (const loadedId of next.keys()) if (!desired.has(loadedId)) next.delete(loadedId);
-              tilesRef.current = next;
-              return next;
-            });
-          }
-        } catch (cause) {
-          if (!isAbortError(cause)) {
-            tileRuntimeDiagnostics().failed.push(tileId);
-            console.warn(`Tile ${tileId} fetch failed`, cause);
-          }
-        } finally {
-          inFlightRef.current.delete(tileId);
-        }
+        await loadOne(tileId);
       }
     };
     void Promise.all(Array.from({ length: Math.min(TILE_LOAD_CONCURRENCY, pending.length) }, () => loadWorker()));
   }, [manifest, desiredKey]);
+
+  /* The department outline is a dataset-level artifact, not a per-tile
+     fragment. It is decoded once through the worker pool and mounted as a
+     single geometry, so no tile arrival can re-tessellate it. */
+  useEffect(() => {
+    if (!manifest) return;
+    const controller = new AbortController();
+    loadRenderTile(DATASET_BOUNDARY_TILE_ID, controller.signal).then((decoded) => {
+      if (controller.signal.aborted) return;
+      putDecodedTile(decoded);
+      setDatasetBoundaryReady(true);
+    }).catch(() => undefined);
+    return () => controller.abort();
+  }, [manifest]);
 
   useEffect(() => () => {
     for (const controller of inFlightRef.current.values()) controller.abort();
     inFlightRef.current.clear();
   }, []);
 
+  useEffect(() => () => {
+    resetTileGpuCache();
+  }, []);
+
   useEffect(() => {
-    sceneMetrics.loadedTileCount = tiles.size;
-    sceneMetrics.loadedFeatureCount = countTileFeatures(tiles);
+    sceneMetrics.loadedTileCount = tileState.slots.size;
+    sceneMetrics.loadedFeatureCount = [...tileState.slots.values()].reduce((total, tile) => total + tile.meta.length, 0);
     if (error) {
       sceneMetrics.rendererStatus = "errored";
       sceneMetrics.rendererError = error;
@@ -346,25 +345,22 @@ export default function MapShell() {
       sceneMetrics.rendererError = "WebGPU unavailable in this browser";
     }
     publishSceneDiagnostics(true);
-  }, [tiles, error, webGpuStatus]);
+  }, [tileState, error, webGpuStatus]);
 
   const handleSearchResultSelect = useCallback(async (hit: SearchHit): Promise<void> => {
-    let raw: MapFeature | undefined;
-    for (const tile of tilesRef.current.values()) {
-      raw = tile.features.find((feature) => feature.stableId === hit.featureId);
-      if (raw) break;
+    let pick: PickedFeature | null = null;
+    for (const slot of tileStateRef.current.slots.values()) {
+      pick = resolvePickedFeatureByStableId(slot, hit.featureId);
+      if (pick !== null) break;
     }
-    if (!raw) {
+    if (pick === null) {
       tileRuntimeDiagnostics().requested.push(hit.tileId);
       try {
-        const tile = await loadTile(hit.tileId);
+        const decoded = await loadRenderTile(hit.tileId);
+        putDecodedTile(decoded);
         tileRuntimeDiagnostics().loaded.push(hit.tileId);
-        setTiles((previous) => {
-          const next = new Map(previous).set(tile.manifest.tileId, tile);
-          tilesRef.current = next;
-          return next;
-        });
-        raw = tile.features.find((feature) => feature.stableId === hit.featureId);
+        setTileState((previous) => mergeTileSlot(previous, decoded));
+        pick = resolvePickedFeatureByStableId(decoded, hit.featureId);
       } catch (cause) {
         tileRuntimeDiagnostics().failed.push(hit.tileId);
         console.warn(`Search tile ${hit.tileId} load failed`, cause);
@@ -372,17 +368,95 @@ export default function MapShell() {
     }
     const [focusX, focusZ] = wgs84ToRender([hit.focusLon, hit.focusLat]);
     const fallbackFocus = { x: focusX, z: focusZ };
-    const focus = raw ? focusFromFeature(raw) : fallbackFocus;
-    setCameraFocus({ ...(focus ?? fallbackFocus), zoom: 80 });
-    if (raw) {
-      setSelectedFeature(raw);
-      if (raw.kind === "business" && /nocibe/i.test(raw.businessName)) setLayers((previous) => ({ ...previous, commercialAudit: true }));
-    }
+    const focus = pick === null ? fallbackFocus : { x: pick.anchor[0], z: pick.anchor[1] };
+    setCameraFocus({ ...focus, zoom: 80 });
+    if (pick !== null) setSelectedFeature(pick);
     setSearchQuery("");
     setSearchHits([]);
   }, []);
 
-  const sceneFeatures = useMemo(() => deduplicateSceneFeatures(tiles), [tiles]);
+  const sceneTileIds = useMemo(() => {
+    const ids = tileState.renderTileIds.slice();
+    if (datasetBoundaryReady && !ids.includes(DATASET_BOUNDARY_TILE_ID)) ids.push(DATASET_BOUNDARY_TILE_ID);
+    return ids;
+  }, [tileState, datasetBoundaryReady]);
+
+  const handleRenderPick = useCallback(async (tileId: string, stableId: string): Promise<void> => {
+    const tile = getResidentDecodedTile(tileId);
+    const pick = tile === undefined ? null : resolvePickedFeatureByStableId(tile, stableId);
+    if (pick === null) return;
+    setSelectedFeature(pick);
+    setCameraFocus({ x: pick.anchor[0], z: pick.anchor[1], zoom: 80 });
+  }, []);
+  const [detailRecord, setDetailRecord] = useState<FeatureDetailRecord | null>(null);
+  const [menuDetail, setMenuDetail] = useState<FeatureContextMenuDetail | null>(null);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [detailError, setDetailError] = useState<string | null>(null);
+  const [contextMenu, setContextMenu] = useState<{ pick: PickedFeature; clientX: number; clientY: number } | null>(null);
+  const [detailOpen, setDetailOpen] = useState(true);
+
+  const handleInspect = useCallback((pick: PickedFeature): void => {
+    setSelectedFeature(pick);
+    setDetailOpen(true);
+  }, []);
+  const handleCenter = useCallback((pick: PickedFeature): void => {
+    setCameraFocus({ x: pick.anchor[0], z: pick.anchor[1], zoom: 80 });
+  }, []);
+  const handleContextMenu = useCallback((tileId: string, stableId: string, clientX: number, clientY: number): void => {
+    const tile = getResidentDecodedTile(tileId);
+    const pick = tile === undefined ? null : resolvePickedFeatureByStableId(tile, stableId);
+    if (pick === null) return;
+    setSelectedFeature(pick);
+    setContextMenu({ pick, clientX, clientY });
+  }, []);
+
+  useEffect(() => {
+    if (selectedFeature === null) {
+      setDetailRecord(null);
+      setMenuDetail(null);
+      setDetailError(null);
+      return;
+    }
+    const controller = new AbortController();
+    setDetailLoading(true);
+    setDetailError(null);
+    loadTileMeta(selectedFeature.tileId, controller.signal)
+      .then((tile) => {
+        const record = tile.features.find((feature) => feature.stableId === selectedFeature.stableId);
+        if (record === undefined) {
+          setDetailError("Détail introuvable");
+          return;
+        }
+        const attributes = Object.entries(record as unknown as Record<string, unknown>)
+          .filter(([key, value]) => !["stableId", "geometry", "localGeometry", "sourceGeometry", "names", "provenance", "sourceRefs", "sourceMetadata", "displayName", "lon", "lat", "x", "z", "confidence", "status", "kind", "category", "address", "name"].includes(key) && (typeof value === "string" || typeof value === "number" || typeof value === "boolean"))
+          .slice(0, 24)
+          .map(([key, value]) => ({ label: attributeLabel(key), value: String(value) }));
+        const businessName = "businessName" in record ? String((record as unknown as Record<string, unknown>).businessName) : undefined;
+        const category = "category" in record ? String((record as unknown as Record<string, unknown>).category) : undefined;
+        const sources = record.sourceRefs.map((reference) => ({ source: reference.source, timestamp: reference.timestamp, license: reference.license, url: reference.url }));
+        setDetailRecord({
+          kind: record.kind,
+          name: record.name ?? businessName,
+          address: record.address,
+          category,
+          status: record.status,
+          confidence: record.confidence,
+          lon: "lon" in record ? record.lon : undefined,
+          lat: "lat" in record ? record.lat : undefined,
+          attributes,
+          sources,
+        });
+        setMenuDetail({ kind: record.kind, name: record.name ?? businessName, address: record.address, category, status: record.status, attributes: attributes.map((attribute) => ({ label: attribute.label, value: attribute.value })), roadClass: "roadClass" in record ? String((record as unknown as Record<string, unknown>).roadClass) : undefined, widthMetres: "width" in record && typeof (record as unknown as Record<string, unknown>).width === "number" ? Number((record as unknown as Record<string, unknown>).width) : undefined });
+      })
+      .catch((cause: unknown) => {
+        if (controller.signal.aborted) return;
+        setDetailError(cause instanceof Error ? cause.message : String(cause));
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setDetailLoading(false);
+      });
+    return () => controller.abort();
+  }, [selectedFeature]);
   const hasCriticalError = error !== null && manifest === null;
   const attributionData = useMemo(() => manifest ? {
     datasetVersion: manifest.datasetVersion,
@@ -414,19 +488,21 @@ export default function MapShell() {
   ) : null;
 
   return (
-    <div className="map-shell" data-theme={theme} style={{ position: "fixed", inset: 0, overflow: "hidden", display: "flex", flexDirection: "column", background: "var(--color-paper, #ffffff)", color: "var(--color-ink, #000000)" }}>
+    <div className="map-shell" data-theme={theme}>
       {loading ? <div className="map-shell__loading" style={{ position: "absolute", inset: 0, zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center" }}><LoadingState /></div> : null}
       {hasCriticalError && !loading ? <div className="map-shell__error"><h2>Impossible de charger la carte</h2><p>{error}</p><code>npm run data:refresh</code></div> : null}
-      <div className="map-shell__canvas" style={{ flex: 1, position: "relative", overflow: "hidden" }}>
+      <div className="map-shell__canvas">
         {!hasCriticalError && manifest && webGpuStatus === "supported" ? (
           <WebGPUCityCanvas bounds={manifestBounds(manifest)} cameraFocus={cameraFocus} cameraReset={cameraReset} onCameraMoved={handleCameraMoved} onViewportChange={handleViewportChange}>
-            <CityScene features={sceneFeatures} layers={layers} />
+            <CityScene features={EMPTY_SCENE_FEATURES} layers={layers} tileIds={sceneTileIds} onPick={handleRenderPick} onContextMenu={handleContextMenu} />
+            <FeatureHighlightLayer pick={selectedFeature} />
           </WebGPUCityCanvas>
         ) : !hasCriticalError && webGpuStatus === "unsupported" ? <WebGPUUnsupported error={sceneMetrics.rendererError} /> : null}
       </div>
       {!hasCriticalError && !loading ? <MapHud query={searchQuery} onQueryChange={setSearchQuery} onSearch={(query) => void runSearch(query)} onResetView={resetView} results={searchResultsNode} /> : null}
       {!hasCriticalError && !loading ? <LayerControls layers={layers} onToggle={handleLayerToggle} onReset={resetView} /> : null}
-      {!hasCriticalError && !loading ? <FeatureInspector feature={selectedFeature} onClose={() => setSelectedFeature(null)} /> : null}
+      {!hasCriticalError && !loading ? <FeatureInspector pick={selectedFeature} detail={detailRecord} detailLoading={detailLoading} detailError={detailError} detailOpen={detailOpen} onToggleDetail={setDetailOpen} onClose={() => setSelectedFeature(null)} onCenter={handleCenter} /> : null}
+      {!hasCriticalError && !loading && contextMenu ? <FeatureContextMenu pick={contextMenu.pick} clientX={contextMenu.clientX} clientY={contextMenu.clientY} detail={menuDetail} onInspect={handleInspect} onCenter={handleCenter} onDismiss={() => setContextMenu(null)} /> : null}
       {!hasCriticalError && !loading && attributionData ? <SourceAttribution data={attributionData} /> : null}
       <div id="scene-diagnostics" aria-hidden="true" style={{ position: "absolute", bottom: "2rem", left: "0.5rem", fontSize: "10px", fontFamily: "monospace", color: "color-mix(in srgb, var(--color-ink, #000) 40%, transparent)", whiteSpace: "pre", pointerEvents: "none", userSelect: "none", opacity: 0.6 }} />
       {selectedFeature && !hasCriticalError && !loading ? <button type="button" className="map-shell__inspector-toggle" onClick={() => setMobileInspectorOpen((open) => !open)} aria-label={mobileInspectorOpen ? "Fermer les détails" : "Ouvrir les détails"}>{mobileInspectorOpen ? "Fermer" : "Détails"}</button> : null}

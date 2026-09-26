@@ -14,6 +14,8 @@ const MINIMUM_SAMPLE_COUNT = 1000;
 const MAX_ROUND_TRIP_METRES = 0.05;
 const MAX_NORMALIZED_RESIDUAL_METRES = 0.1;
 const MAX_TILE_RENDER_RESIDUAL_METRES = 0.1;
+const STRATIFIED_SAMPLE_COUNT = 50;
+const STRATIFIED_MAX_RESIDUAL_METRES = 1;
 
 export interface SpatialQaScope {
   territoryCode: string;
@@ -57,6 +59,28 @@ interface SpatialReport {
   };
   perSource: Record<string, { samples: number; worstRoundTripMetres: number; worstNormalizedResidualMetres: number }>;
   offendingFeature?: Record<string, unknown>;
+  stratified: StratifiedReport;
+}
+
+export interface StratifiedSample {
+  cell: string;
+  commune: string;
+  kind: string;
+  source: string;
+  featureId: string;
+  verticesChecked: number;
+  worstSourceToNormalizedMetres: number;
+  worstTileRenderMetres: number;
+}
+
+export interface StratifiedReport {
+  sampleCount: number;
+  requestedSampleCount: number;
+  cellsCovered: number;
+  communesCovered: number;
+  maxResidualMetres: number;
+  worst: StratifiedSample | null;
+  samples: StratifiedSample[];
 }
 
 function isPoint(value: unknown): value is Point {
@@ -193,6 +217,59 @@ async function loadIntermediateFeatures(root: string): Promise<MapFeature[]> {
   }
   return result;
 }
+
+function communeCellOf(point: Point): string {
+  const grid = 0.1;
+  return `${Math.floor(point[0] / grid)}:${Math.floor(point[1] / grid)}`;
+}
+
+function featureCommune(feature: MapFeature): string {
+  const metadata = feature.sourceMetadata as Record<string, unknown> | undefined;
+  const commune = metadata?.commune ?? metadata?.inseeCommune ?? metadata?.city;
+  return typeof commune === "string" && commune.length > 0 ? commune : "unknown";
+}
+
+function selectStratifiedFeatures(features: MapFeature[], sampleCount: number): MapFeature[] {
+  const cells = new Map<string, MapFeature[]>();
+  for (const feature of features) {
+    if (feature.kind === "boundary" || feature.x === undefined || feature.z === undefined) continue;
+    const cell = communeCellOf([feature.x, feature.z]);
+    const list = cells.get(cell) ?? [];
+    list.push(feature);
+    cells.set(cell, list);
+  }
+  const ordered = [...cells.values()].sort((first, second) => first.length - second.length);
+  const samples: MapFeature[] = [];
+  let round = 0;
+  while (samples.length < sampleCount && ordered.length > 0) {
+    for (const cell of ordered) {
+      const feature = cell[round];
+      if (feature === undefined) continue;
+      samples.push(feature);
+      if (samples.length >= sampleCount) break;
+    }
+    round += 1;
+    if (round > 64) break;
+  }
+  return samples;
+}
+
+export function buildStratifiedReport(samples: StratifiedSample[], requestedSampleCount: number): StratifiedReport {
+  const worst = samples.reduce<StratifiedSample | null>((accumulator, sample) => {
+    const residual = Math.max(sample.worstSourceToNormalizedMetres, sample.worstTileRenderMetres);
+    if (accumulator === null || residual > Math.max(accumulator.worstSourceToNormalizedMetres, accumulator.worstTileRenderMetres)) return sample;
+    return accumulator;
+  }, null);
+  return {
+    sampleCount: samples.length,
+    requestedSampleCount,
+    cellsCovered: new Set(samples.map((sample) => sample.cell)).size,
+    communesCovered: new Set(samples.map((sample) => sample.commune)).size,
+    maxResidualMetres: worst === null ? 0 : Math.max(worst.worstSourceToNormalizedMetres, worst.worstTileRenderMetres),
+    worst,
+    samples,
+  };
+}
 async function checkTileFragments(samples: SamplePoint[], featuresById: Map<string, MapFeature>, root: string): Promise<{ worst: ErrorRecord | undefined; count: number; fragmentsById: Map<string, number> }> {
   const ids = new Set(samples.map((sample) => sample.feature.stableId));
   const fragmentsById = new Map<string, number>();
@@ -305,6 +382,33 @@ export async function runSpatialQa(requestedId?: string, scope?: SpatialQaScope)
   const fragments = await checkTileFragments(samples, featuresById, root);
   const sampledFeatureIds = new Set(samples.map((sample) => sample.feature.stableId));
   const rendererInput = rendererDebug(uniqueFeatures.filter((feature) => sampledFeatureIds.has(feature.stableId)).slice(0, 400));
+  const stratifiedFeatures = selectStratifiedFeatures(uniqueFeatures, STRATIFIED_SAMPLE_COUNT);
+  const stratifiedFragments = await checkTileFragments(stratifiedFeatures.map((feature) => ({ feature, point: [feature.x ?? 0, feature.z ?? 0] as Point })), featuresById, root);
+  const tileResidualById = new Map<string, number>();
+  if (stratifiedFragments.worst !== null && stratifiedFragments.worst !== undefined) tileResidualById.set(stratifiedFragments.worst.stableId, stratifiedFragments.worst.metres);
+  const normalizedById = new Map<string, number>();
+  for (const sample of samples) {
+    const local = sample.feature.localGeometry;
+    if (!local) continue;
+    for (const pair of pairedGeometryPoints(sample.feature.geometry, local)) {
+      const expected = wgs84ToRender(pair.source);
+      const residual = Math.hypot(expected[0] - pair.local[0], expected[1] - pair.local[1]);
+      normalizedById.set(sample.feature.stableId, Math.max(normalizedById.get(sample.feature.stableId) ?? 0, residual));
+    }
+  }
+  const stratifiedSamples: StratifiedSample[] = stratifiedFeatures.map((feature) => ({
+    cell: communeCellOf([feature.x ?? 0, feature.z ?? 0]),
+    commune: featureCommune(feature),
+    kind: feature.kind,
+    source: feature.sourceRefs[0]?.source ?? "unknown",
+    featureId: feature.stableId,
+    verticesChecked: feature.localGeometry ? geometryPoints(feature.localGeometry).length : 0,
+    worstSourceToNormalizedMetres: normalizedById.get(feature.stableId) ?? 0,
+    worstTileRenderMetres: tileResidualById.get(feature.stableId) ?? 0,
+  }));
+  const stratified = buildStratifiedReport(stratifiedSamples, STRATIFIED_SAMPLE_COUNT);
+  if (stratified.sampleCount < STRATIFIED_SAMPLE_COUNT) throw new Error(`Spatial QA stratified only ${stratified.sampleCount} of ${STRATIFIED_SAMPLE_COUNT} samples across the territory`);
+  if (stratified.maxResidualMetres > STRATIFIED_MAX_RESIDUAL_METRES) throw new Error(`Stratified spatial residual threshold exceeded: ${stratified.maxResidualMetres} metres at ${stratified.worst?.featureId}`);
   const report: SpatialReport = {
     checkedAt: new Date().toISOString(),
     territory: { code: scope?.territoryCode ?? GERS_TERRITORY.code, name: boundary.name ?? GERS_TERRITORY.name },
@@ -320,6 +424,7 @@ export async function runSpatialQa(requestedId?: string, scope?: SpatialQaScope)
     tileFragmentVerticesChecked: fragments.count,
     rendererInput,
     perSource,
+    stratified,
   };
   if (requestedId) {
     const feature = featuresById.get(requestedId);

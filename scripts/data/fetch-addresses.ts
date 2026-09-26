@@ -1,4 +1,4 @@
-import { createReadStream } from "node:fs";
+import { createReadStream, readFileSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { createGunzip } from "node:zlib";
 import * as path from "node:path";
@@ -16,9 +16,97 @@ const AUCH_BOUNDARY_PATH = path.join(RAW_DIR, AUCH_DETAIL_SCOPE.boundaryRawFile)
 const GERS_OUTPUT_PATH = path.join(RAW_DIR, "ban-addresses.json");
 const AUCH_OUTPUT_PATH = path.join(RAW_DIR, "ban-addresses-auch.json");
 const SOURCES_MANIFEST_PATH = path.join(DATA_DIR, "manifests", "sources.json");
+const ADDRESS_RECONCILIATION_PATH = path.join(DATA_DIR, "qa", "address-reconciliation.json");
 const BAN_LICENSE = "Etalab-2.0";
 const BAN_CRS = "WGS84 (EPSG:4326)";
 const BAN_TRANSFORMATION = "none (native WGS84 lon/lat)";
+
+export const BAN_CSV_COLUMNS = [
+  "id",
+  "id_fantoir",
+  "numero",
+  "rep",
+  "nom_voie",
+  "code_postal",
+  "code_insee",
+  "nom_commune",
+  "code_insee_ancienne_commune",
+  "nom_ancienne_commune",
+  "x",
+  "y",
+  "lon",
+  "lat",
+  "type_position",
+  "alias",
+  "nom_ld",
+  "libelle_acheminement",
+  "nom_afnor",
+  "source_position",
+  "source_nom_voie",
+  "certification_commune",
+  "cad_parcelles",
+] as const;
+
+export const BAN_LOSS_REASONS = [
+  "malformed-csv-row",
+  "short-csv-row",
+  "non-finite-coordinates",
+  "outside-boundary",
+  "commune-mismatch",
+  "duplicate-ban-id",
+  "empty-ban-id",
+] as const;
+
+export type BanLossReason = (typeof BAN_LOSS_REASONS)[number];
+
+export interface AddressCounters {
+  rawLines: number;
+  headerLines: number;
+  blankLines: number;
+  dataRows: number;
+  parsed: number;
+  malformedRows: number;
+  shortRows: number;
+  communeRejected: number;
+  nonFiniteCoordinates: number;
+  outsideBoundary: number;
+  inBoundary: number;
+  normalized: number;
+  duplicateBanIds: number;
+  emptyBanIds: number;
+  uniqueNormalized: number;
+}
+
+export interface AddressDuplicates {
+  duplicateKeyCount: number;
+  droppedRecords: number;
+  identicalPositionGroups: number;
+  conflictingPositionGroups: number;
+  maxRowsForOneKey: number;
+  samples: Array<{ banId: string; rows: number; distinctPositions: number }>;
+}
+
+export interface AddressReconciliation {
+  dataset: "ban-address-reconciliation";
+  department: string;
+  scope: string;
+  generatedAt: string;
+  license: string;
+  sourceUrl: string;
+  sourceSha256: string;
+  boundary: string;
+  stages: AddressCounters;
+  indexed: number;
+  losses: Record<BanLossReason, number>;
+  duplicates: AddressDuplicates;
+  upstream: {
+    csvDataRows: number;
+    sourceRecordCount: number;
+    searchIndexAddressEntries: number;
+    indexedMatchesSource: boolean;
+  };
+  unexplained: number;
+}
 
 interface Boundary {
   type: "Polygon" | "MultiPolygon";
@@ -46,7 +134,7 @@ interface BanCsvRow {
   cadParcelles: string;
 }
 
-interface AddressRecord {
+export interface AddressRecord {
   banId: string;
   source: string;
   sourceId: string;
@@ -240,6 +328,140 @@ function normalizeAddress(row: BanCsvRow): AddressRecord {
   };
 }
 
+function positionSignature(record: AddressRecord): string {
+  return [
+    record.lon,
+    record.lat,
+    record.positionType,
+    record.sourcePosition,
+    record.certificationCommune,
+    record.cadastreParcelles,
+  ].join("|");
+}
+
+function newCounters(): AddressCounters {
+  return {
+    rawLines: 0,
+    headerLines: 0,
+    blankLines: 0,
+    dataRows: 0,
+    parsed: 0,
+    malformedRows: 0,
+    shortRows: 0,
+    communeRejected: 0,
+    nonFiniteCoordinates: 0,
+    outsideBoundary: 0,
+    inBoundary: 0,
+    normalized: 0,
+    duplicateBanIds: 0,
+    emptyBanIds: 0,
+    uniqueNormalized: 0,
+  };
+}
+
+function newLosses(): Record<BanLossReason, number> {
+  const losses = {} as Record<BanLossReason, number>;
+  for (const reason of BAN_LOSS_REASONS) losses[reason] = 0;
+  return losses;
+}
+
+export function summarizeBanDuplicates(records: AddressRecord[]): AddressDuplicates {
+  const groups = new Map<string, AddressRecord[]>();
+  for (const record of records) {
+    const bucket = groups.get(record.banId);
+    if (bucket === undefined) groups.set(record.banId, [record]);
+    else bucket.push(record);
+  }
+  let duplicateKeyCount = 0;
+  let droppedRecords = 0;
+  let identicalPositionGroups = 0;
+  let conflictingPositionGroups = 0;
+  let maxRowsForOneKey = 0;
+  const samples: AddressDuplicates["samples"] = [];
+  for (const [banId, rows] of groups) {
+    if (rows.length < 2) continue;
+    duplicateKeyCount += 1;
+    droppedRecords += rows.length - 1;
+    if (rows.length > maxRowsForOneKey) maxRowsForOneKey = rows.length;
+    const distinctPositions = new Set(rows.map(positionSignature));
+    if (distinctPositions.size === 1) identicalPositionGroups += 1;
+    else conflictingPositionGroups += 1;
+    if (samples.length < 10) {
+      samples.push({ banId, rows: rows.length, distinctPositions: distinctPositions.size });
+    }
+  }
+  return {
+    duplicateKeyCount,
+    droppedRecords,
+    identicalPositionGroups,
+    conflictingPositionGroups,
+    maxRowsForOneKey,
+    samples,
+  };
+}
+
+export function summarizeDuplicateGroups(groups: Map<string, AddressRecord[]>): AddressDuplicates {
+  let droppedRecords = 0;
+  let identicalPositionGroups = 0;
+  let conflictingPositionGroups = 0;
+  let maxRowsForOneKey = 0;
+  const samples: AddressDuplicates["samples"] = [];
+  for (const [banId, dropped] of groups) {
+    droppedRecords += dropped.length;
+    const totalRows = dropped.length + 1;
+    if (totalRows > maxRowsForOneKey) maxRowsForOneKey = totalRows;
+    const distinctPositions = new Set(dropped.map(positionSignature));
+    if (distinctPositions.size === 1) identicalPositionGroups += 1;
+    else conflictingPositionGroups += 1;
+    if (samples.length < 10) {
+      samples.push({ banId, rows: totalRows, distinctPositions: distinctPositions.size });
+    }
+  }
+  return {
+    duplicateKeyCount: groups.size,
+    droppedRecords,
+    identicalPositionGroups,
+    conflictingPositionGroups,
+    maxRowsForOneKey,
+    samples,
+  };
+}
+
+export function countIndexedAddresses(dataDir: string = DATA_DIR): { count: number; present: boolean } {
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(path.join(dataDir, "search", "index.json"), "utf8"));
+    if (typeof parsed !== "object" || parsed === null) return { count: 0, present: false };
+    let count = 0;
+    for (const value of Object.values(parsed as Record<string, unknown>)) {
+      if (typeof value === "object" && value !== null && (value as { kind?: unknown }).kind === "address") count += 1;
+    }
+    return { count, present: true };
+  } catch {
+    return { count: 0, present: false };
+  }
+}
+
+export function readBanLossCounters(
+  reconciliationPath: string = ADDRESS_RECONCILIATION_PATH,
+): { stages: AddressCounters; indexed: number; losses: Record<BanLossReason, number>; unexplained: number } | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(reconciliationPath, "utf8"));
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null) return null;
+  const candidate = parsed as Partial<AddressReconciliation>;
+  if (typeof candidate.stages !== "object" || candidate.stages === null) return null;
+  if (typeof candidate.losses !== "object" || candidate.losses === null) return null;
+  return {
+    stages: candidate.stages as AddressCounters,
+    indexed: typeof candidate.indexed === "number" ? candidate.indexed : 0,
+    losses: candidate.losses as Record<BanLossReason, number>,
+    unexplained: typeof candidate.unexplained === "number" ? candidate.unexplained : 0,
+  };
+}
+
 function parseCommuneArg(argv: string[]): string | null {
   const index = argv.indexOf("--commune");
   if (index === -1) return null;
@@ -250,32 +472,49 @@ function parseCommuneArg(argv: string[]): string | null {
   return value;
 }
 
+function parseDataDirArg(argv: string[]): string {
+  const index = argv.indexOf("--data-dir");
+  const value = index === -1 ? undefined : argv[index + 1];
+  return value === undefined ? DATA_DIR : value;
+}
+
 function hasForceArg(argv: string[]): boolean {
   return argv.includes("--force");
 }
 
-async function acquireAddresses(commune: string | null, forceRefresh: boolean): Promise<{
+interface AcquiredAddresses {
   records: AddressRecord[];
+  counters: AddressCounters;
+  losses: Record<BanLossReason, number>;
+  duplicates: AddressDuplicates;
   sha256: string;
   acquisitionTimestamp: string;
   etag: string;
-  totalInDepartment: number;
-  totalInBoundary: number;
-  communeRejected: number;
   acquisition: AcquisitionOutcome;
-}> {
+}
+
+async function acquireAddresses(
+  commune: string | null,
+  forceRefresh: boolean,
+  dataDir: string,
+): Promise<AcquiredAddresses> {
+  const rawDir = path.join(dataDir, "raw");
+  const csvPath = path.join(rawDir, path.basename(BAN_CSV_GZ_PATH));
+  const boundaryPath = commune === null
+    ? path.join(rawDir, GERS_TERRITORY.boundaryRawFile)
+    : path.join(rawDir, AUCH_DETAIL_SCOPE.boundaryRawFile);
+  const scopeLabel = commune === null ? "Gers department" : `commune ${commune}`;
+
   const acquisition = await acquireFile({
     url: BAN_CSV_GZ_URL,
-    destination: BAN_CSV_GZ_PATH,
+    destination: csvPath,
     forceRefresh,
   });
-  console.log(`Acquiring BAN addresses from ${BAN_CSV_GZ_URL} ...`);
-  const boundaryPath = commune === null ? GERS_BOUNDARY_PATH : AUCH_BOUNDARY_PATH;
-  const scopeLabel = commune === null ? "Gers department" : `commune ${commune}`;
+  console.log(`Acquired BAN CSV (sha256 ${acquisition.sha256.slice(0, 16)}, fromCache ${acquisition.fromCache})`);
   console.log(`Loading ${scopeLabel} boundary from ${boundaryPath} ...`);
   const boundary = await loadBoundary(boundaryPath);
 
-  const source = createReadStream(BAN_CSV_GZ_PATH);
+  const source = createReadStream(csvPath);
   const gunzip = createGunzip();
   source.on("error", () => gunzip.destroy());
   const rl = readline.createInterface({
@@ -283,66 +522,125 @@ async function acquireAddresses(commune: string | null, forceRefresh: boolean): 
     crlfDelay: Infinity,
   });
 
-  let headerParsed = false;
-  const allAddresses: AddressRecord[] = [];
-  let totalDepartment = 0;
-  let communeRejected = 0;
-  let totalInBoundary = 0;
+  const counters = newCounters();
+  const losses = newLosses();
+  const uniqueRecords: AddressRecord[] = [];
+  const seenBanIds = new Set<string>();
+  const duplicateGroups = new Map<string, AddressRecord[]>();
+  let headerValidated = false;
 
   for await (const rawLine of rl) {
+    counters.rawLines += 1;
     const line = rawLine.trim();
-    if (!line) continue;
+    if (line === "") {
+      counters.blankLines += 1;
+      continue;
+    }
 
     const fields = parseCsvLine(line);
 
-    if (!headerParsed) {
-      headerParsed = true;
+    if (!headerValidated) {
+      counters.headerLines += 1;
+      const header = fields.map((field) => field.trim());
+      if (header.length !== BAN_CSV_COLUMNS.length) {
+        throw new Error(`BAN CSV header has ${header.length} columns, expected ${BAN_CSV_COLUMNS.length}`);
+      }
+      for (let index = 0; index < BAN_CSV_COLUMNS.length; index += 1) {
+        if (header[index] !== BAN_CSV_COLUMNS[index]) {
+          throw new Error(
+            `BAN CSV column ${index} is "${header[index]}" but "${BAN_CSV_COLUMNS[index]}" was expected; refusing index based parsing`,
+          );
+        }
+      }
+      headerValidated = true;
+      continue;
+    }
+
+    counters.dataRows += 1;
+
+    if (fields.length !== BAN_CSV_COLUMNS.length) {
+      counters.shortRows += 1;
+      losses["short-csv-row"] += 1;
       continue;
     }
 
     const row = parseCsvRow(fields);
-    totalDepartment += 1;
+    if (row.id.trim() === "" && row.idFantoir.trim() === "") {
+      counters.malformedRows += 1;
+      losses["malformed-csv-row"] += 1;
+      continue;
+    }
+    counters.parsed += 1;
 
     if (commune !== null && row.codeInsee !== commune) {
-      communeRejected += 1;
+      counters.communeRejected += 1;
+      losses["commune-mismatch"] += 1;
       continue;
     }
 
     const lon = Number.parseFloat(row.lon);
     const lat = Number.parseFloat(row.lat);
     if (!Number.isFinite(lon) || !Number.isFinite(lat)) {
+      counters.nonFiniteCoordinates += 1;
+      losses["non-finite-coordinates"] += 1;
       continue;
     }
 
     if (!pointInBoundary([lon, lat], boundary)) {
+      counters.outsideBoundary += 1;
+      losses["outside-boundary"] += 1;
       continue;
     }
-    totalInBoundary += 1;
+    counters.inBoundary += 1;
 
-    allAddresses.push(normalizeAddress(row));
+    const record = normalizeAddress(row);
+    if (record.banId.trim() === "") {
+      counters.emptyBanIds += 1;
+      losses["empty-ban-id"] += 1;
+      continue;
+    }
+    counters.normalized += 1;
+
+    if (seenBanIds.has(record.banId)) {
+      counters.duplicateBanIds += 1;
+      losses["duplicate-ban-id"] += 1;
+      const group = duplicateGroups.get(record.banId);
+      if (group === undefined) duplicateGroups.set(record.banId, [record]);
+      else group.push(record);
+      continue;
+    }
+    seenBanIds.add(record.banId);
+    uniqueRecords.push(record);
   }
 
-  console.log(`Total CSV rows: ${totalDepartment}`);
+  counters.uniqueNormalized = uniqueRecords.length;
+
+  if (counters.rawLines !== counters.dataRows + counters.headerLines + counters.blankLines) {
+    throw new Error(
+      `BAN line accounting does not close: rawLines ${counters.rawLines} vs header ${counters.headerLines} + data ${counters.dataRows} + blank ${counters.blankLines}`,
+    );
+  }
+
+  console.log(`Raw CSV lines: ${counters.rawLines} (data rows ${counters.dataRows})`);
   if (commune !== null) {
-    console.log(`Rejected by commune ${commune} INSEE filter: ${communeRejected}`);
+    console.log(`Rejected by commune ${commune} INSEE filter: ${counters.communeRejected}`);
   }
-  console.log(`Within ${scopeLabel} boundary: ${totalInBoundary}`);
+  console.log(`Within ${scopeLabel} boundary: ${counters.inBoundary}`);
+  console.log(`Unique normalized addresses: ${counters.uniqueNormalized}`);
 
   return {
-    records: allAddresses,
+    records: uniqueRecords,
+    counters,
+    losses,
+    duplicates: summarizeDuplicateGroups(duplicateGroups),
     sha256: acquisition.sha256,
     acquisitionTimestamp: acquisition.acquiredAt,
     etag: acquisition.etag ?? "",
-    totalInDepartment: totalDepartment,
-    totalInBoundary: totalInBoundary,
-    communeRejected: communeRejected,
     acquisition,
   };
 }
 
-async function writeSourceManifest(
-  entry: SourceManifestEntry,
-): Promise<void> {
+async function writeSourceManifest(entry: SourceManifestEntry): Promise<void> {
   let manifest: SourcesManifestFile = { sources: [] };
 
   try {
@@ -372,68 +670,97 @@ async function main(): Promise<void> {
   const argv = process.argv.slice(2);
   const commune = parseCommuneArg(argv);
   const forceRefresh = hasForceArg(argv);
+  const dataDir = parseDataDirArg(argv);
   console.log(
     `=== BAN Address Acquisition: ${commune === null ? `Department ${GERS_TERRITORY.code} (Gers)` : `Commune ${commune}`} ===`,
   );
 
-  await mkdir(RAW_DIR, { recursive: true });
-  await mkdir(path.join(DATA_DIR, "manifests"), { recursive: true });
+  const rawDir = path.join(dataDir, "raw");
+  await mkdir(rawDir, { recursive: true });
+  await mkdir(path.join(dataDir, "manifests"), { recursive: true });
+  await mkdir(path.join(dataDir, "qa"), { recursive: true });
 
-  const result = await acquireAddresses(commune, forceRefresh);
+  const result = await acquireAddresses(commune, forceRefresh, dataDir);
+  const duplicates = result.duplicates;
 
-  const outputPath = commune === null ? GERS_OUTPUT_PATH : AUCH_OUTPUT_PATH;
+  const outputPath = commune === null
+    ? path.join(rawDir, "ban-addresses.json")
+    : path.join(rawDir, "ban-addresses-auch.json");
+  const commonPayload = {
+    dataset: "ban",
+    department: GERS_TERRITORY.code,
+    acquisitionTimestamp: result.acquisitionTimestamp,
+    license: BAN_LICENSE,
+    sourceUrl: BAN_CSV_GZ_URL,
+    recordCount: result.records.length,
+    reconciliation: {
+      stages: result.counters,
+      losses: result.losses,
+      duplicates,
+    },
+    addresses: result.records,
+    sha256: result.sha256,
+    fromCache: result.acquisition.fromCache,
+    httpStatus: result.acquisition.httpStatus,
+    bytesDownloaded: result.acquisition.bytesDownloaded,
+    requestCount: result.acquisition.requestCount,
+    retryCount: result.acquisition.retryCount,
+    rateLimitCount: result.acquisition.rateLimitCount,
+  };
   const outputPayload = commune === null
     ? {
-        dataset: "ban",
-        department: GERS_TERRITORY.code,
-        acquisitionTimestamp: result.acquisitionTimestamp,
-        license: BAN_LICENSE,
-        sourceUrl: BAN_CSV_GZ_URL,
-        recordCount: result.records.length,
+        ...commonPayload,
         stats: {
-          departmentTotal: result.totalInDepartment,
-          boundaryFiltered: result.totalInBoundary,
+          departmentTotal: result.counters.parsed,
+          boundaryFiltered: result.counters.inBoundary,
+          uniqueNormalized: result.counters.uniqueNormalized,
         },
-        addresses: result.records,
-        sha256: result.sha256,
-        fromCache: result.acquisition.fromCache,
-        httpStatus: result.acquisition.httpStatus,
-        bytesDownloaded: result.acquisition.bytesDownloaded,
-        requestCount: result.acquisition.requestCount,
-        retryCount: result.acquisition.retryCount,
-        rateLimitCount: result.acquisition.rateLimitCount,
       }
     : {
-        dataset: "ban",
-        department: GERS_TERRITORY.code,
+        ...commonPayload,
         commune,
-        acquisitionTimestamp: result.acquisitionTimestamp,
-        license: BAN_LICENSE,
-        sourceUrl: BAN_CSV_GZ_URL,
-        recordCount: result.records.length,
         stats: {
-          departmentTotal: result.totalInDepartment,
-          communeFiltered: result.communeRejected,
-          boundaryFiltered: result.totalInBoundary,
+          departmentTotal: result.counters.parsed,
+          communeFiltered: result.counters.communeRejected,
+          boundaryFiltered: result.counters.inBoundary,
+          uniqueNormalized: result.counters.uniqueNormalized,
         },
-        addresses: result.records,
-        sha256: result.sha256,
-        fromCache: result.acquisition.fromCache,
-        httpStatus: result.acquisition.httpStatus,
-        bytesDownloaded: result.acquisition.bytesDownloaded,
-        requestCount: result.acquisition.requestCount,
-        retryCount: result.acquisition.retryCount,
-        rateLimitCount: result.acquisition.rateLimitCount,
       };
 
+  await writeFile(outputPath, JSON.stringify(outputPayload, null, 2), "utf-8");
+  console.log(`Written ${result.records.length} addresses to ${outputPath}`);
+
+  const boundaryPath = commune === null
+    ? path.join(rawDir, GERS_TERRITORY.boundaryRawFile)
+    : path.join(rawDir, AUCH_DETAIL_SCOPE.boundaryRawFile);
+  const searchIndex = countIndexedAddresses(dataDir);
+  const reconciliation: AddressReconciliation = {
+    dataset: "ban-address-reconciliation",
+    department: GERS_TERRITORY.code,
+    scope: commune === null ? `departement ${GERS_TERRITORY.code}` : `commune ${commune}`,
+    generatedAt: new Date().toISOString(),
+    license: BAN_LICENSE,
+    sourceUrl: BAN_CSV_GZ_URL,
+    sourceSha256: result.sha256,
+    boundary: boundaryPath,
+    stages: result.counters,
+    indexed: searchIndex.count,
+    losses: result.losses,
+    duplicates,
+    upstream: {
+      csvDataRows: result.counters.dataRows,
+      sourceRecordCount: result.records.length,
+      searchIndexAddressEntries: searchIndex.count,
+      indexedMatchesSource: searchIndex.count === result.counters.uniqueNormalized,
+    },
+    unexplained: result.counters.malformedRows,
+  };
   await writeFile(
-    outputPath,
-    JSON.stringify(outputPayload, null, 2),
+    ADDRESS_RECONCILIATION_PATH,
+    `${JSON.stringify(reconciliation, null, 2)}\n`,
     "utf-8",
   );
-  console.log(
-    `Written ${result.records.length} addresses to ${outputPath}`,
-  );
+  console.log(`Address reconciliation written to ${ADDRESS_RECONCILIATION_PATH}`);
 
   const manifestEntry: SourceManifestEntry = {
     source: commune === null ? "ban" : "ban-auch",
@@ -463,16 +790,24 @@ async function main(): Promise<void> {
     requestCount: result.acquisition.requestCount,
     retryCount: result.acquisition.retryCount,
     rateLimitCount: result.acquisition.rateLimitCount,
-    filteredRecordCount: result.totalInDepartment - result.totalInBoundary,
-    retainedRecordCount: result.totalInBoundary,
+    filteredRecordCount: result.counters.parsed - result.counters.inBoundary,
+    retainedRecordCount: result.counters.inBoundary,
   };
   await writeSourceManifest(manifestEntry);
   console.log(`Source manifest updated at ${SOURCES_MANIFEST_PATH}`);
 
+  if (result.counters.uniqueNormalized !== result.records.length) {
+    throw new Error(
+      `Address normalization lost records: uniqueNormalized ${result.counters.uniqueNormalized} vs emitted ${result.records.length}`,
+    );
+  }
+
   console.log("=== Acquisition complete ===");
 }
 
-main().catch((err) => {
-  console.error("Fatal error during BAN address acquisition:", err);
-  process.exit(1);
-});
+if (process.argv[1]?.endsWith("fetch-addresses.ts")) {
+  main().catch((err) => {
+    console.error("Fatal error during BAN address acquisition:", err);
+    process.exit(1);
+  });
+}

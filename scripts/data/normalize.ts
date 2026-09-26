@@ -1,4 +1,5 @@
 #!/usr/bin/env tsx
+import { closeSync, openSync, readSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import {
@@ -9,6 +10,7 @@ import {
   type FeatureKind,
   type Geometry,
   type MapFeature,
+  type ProvenanceRecord,
   type SourceReference,
 } from "../../src/lib/data/schema";
 import {
@@ -27,14 +29,20 @@ import {
   deduplicateOsmElements,
   isOsmElement,
   reconstructMultipolygonRelation,
-  type OsmElement,
   type OsmRelationElement,
   type OsmWayElement,
   type RelationIssue,
 } from "./osmRelations";
+import { ADOPTED_LAYERS } from "./bdtopoLayers";
 import { createBoundaryIndex, type BoundaryIndex } from "./boundaryIndex";
 import { normalizeBdtopo } from "./normalizeBdtopo";
-import { normalizeOsmBulk, type OsmNormalizeConfig } from "./normalizeOsmBulk";
+import {
+  emptyOsmNormalizeReport,
+  normalizeOsmBulkFeature,
+  type BulkBoundary,
+  type OsmNormalizeConfig,
+  type OsmNormalizeReport,
+} from "./normalizeOsmBulk";
 
 type Coordinate = [number, number];
 
@@ -48,42 +56,6 @@ type RawBoundary = {
   features?: Array<{ geometry?: unknown; properties?: Record<string, unknown> }>;
 };
 
-type RawSources = {
-  boundary: RawBoundary;
-  osm: RawOsm;
-  osmBulk: { features?: Record<string, unknown>[] };
-  bdtopoFiles: string[];
-  addresses: { addresses?: Record<string, unknown>[]; license?: string };
-  businesses: { records?: Record<string, unknown>[]; sourceUrl?: string; license?: string; acquiredAt?: string };
-  businessesOsm: { status?: string; body?: unknown };
-  businessesWeb: { results?: Record<string, unknown>[] };
-  ign: { features: Record<string, unknown>[]; unavailable: boolean };
-  osmExtract?: { features: Record<string, unknown>[] };
-};
-
-type OsmGeometry =
-  | { type: "Point"; coordinates: Coordinate }
-  | { type: "LineString"; coordinates: Coordinate[] }
-  | { type: "MultiLineString"; coordinates: Coordinate[][] }
-  | { type: "Polygon"; coordinates: Coordinate[][] }
-  | { type: "MultiPolygon"; coordinates: Coordinate[][][] };
-
-export interface OsmNormalizationResult {
-  features: MapFeature[];
-  relationIssues: RelationIssue[];
-}
-
-interface NormalizeOptions {
-  rawDir: string;
-  outDir: string;
-}
-
-export interface NormalizeScope {
-  boundaryRawFile: string;
-  osmExtractFile?: string;
-  bdtopoDir?: string;
-}
-
 interface TagClassification {
   kind: Exclude<FeatureKind, "boundary" | "business" | "address">;
   poiType?: string;
@@ -92,6 +64,92 @@ interface TagClassification {
   landuseType?: string;
   transportType?: string;
 }
+
+export interface NormalizeScope {
+  boundaryRawFile: string;
+  osmExtractFile?: string;
+  bdtopoDir?: string;
+}
+
+export interface OsmNormalizationResult {
+  features: MapFeature[];
+  relationIssues: RelationIssue[];
+}
+
+const LINE_READ_SIZE = 1 << 20;
+
+export type BulkInputBoundary = BulkBoundary;
+
+export interface NormalizeAllOptions {
+  emit?: (feature: MapFeature) => void;
+  rss?: () => number;
+}
+
+export interface FeatureCounts {
+  total: number;
+  byKind: Record<string, number>;
+}
+
+export interface JsonObjectStream extends AsyncIterable<Record<string, unknown>> {
+  close: () => void;
+}
+
+export interface OsmBulkStream extends AsyncIterable<MapFeature> {
+  report: OsmNormalizeReport;
+}
+
+export interface AddressSourceInput {
+  file: string;
+  license?: string;
+  addresses?: Record<string, unknown>[];
+}
+
+export interface BusinessSourceInput {
+  file: string;
+  header: Record<string, unknown> | null;
+  records?: Record<string, unknown>[];
+}
+
+export interface BusinessSources extends BusinessSourceInput {
+  osm: Record<string, unknown>;
+  web: Record<string, unknown>;
+}
+
+
+
+interface RawSources {
+  boundary: RawBoundary;
+  osm: RawOsm;
+  osmBulkFile: string | null;
+  bdtopoFiles: string[];
+  addressFile: string;
+  addressLicense: string | undefined;
+  businessFile: string;
+  businessHeader: Record<string, unknown> | null;
+  businessesOsm: Record<string, unknown>;
+  businessesWeb: Record<string, unknown>;
+  ign: { features: Record<string, unknown>[]; unavailable: boolean };
+  osmExtractFile: string | null;
+}
+
+
+const PRESERVED_INTERMEDIATE_FILES: ReadonlySet<string> = new Set([
+  "auch-boundary-source.json",
+  "auch-osm-manifest.json",
+  "boundary-source.json",
+  "bdtopo-manifest.json",
+  "ign-unavailable.json",
+  "normalization-issues.json",
+  "osm-bulk-manifest.json",
+  "osm-manifest.json",
+  "relation-issues.json",
+]);
+
+const CHUNK_SIZE = 20_000;
+const WINDOW_SIZE = 4096;
+const MAX_JSON_ERROR_DETAIL = 240;
+const INVALID_ISSUE_LIMIT = 10_000;
+export const FEATURE_BATCH_SIZE = 256;
 
 const SOURCE_TIMESTAMP = new Date().toISOString();
 const OSM_URL = "https://www.openstreetmap.org";
@@ -109,7 +167,7 @@ function dataRoot(): string {
   return process.env.MASTER_MAPS_DATA_DIR ?? "data";
 }
 
-function parseArgs(args: string[]): NormalizeOptions {
+function parseArgs(args: string[]): { rawDir: string; outDir: string } {
   const root = dataRoot();
   let rawDir = path.join(root, "raw");
   let outDir = path.join(root, "intermediate");
@@ -123,6 +181,18 @@ function parseArgs(args: string[]): NormalizeOptions {
     }
   }
   return { rawDir, outDir };
+}
+
+function rssBytes(): number {
+  return process.memoryUsage().rss;
+}
+
+function megabytes(bytes: number): string {
+  return `${(bytes / 1024 / 1024).toFixed(0)}MB`;
+}
+
+function jsonErrorDetail(text: string): string {
+  return text.length <= MAX_JSON_ERROR_DETAIL ? text : `${text.slice(0, MAX_JSON_ERROR_DETAIL)}...`;
 }
 
 function text(value: unknown): string | undefined {
@@ -157,10 +227,6 @@ function parseWidth(value: unknown): number | undefined {
       ? Number.parseFloat(value)
       : NaN;
   return Number.isFinite(candidate) && candidate > 0 ? candidate : undefined;
-}
-
-function metadata(values: Record<string, unknown>): Record<string, unknown> {
-  return Object.fromEntries(Object.entries(values).filter(([, value]) => value !== undefined && value !== null && value !== ""));
 }
 
 function toGeometry(value: unknown): Geometry | null {
@@ -511,54 +577,62 @@ export function normalizeOsmWithReport(raw: RawOsm, boundary: BoundaryFeature | 
   const features: MapFeature[] = [];
   const relationIssues: RelationIssue[] = [];
   const relationWayIds = new Set<number>();
-  for (const relation of relations) {
-    const tags = relation.tags ?? {};
-    const classification = classifyTags(tags);
-    const areaRelation = classification?.kind === "building" || classification?.kind === "water" || classification?.kind === "landuse";
-    const namedAreaPoi = classification?.kind === "poi" && relation.members.some((member) => member.role === "outer" || member.role === "inner");
-    if (!classification || (!areaRelation && !namedAreaPoi)) continue;
-    const reconstructed = reconstructMultipolygonRelation(relation, ways, nodeCoordinates);
-    if ("reason" in reconstructed) {
-      relationIssues.push(reconstructed);
-      continue;
+  for (let cursor = 0; cursor < relations.length; cursor += FEATURE_BATCH_SIZE) {
+    const end = Math.min(relations.length, cursor + FEATURE_BATCH_SIZE);
+    for (let position = cursor; position < end; position += 1) {
+      const relation = relations[position]!;
+      const tags = relation.tags ?? {};
+      const classification = classifyTags(tags);
+      const areaRelation = classification?.kind === "building" || classification?.kind === "water" || classification?.kind === "landuse";
+      const namedAreaPoi = classification?.kind === "poi" && relation.members.some((member) => member.role === "outer" || member.role === "inner");
+      if (!classification || (!areaRelation && !namedAreaPoi)) continue;
+      const reconstructed = reconstructMultipolygonRelation(relation, ways, nodeCoordinates);
+      if ("reason" in reconstructed) {
+        relationIssues.push(reconstructed);
+        continue;
+      }
+      const feature = osmFeature("relation", relation.id, tags, classification, reconstructed.geometry, boundaries, boundaryIndex, timestamp);
+      if (feature) features.push(feature);
+      if (feature && areaRelation) for (const wayId of reconstructed.memberWayIds) relationWayIds.add(wayId);
     }
-    const feature = osmFeature("relation", relation.id, tags, classification, reconstructed.geometry, boundaries, boundaryIndex, timestamp);
-    if (feature) features.push(feature);
-    if (feature && areaRelation) for (const wayId of reconstructed.memberWayIds) relationWayIds.add(wayId);
   }
-  for (const element of elements) {
-    if (element.type === "relation") continue;
-    const tags = element.tags ?? {};
-    const classification = classifyTags(tags);
-    if (!classification) continue;
-    let geometry: Geometry | null = null;
-    if (element.type === "node") {
-      geometry = { type: "Point", coordinates: [element.lon, element.lat] };
-    } else {
-      if (relationWayIds.has(element.id) && (classification.kind === "building" || classification.kind === "water" || classification.kind === "landuse")) continue;
-      const points: Coordinate[] = [];
-      let complete = true;
-      for (const nodeId of element.nodes) {
-        const point = nodeCoordinates.get(nodeId);
-        if (!point) {
-          complete = false;
-          break;
+  for (let cursor = 0; cursor < elements.length; cursor += FEATURE_BATCH_SIZE) {
+    const end = Math.min(elements.length, cursor + FEATURE_BATCH_SIZE);
+    for (let position = cursor; position < end; position += 1) {
+      const element = elements[position]!;
+      if (element.type === "relation") continue;
+      const tags = element.tags ?? {};
+      const classification = classifyTags(tags);
+      if (!classification) continue;
+      let geometry: Geometry | null = null;
+      if (element.type === "node") {
+        geometry = { type: "Point", coordinates: [element.lon, element.lat] };
+      } else {
+        if (relationWayIds.has(element.id) && (classification.kind === "building" || classification.kind === "water" || classification.kind === "landuse")) continue;
+        const points: Coordinate[] = [];
+        let complete = true;
+        for (const nodeId of element.nodes) {
+          const point = nodeCoordinates.get(nodeId);
+          if (!point) {
+            complete = false;
+            break;
+          }
+          points.push(point);
         }
-        points.push(point);
+        if (complete && points.length >= 2) {
+          const first = points[0]!;
+          const last = points[points.length - 1]!;
+          const closed = first[0] === last[0] && first[1] === last[1];
+          const areaKind = classification.kind === "building" || classification.kind === "water" || classification.kind === "landuse" || classification.kind === "poi";
+          geometry = closed && areaKind
+            ? { type: "Polygon", coordinates: [points] }
+            : { type: "LineString", coordinates: points };
+        }
       }
-      if (complete && points.length >= 2) {
-        const first = points[0]!;
-        const last = points[points.length - 1]!;
-        const closed = first[0] === last[0] && first[1] === last[1];
-        const areaKind = classification.kind === "building" || classification.kind === "water" || classification.kind === "landuse" || classification.kind === "poi";
-        geometry = closed && areaKind
-          ? { type: "Polygon", coordinates: [points] }
-          : { type: "LineString", coordinates: points };
-      }
+      if (!geometry) continue;
+      const feature = osmFeature(element.type, element.id, tags, classification, geometry, boundaries, boundaryIndex, timestamp);
+      if (feature) features.push(feature);
     }
-    if (!geometry) continue;
-    const feature = osmFeature(element.type, element.id, tags, classification, geometry, boundaries, boundaryIndex, timestamp);
-    if (feature) features.push(feature);
   }
   return { features, relationIssues };
 }
@@ -567,47 +641,702 @@ export function normalizeOsm(raw: RawOsm, boundary: BoundaryFeature): MapFeature
   return normalizeOsmWithReport(raw, boundary).features;
 }
 
-function normalizeAddresses(raw: { addresses?: Record<string, unknown>[]; license?: string }, boundary: BoundaryFeature): AddressFeature[] {
+function positionLabel(state: JsonScanner, readPath: string): string {
+  return `${readPath} at character ${state.cursor}`;
+}
+
+class TruncatedJsonError extends Error {
+  constructor(message: string) {
+    super(`Truncated JSON document: ${message}`);
+    this.name = "TruncatedJsonError";
+  }
+}
+
+interface JsonScanner {
+  text: string;
+  cursor: number;
+  closed: boolean;
+  pull: () => string | null;
+}
+
+function fillScanner(state: JsonScanner): boolean {
+  if (state.cursor < state.text.length) return true;
+  const next = state.pull();
+  if (next === null) return false;
+  state.text = state.text.length === 0 ? next : state.text + next;
+  return true;
+}
+
+function compactScanner(state: JsonScanner): void {
+  if (state.cursor === 0) return;
+  state.text = state.text.slice(state.cursor);
+  state.cursor = 0;
+}
+
+function jsonValueComplete(value: string): boolean {
+  try {
+    JSON.parse(value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function skipWhitespace(state: JsonScanner): boolean {
+  for (;;) {
+    while (state.cursor < state.text.length) {
+      const code = state.text.charCodeAt(state.cursor);
+      if (code === 0x20 || code === 0x09 || code === 0x0a || code === 0x0d) {
+        state.cursor += 1;
+        continue;
+      }
+      return true;
+    }
+    if (!fillScanner(state)) return false;
+  }
+}
+
+function scanValue(state: JsonScanner, readPath: string): string {
+  while (state.cursor >= state.text.length) {
+    if (!fillScanner(state)) throw new TruncatedJsonError(positionLabel(state, readPath));
+  }
+  const start = state.cursor;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (;;) {
+    while (state.cursor < state.text.length) {
+      const code = state.text.charCodeAt(state.cursor);
+      if (inString) {
+        if (escaped) {
+          escaped = false;
+          state.cursor += 1;
+          continue;
+        }
+        if (code === 0x5c) {
+          escaped = true;
+          state.cursor += 1;
+          continue;
+        }
+        state.cursor += 1;
+        if (code === 0x22) {
+          inString = false;
+          if (depth === 0) return state.text.slice(start, state.cursor);
+        }
+        continue;
+      }
+      if (code === 0x22) {
+        inString = true;
+        state.cursor += 1;
+        continue;
+      }
+      if (code === 0x7b || code === 0x5b) {
+        depth += 1;
+        state.cursor += 1;
+        continue;
+      }
+      if (code === 0x7d || code === 0x5d) {
+        if (depth === 0) return state.text.slice(start, state.cursor);
+        depth -= 1;
+        state.cursor += 1;
+        if (depth === 0) return state.text.slice(start, state.cursor);
+        continue;
+      }
+      if (depth === 0 && (code === 0x2c || code === 0x5d)) {
+        return state.text.slice(start, state.cursor);
+      }
+      if (depth === 0 && (code === 0x20 || code === 0x09 || code === 0x0a || code === 0x0d)) {
+        const candidate = state.text.slice(start, state.cursor).trim();
+        if (jsonValueComplete(candidate)) return candidate;
+        state.cursor += 1;
+        continue;
+      }
+      state.cursor += 1;
+    }
+    if (!fillScanner(state)) {
+      if (inString || depth > 0) throw new TruncatedJsonError(positionLabel(state, readPath));
+      const value = state.text.slice(start, state.cursor).trim();
+      if (value.length === 0 || !jsonValueComplete(value)) throw new TruncatedJsonError(positionLabel(state, readPath));
+      return value;
+    }
+  }
+}
+
+function nextValue(state: JsonScanner, readPath: string): string | null {
+  compactScanner(state);
+  for (;;) {
+    if (!skipWhitespace(state)) return null;
+    const code = state.text.charCodeAt(state.cursor);
+    if (code === 0x2c || code === 0x3a) {
+      state.cursor += 1;
+      continue;
+    }
+    if (code === 0x5b) {
+      state.cursor += 1;
+      continue;
+    }
+    if (code === 0x5d) {
+      state.cursor += 1;
+      state.closed = true;
+      return "]";
+    }
+    return scanValue(state, readPath);
+  }
+}
+
+function seekFirstArray(state: JsonScanner, readPath: string): boolean {
+  for (;;) {
+    if (!skipWhitespace(state)) return false;
+    const code = state.text.charCodeAt(state.cursor);
+    if (code === 0x5b) {
+      state.cursor += 1;
+      return true;
+    }
+    if (code === 0x7b || code === 0x7d || code === 0x2c || code === 0x3a) {
+      state.cursor += 1;
+      continue;
+    }
+    scanValue(state, readPath);
+  }
+}
+
+function seekArrayField(state: JsonScanner, field: string, readPath: string): boolean {
+  let depth = 0;
+  let pendingKey: string | null = null;
+  for (;;) {
+    if (!skipWhitespace(state)) return false;
+    const code = state.text.charCodeAt(state.cursor);
+    if (byte(code) === "brace-open" || byte(code) === "bracket-open") {
+      if (code === 0x5b && pendingKey === field && depth === 1) {
+        state.cursor += 1;
+        return true;
+      }
+      depth += 1;
+      state.cursor += 1;
+      pendingKey = null;
+      continue;
+    }
+    if (byte(code) === "brace-close") {
+      depth -= 1;
+      state.cursor += 1;
+      if (depth <= 0) return false;
+      continue;
+    }
+    if (byte(code) === "comma" || byte(code) === "colon") {
+      state.cursor += 1;
+      continue;
+    }
+    const token = scanValue(state, readPath);
+    if (code === 0x22) pendingKey = token.slice(1, -1);
+    else pendingKey = null;
+  }
+}
+
+function byte(code: number): "brace-open" | "bracket-open" | "brace-close" | "comma" | "colon" | "other" {
+  if (code === 0x7b) return "brace-open";
+  if (code === 0x5b) return "bracket-open";
+  if (code === 0x7d || code === 0x5d) return "brace-close";
+  if (code === 0x2c) return "comma";
+  if (code === 0x3a) return "colon";
+  return "other";
+}
+
+function scannerFromChunks(chunks: Iterable<string>): JsonScanner {
+  const iterator = chunks[Symbol.iterator]();
+  return {
+    text: "",
+    cursor: 0,
+    closed: false,
+    pull: () => {
+      const next = iterator.next();
+      return next.done ? null : String(next.value);
+    },
+  };
+}
+
+function scannerFromLines(filePath: string): JsonScanner {
+  const handle = openSync(filePath, "r");
+  const buffer = Buffer.allocUnsafe(LINE_READ_SIZE);
+  let position = 0;
+  let pending = "";
+  let done = false;
+  return {
+    text: "",
+    cursor: 0,
+    closed: false,
+    pull: () => {
+      if (pending.length > 0) {
+        const line = pending;
+        pending = "";
+        return line;
+      }
+      if (done) return null;
+      const read = readSync(handle, buffer, 0, buffer.length, position);
+      if (read === 0) {
+        done = true;
+        closeSync(handle);
+        return null;
+      }
+      position += read;
+      const decoded = buffer.toString("utf8", 0, read);
+      const lastBreak = decoded.lastIndexOf("\n");
+      const complete = lastBreak < 0 ? "" : decoded.slice(0, lastBreak + 1);
+      pending = lastBreak < 0 ? decoded : decoded.slice(lastBreak + 1);
+      if (complete.length === 0) return decoded;
+      return complete;
+    },
+  };
+}
+
+function parseJsonObject(chunk: string, readPath: string, scanner: JsonScanner): Record<string, unknown> {
+  try {
+    const parsed: unknown = JSON.parse(chunk);
+    return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {};
+  } catch (error) {
+    throw new SyntaxError(`Invalid JSON value in ${positionLabel(scanner, readPath)}: ${jsonErrorDetail(error instanceof Error ? error.message : String(error))}`);
+  }
+}
+
+export function createJsonStringStream(chunks: Iterable<string>, readPath = "<string>"): AsyncIterable<string | Record<string, unknown>> {
+  const scanner = scannerFromChunks(chunks);
+  let located = false;
+  return {
+    [Symbol.asyncIterator](): AsyncIterator<string | Record<string, unknown>> {
+      return {
+        next: async (): Promise<IteratorResult<string | Record<string, unknown>>> => {
+          if (!located) {
+            located = true;
+            if (!seekFirstArray(scanner, readPath)) return { done: true, value: undefined };
+          }
+          const chunk = nextValue(scanner, readPath);
+          if (chunk === null) {
+            if (!scanner.closed) throw new TruncatedJsonError(positionLabel(scanner, readPath));
+            return { done: true, value: undefined };
+          }
+          if (chunk === "]") return { done: true, value: undefined };
+          if (chunk === "," || chunk === ":") return this.next();
+          try {
+            return { done: false, value: JSON.parse(chunk) as string | Record<string, unknown> };
+          } catch (error) {
+            throw new SyntaxError(`Invalid JSON value in ${positionLabel(scanner, readPath)}: ${jsonErrorDetail(error instanceof Error ? error.message : String(error))}`);
+          }
+        },
+        [Symbol.asyncIterator](): AsyncIterator<string | Record<string, unknown>> {
+          return this;
+        },
+      };
+    },
+  };
+}
+
+export function streamJsonArray(filePath: string, field?: string): JsonObjectStream {
+  const scanner = scannerFromLines(filePath);
+  let located = field === undefined;
+  return {
+    close: () => undefined,
+    [Symbol.asyncIterator](): AsyncIterator<Record<string, unknown>> {
+      return {
+        next: async (): Promise<IteratorResult<Record<string, unknown>>> => {
+          if (!located) {
+            located = true;
+            if (field !== undefined && !seekArrayField(scanner, field, filePath)) return { done: true, value: undefined };
+          }
+          for (;;) {
+            const chunk = nextValue(scanner, filePath);
+            if (chunk === null) {
+              if (!scanner.closed) throw new TruncatedJsonError(positionLabel(scanner, filePath));
+              return { done: true, value: undefined };
+            }
+            if (chunk === "]") return { done: true, value: undefined };
+            if (chunk === "," || chunk === ":") continue;
+            if (chunk === "[") continue;
+            return { done: false, value: parseJsonObject(chunk, filePath, scanner) };
+          }
+        },
+        [Symbol.asyncIterator](): AsyncIterator<Record<string, unknown>> {
+          return this;
+        },
+      };
+    },
+  };
+}
+
+export function streamFeatureCollection(filePath: string): JsonObjectStream {
+  const scanner = scannerFromLines(filePath);
+  let located = false;
+  return {
+    close: () => undefined,
+    [Symbol.asyncIterator](): AsyncIterator<Record<string, unknown>> {
+      return {
+        next: async (): Promise<IteratorResult<Record<string, unknown>>> => {
+          if (!located) {
+            located = true;
+            if (!seekFeatureArray(scanner, filePath)) throw new Error(`Invalid GeoJSON FeatureCollection: ${filePath}`);
+          }
+          for (;;) {
+            const chunk = nextValue(scanner, filePath);
+            if (chunk === null) {
+              if (!scanner.closed) throw new TruncatedJsonError(positionLabel(scanner, filePath));
+              return { done: true, value: undefined };
+            }
+            if (chunk === "]") return { done: true, value: undefined };
+            if (chunk === "," || chunk === ":") continue;
+            if (chunk === "[") continue;
+            return { done: false, value: parseJsonObject(chunk, filePath, scanner) };
+          }
+        },
+        [Symbol.asyncIterator](): AsyncIterator<Record<string, unknown>> {
+          return this;
+        },
+      };
+    },
+  };
+}
+
+function seekFeatureArray(scanner: JsonScanner, readPath: string): boolean {
+  for (;;) {
+    if (!skipWhitespace(scanner)) return false;
+    const code = scanner.text.charCodeAt(scanner.cursor);
+    if (code === 0x5b) {
+      scanner.cursor += 1;
+      return true;
+    }
+    if (byte(code) === "other") scanValue(scanner, readPath);
+    else scanner.cursor += 1;
+    if (byte(code) === "brace-close") continue;
+  }
+}
+
+export function streamOsmBulk(filePath: string, boundary: BulkInputBoundary, config?: OsmNormalizeConfig): OsmBulkStream {
+  const report = emptyOsmNormalizeReport();
+  const scanner = scannerFromLines(filePath);
+  let located = false;
+  return {
+    report,
+    [Symbol.asyncIterator](): AsyncIterator<MapFeature> {
+      return {
+        next: async (): Promise<IteratorResult<MapFeature>> => {
+          if (!located) {
+            located = true;
+            if (!seekFeatureArray(scanner, filePath)) throw new Error(`Invalid GeoJSON FeatureCollection: ${filePath}`);
+          }
+          for (;;) {
+            const chunk = nextValue(scanner, filePath);
+            if (chunk === null) {
+              if (!scanner.closed) throw new TruncatedJsonError(positionLabel(scanner, filePath));
+              return { done: true, value: undefined };
+            }
+            if (chunk === "]") return { done: true, value: undefined };
+            if (chunk === "," || chunk === ":") continue;
+            if (chunk === "[") continue;
+            const outcome = normalizeOsmBulkFeature(parseJsonObject(chunk, filePath, scanner), boundary, config, report);
+            if (outcome.feature !== null) return { done: false, value: outcome.feature };
+          }
+        },
+        [Symbol.asyncIterator](): AsyncIterator<MapFeature> {
+          return this;
+        },
+      };
+    },
+  };
+}
+
+type FileHandle = Awaited<ReturnType<typeof fs.open>>;
+
+class FeatureChunkWriter {
+  private readonly handles = new Map<string, FileHandle>();
+  private readonly counts = new Map<string, number>();
+  private readonly directory: string;
+  private chain: Promise<void> = Promise.resolve();
+  private total = 0;
+
+  constructor(directory: string) {
+    this.directory = directory;
+  }
+
+  kinds(): string[] {
+    return [...this.counts.keys()];
+  }
+
+  recordCount(kind: string): number {
+    return this.counts.get(kind) ?? 0;
+  }
+
+  totalCount(): number {
+    return this.total;
+  }
+
+  private async writeChunk(feature: MapFeature, count: number): Promise<void> {
+    const kind = feature.kind;
+    let handle = this.handles.get(kind);
+    if (handle === undefined || count % CHUNK_SIZE === 0) {
+      if (handle !== undefined) {
+        await handle.write("\n]\n");
+        await handle.close();
+      }
+      const suffix = count === 0 ? "" : `-${String(count / CHUNK_SIZE).padStart(4, "0")}`;
+      handle = await fs.open(path.join(this.directory, `${kind}${suffix}.json`), "w");
+      this.handles.set(kind, handle);
+      await handle.write("[");
+    }
+    await handle.write(count % CHUNK_SIZE === 0 ? "\n" : ",\n");
+    await handle.write(JSON.stringify(feature));
+    this.counts.set(kind, count + 1);
+    this.total += 1;
+  }
+
+  push(feature: MapFeature): void {
+    this.chain = this.chain.then(() => this.writeChunk(feature, this.counts.get(feature.kind) ?? 0));
+  }
+
+  async close(): Promise<void> {
+    await this.chain;
+    for (const handle of this.handles.values()) {
+      await handle.write("\n]\n");
+      await handle.close();
+    }
+    this.handles.clear();
+  }
+}
+
+async function writeJsonArray(filePath: string, values: AsyncIterable<unknown> | Iterable<unknown>): Promise<void> {
+  const handle = await fs.open(filePath, "w");
+  let buffer = "";
+  let first = true;
+  try {
+    await handle.write("[");
+    for await (const value of values) {
+      const encoded = JSON.stringify(value);
+      if (encoded === undefined) continue;
+      buffer += `${first ? "" : ",\n"}${encoded}`;
+      first = false;
+      if (buffer.length >= 1024 * 1024) {
+        await handle.write(buffer);
+        buffer = "";
+      }
+    }
+    await handle.write(`${buffer}\n]\n`);
+  } finally {
+    await handle.close();
+  }
+}
+
+async function readJson(filePath: string, required: boolean): Promise<unknown> {
+  try {
+    return JSON.parse(await fs.readFile(filePath, "utf8")) as unknown;
+  } catch (error) {
+    if (required) throw new Error(`Required source file missing or invalid: ${filePath}: ${error instanceof Error ? error.message : String(error)}`);
+    return null;
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function normalizeOsmBulkReport(report: OsmNormalizeReport): string {
+  return `${JSON.stringify(report, null, 2)}\n`;
+}
+
+async function collectOsmObjectIds(filePath: string): Promise<Set<string>> {
+  const ids = new Set<string>();
+  const stream = streamJsonArray(filePath, "features");
+  try {
+    for await (const feature of stream) {
+      if (!isRecord(feature.properties)) continue;
+      const properties = feature.properties as Record<string, unknown>;
+      const type = text(properties["@type"]);
+      const id = numberValue(properties["@id"]);
+      if (type === undefined || id === undefined) continue;
+      ids.add(`${type}/${id}`);
+    }
+  } finally {
+    stream.close();
+  }
+  return ids;
+}
+
+function canonicalOsmObjectIds(sourceId: string | undefined): string[] {
+  if (sourceId === undefined) return [];
+  if (/^(node|way|relation)\/\d+$/.test(sourceId)) return [sourceId];
+  if (/^[nwr]\d+$/.test(sourceId)) {
+    const prefix = sourceId[0]!;
+    const type = prefix === "n" ? "node" : prefix === "w" ? "way" : "relation";
+    return [`${type}/${sourceId.slice(1)}`];
+  }
+  if (/^a\d+$/.test(sourceId)) return [`way/${sourceId.slice(1)}`, `relation/${sourceId.slice(1)}`];
+  return [];
+}
+
+async function loadRawSources(rawDir: string, scope?: NormalizeScope, intermediateDir = path.join(dataRoot(), "intermediate")): Promise<RawSources> {
+  const boundary = await readJson(path.join(rawDir, scope?.boundaryRawFile ?? GERS_TERRITORY.boundaryRawFile), true);
+  if (typeof boundary !== "object" || boundary === null) throw new Error("Admin Express boundary is not an object");
+  const osmParsed = await readJson(path.join(rawDir, "osm.json"), false);
+  const osm: RawOsm = typeof osmParsed === "object" && osmParsed !== null && Array.isArray((osmParsed as Record<string, unknown>).elements)
+    ? osmParsed as unknown as RawOsm
+    : { elements: [], timestamp: "", query: "" };
+  const files = await fs.readdir(rawDir, { withFileTypes: true });
+  const bdtopoDir = scope?.bdtopoDir ?? rawDir;
+  const bdtopoEntries = bdtopoDir === rawDir ? files : await fs.readdir(bdtopoDir, { withFileTypes: true });
+  const bdtopoFiles = bdtopoEntries
+    .filter((entry) => entry.isFile() && ADOPTED_LAYERS.has(entry.name))
+    .map((entry) => path.join(bdtopoDir, entry.name))
+    .sort();
+  if (bdtopoFiles.length === 0) throw new Error("No canonical BD TOPO exports found");
+  const addressFile = scope === undefined ? "ban-addresses.json" : "ban-addresses-auch.json";
+  const addressPath = path.join(rawDir, addressFile);
+  const businessFile = path.join(rawDir, "businesses-sirene.json");
+  const addressHeader = await readObjectHeader(addressPath, true);
+  const businessHeader = await readObjectHeader(businessFile, true);
+  const businessesOsm = (await readJson(path.join(rawDir, "businesses-osm.json"), false)) as Record<string, unknown> ?? {};
+  const businessesWeb = (await readJson(path.join(rawDir, "businesses-web.json"), false)) as Record<string, unknown> ?? {};
+  const ign: RawSources["ign"] = { features: [], unavailable: true };
+  const ignUnavailable = await readJson(path.join(intermediateDir, "ign-unavailable.json"), false);
+  let osmExtractFile: string | null = null;
+  if (scope?.osmExtractFile !== undefined) {
+    const extractPath = path.join(rawDir, scope.osmExtractFile);
+    const stats = await fs.stat(extractPath);
+    if (!stats.isFile()) throw new Error(`OSM extract is not a file: ${extractPath}`);
+    osmExtractFile = extractPath;
+  }
+  for (const entry of files) {
+    if (!entry.isFile() || !/^ign-[^/]+\.json$/.test(entry.name) || entry.name === "ign-capabilities.json") continue;
+    const parsed = await readJson(path.join(rawDir, entry.name), false);
+    if (typeof parsed === "object" && parsed !== null && Array.isArray((parsed as Record<string, unknown>).features)) {
+      ign.features.push(...(parsed as { features: Record<string, unknown>[] }).features);
+      ign.unavailable = false;
+    }
+  }
+  if (typeof ignUnavailable === "object" && ignUnavailable !== null && text((ignUnavailable as Record<string, unknown>).reason)) {
+    ign.features = [];
+    ign.unavailable = true;
+  }
+  const bulkPath = path.join(rawDir, "osm-bulk.geojson");
+  const bulkStats = await fs.stat(bulkPath).catch(() => null);
+  const osmBulkFile = bulkStats?.isFile() === true && bulkStats.size > 0 ? bulkPath : null;
+  return {
+    boundary: boundary as RawBoundary,
+    osm: osm.elements.length > 0 ? osm : { elements: [], timestamp: osmBulkFile === null ? osm.timestamp : "bulk", query: osmBulkFile === null ? osm.query : "geofabrik-enrichment" },
+    osmBulkFile,
+    bdtopoFiles,
+    addressFile: addressPath,
+    addressLicense: text(addressHeader.license),
+    businessFile,
+    businessHeader,
+    businessesOsm,
+    businessesWeb,
+    ign,
+    osmExtractFile,
+  };
+}
+
+async function readObjectHeader(filePath: string, required: boolean): Promise<Record<string, unknown>> {
+  const stream = streamJsonArray(filePath);
+  const iterator = stream[Symbol.asyncIterator]();
+  try {
+    for (;;) {
+      const step = await iterator.next();
+      if (step.done) return {};
+      return step.value;
+    }
+  } catch (error) {
+    if (required) throw new Error(`Required source file missing or invalid: ${filePath}: ${error instanceof Error ? error.message : String(error)}`);
+    return {};
+  } finally {
+    stream.close();
+  }
+}
+
+
+function sameGeometry(first: Geometry, second: Geometry): boolean {
+  if (first.type !== second.type) return false;
+  if (first.type === "Point" && second.type === "Point") {
+    return first.coordinates[0] === second.coordinates[0] && first.coordinates[1] === second.coordinates[1];
+  }
+  return JSON.stringify(first) === JSON.stringify(second);
+}
+
+function canonicalGeometry(geometry: Geometry): Geometry {
+  if (geometry.type !== "Polygon" && geometry.type !== "MultiPolygon") return geometry;
+  const normalized = normalizePolygonGeometry(geometry);
+  if (!normalized) throw new Error("Area geometry has no non-degenerate polygon");
+  return normalized;
+}
+
+function canonicalFeature(feature: MapFeature): MapFeature {
+  const geometry = canonicalGeometry(feature.geometry);
+  const localGeometry = feature.localGeometry ? canonicalGeometry(feature.localGeometry) : undefined;
+  const source = feature.sourceGeometry === undefined ? undefined : canonicalGeometry(feature.sourceGeometry);
+  const redundant = source !== undefined && sameGeometry(geometry, source);
+  const candidate = { ...feature, geometry, localGeometry, sourceGeometry: redundant ? undefined : source };
+  const parsed = MapFeatureSchema.safeParse(candidate);
+  if (!parsed.success) throw new Error(`Invalid normalized feature: ${parsed.error.message}`);
+  return parsed.data;
+}
+
+export function normalizeAddresses(source: AddressSourceInput, boundary: BoundaryFeature): AddressFeature[] {
+  const features: AddressFeature[] = [];
+  normalizeAddressesInto(source, boundary, (feature) => features.push(feature));
+  return features;
+}
+
+async function normalizeAddressesInto(source: AddressSourceInput, boundary: BoundaryFeature, emit: (feature: AddressFeature) => void): Promise<void> {
   const boundaries = boundaryPolygons(boundary);
   const boundaryIndex = createBoundaryIndex(boundaries.map((polygon) => polygon.coordinates));
-  const features: AddressFeature[] = [];
-  for (const record of raw.addresses ?? []) {
-    const longitude = numberValue(record.lon);
-    const latitude = numberValue(record.lat);
-    if (longitude === undefined || latitude === undefined || !boundaryIndex.contains([longitude, latitude])) continue;
-    const housenumber = text(record.numero) ?? "";
-    const street = text(record.streetName ?? record.street) ?? "unknown street";
-    const postcode = text(record.postalCode) ?? "";
-    const city = text(record.city) ?? GERS_TERRITORY.name;
-    const banId = text(record.banId);
-    if (!banId) continue;
-    const name = `${housenumber} ${street}`.trim();
-    const stableId = `ban:${banId}`;
-    const local = wgs84ToRender([longitude, latitude]);
-    const feature = parseFeature({
-      kind: "address",
-      stableId,
-      sourceId: banId,
-      banId,
-      housenumber,
-      street,
-      postcode,
-      city,
-      name,
-      lon: longitude,
-      lat: latitude,
-      x: local[0],
-      z: local[1],
-      geometry: { type: "Point", coordinates: [longitude, latitude] },
-      localGeometry: { type: "Point", coordinates: local },
-      confidence: "high",
-      status: "active",
-      provenance: [{ featureId: stableId, property: "geometry", winner: "ban", contenders: ["ban"], priority: 70, timestamp: SOURCE_TIMESTAMP }],
-      sourceRefs: [{ source: "ban", url: BAN_URL, timestamp: SOURCE_TIMESTAMP, license: raw.license ?? "Etalab-2.0" }],
-    }, stableId);
-    features.push(feature as AddressFeature);
+  const stream = source.addresses === undefined ? streamJsonArray(source.file, "addresses") : null;
+  const pending: AddressFeature[] = [];
+  const flush = (): void => {
+    for (const feature of pending) emit(feature);
+    pending.length = 0;
+  };
+  const consume = async function* (): AsyncGenerator<Record<string, unknown>> {
+    if (source.addresses !== undefined) yield* source.addresses;
+    if (stream !== null) {
+      for await (const record of stream) yield record;
+    }
+  };
+  try {
+    for await (const record of consume()) {
+      const longitude = numberValue(record.lon);
+      const latitude = numberValue(record.lat);
+      if (longitude === undefined || latitude === undefined || !boundaryIndex.contains([longitude, latitude])) continue;
+      const housenumber = text(record.numero) ?? "";
+      const street = text(record.streetName ?? record.street) ?? "unknown street";
+      const postcode = text(record.postalCode) ?? "";
+      const city = text(record.city) ?? GERS_TERRITORY.name;
+      const banId = text(record.banId);
+      if (!banId) continue;
+      const name = `${housenumber} ${street}`.trim();
+      const stableId = `ban:${banId}`;
+      const local = wgs84ToRender([longitude, latitude]);
+      const feature = parseFeature({
+        kind: "address",
+        stableId,
+        sourceId: banId,
+        banId,
+        housenumber,
+        street,
+        postcode,
+        city,
+        name,
+        lon: longitude,
+        lat: latitude,
+        x: local[0],
+        z: local[1],
+        geometry: { type: "Point", coordinates: [longitude, latitude] },
+        localGeometry: { type: "Point", coordinates: local },
+        confidence: "high",
+        status: "active",
+        provenance: [{ featureId: stableId, property: "geometry", winner: "ban", contenders: ["ban"], priority: 70, timestamp: SOURCE_TIMESTAMP }],
+        sourceRefs: [{ source: "ban", url: BAN_URL, timestamp: SOURCE_TIMESTAMP, license: source.license ?? "Etalab-2.0" }],
+      }, stableId);
+      pending.push(feature as AddressFeature);
+      if (pending.length >= FEATURE_BATCH_SIZE) flush();
+    }
+  } finally {
+    stream?.close();
   }
-  return features;
+  flush();
 }
 
 function normalizedText(value: string | undefined): string {
@@ -633,163 +1362,249 @@ function cleanString(value: unknown): string | undefined {
   return text(value);
 }
 
-export function normalizeBusinesses(
-  raw: { records?: Record<string, unknown>[]; sourceUrl?: string; license?: string; acquiredAt?: string },
-  boundary: BoundaryFeature,
-  osmRaw: { status?: string; body?: unknown },
-  webRaw: { results?: Record<string, unknown>[] },
-): BusinessFeature[] {
-  const boundaries = boundaryPolygons(boundary);
-  const boundaryIndex = createBoundaryIndex(boundaries.map((polygon) => polygon.coordinates));
-  const features: BusinessFeature[] = [];
-  const propertySource = new Map<string, Map<string, string>>();
-  const now = raw.acquiredAt ?? SOURCE_TIMESTAMP;
-  const sourceRef = (source: string, url: string | undefined, timestamp: string, license: string | undefined): SourceReference => ({ source, url, timestamp, license });
-  const addSource = (feature: BusinessFeature, reference: SourceReference): void => {
-    if (!feature.sourceRefs.some((candidate) => candidate.source === reference.source && candidate.url === reference.url)) feature.sourceRefs.push(reference);
+interface BusinessSourceFactory {
+  now: string;
+  create(kind: "sirene" | "osm", url: string | undefined, timestamp: string, license: string | undefined): SourceReference;
+}
+
+function businessSources(header: Record<string, unknown> | null): BusinessSourceFactory {
+  const now = cleanString(header?.acquiredAt) ?? SOURCE_TIMESTAMP;
+  const sourceUrl = cleanString(header?.sourceUrl) ?? BUSINESS_URL;
+  const license = cleanString(header?.license) ?? "Licence Ouverte / Open Licence 2.0";
+  return {
+    now,
+    create: (kind, url, timestamp, licenseOverride) => ({ source: kind, url: url ?? sourceUrl, timestamp, license: licenseOverride ?? license }),
   };
-  const priority = (source: string): number => source === "official-website" ? 90 : source === "sirene" ? 80 : source === "annuaire-entreprises" ? 75 : source === "osm" ? 60 : 40;
-  const mergeField = (feature: BusinessFeature, property: keyof BusinessFeature, value: string | undefined, source: string, timestamp: string): void => {
+}
+
+function sireneBusiness(raw: Record<string, unknown>, factory: BusinessSourceFactory): BusinessFeature {
+  const coordinateRecord = isRecord(raw["coordinate"]) ? raw["coordinate"] : {};
+  const longitude = numberValue(coordinateRecord.lon);
+  const latitude = numberValue(coordinateRecord.lat);
+  const businessName = cleanString(raw.tradingName) ?? cleanString(raw.legalName);
+  if (longitude === undefined || latitude === undefined || !businessName) throw new Error("SIRENE record has no coordinate and name");
+  const siret = cleanString(raw.siret);
+  const stableId = siret ? `business:siret/${siret}` : buildStableId("business", businessName, cleanString(raw.address) ?? "", [longitude, latitude]);
+  const local = wgs84ToRender([longitude, latitude]);
+  const source = factory.create("sirene", undefined, cleanString(raw.acquiredAt) ?? factory.now, undefined);
+  return parseFeature({
+    kind: "business",
+    stableId,
+    sourceId: siret,
+    businessId: siret,
+    siret,
+    siren: cleanString(raw.siren),
+    businessName,
+    legalName: cleanString(raw.legalName),
+    brand: cleanString(raw.tradingName),
+    category: cleanString(raw.nafLabel),
+    nafCode: cleanString(raw.nafCode),
+    nafLabel: cleanString(raw.nafLabel),
+    name: businessName,
+    address: cleanString(raw.address),
+    lon: longitude,
+    lat: latitude,
+    x: local[0],
+    z: local[1],
+    geometry: { type: "Point", coordinates: [longitude, latitude] },
+    localGeometry: { type: "Point", coordinates: local },
+    confidence: "high",
+    status: cleanString(raw.administrativeStatus) === "A" || raw.administrativeStatus === undefined ? ("active" as const) : ("uncertain" as const),
+    provenance: [{ featureId: stableId, property: "identity", winner: "sirene", contenders: ["sirene"], priority: 80, timestamp: source.timestamp }],
+    sourceRefs: [source],
+    administrativeStatus: cleanString(raw.administrativeStatus),
+    creationDate: cleanString(raw.creationDate),
+  }, stableId) as BusinessFeature;
+}
+
+function osmBusiness(element: Record<string, unknown>, factory: BusinessSourceFactory): BusinessFeature {
+  const tags = isRecord(element.tags) ? element.tags as Record<string, string> : {};
+  const businessName = cleanString(tags.name);
+  if (!businessName) throw new Error("OSM business element has no name");
+  const pointValue = element.type === "node" ? element : isRecord(element.center) ? element.center : undefined;
+  const pointRecord = pointValue !== undefined ? pointValue : {};
+  const longitude = numberValue(pointRecord.lon);
+  const latitude = numberValue(pointRecord.lat);
+  if (longitude === undefined || latitude === undefined) throw new Error("OSM business element has no coordinate");
+  const local = wgs84ToRender([longitude, latitude]);
+  const elementType = cleanString(element.type) ?? "element";
+  const elementId = numberValue(element.id) ?? 0;
+  const stableId = `business:osm/${elementType}/${elementId}`;
+  const source = factory.create("osm", `${OSM_URL}/${elementType}/${elementId}`, factory.now, "ODbL-1.0");
+  return parseFeature({
+    kind: "business",
+    stableId,
+    sourceId: stableId,
+    businessId: stableId,
+    businessName,
+    name: businessName,
+    brand: cleanString(tags.brand),
+    category: cleanString(tags.shop) ?? cleanString(tags.office) ?? cleanString(tags.craft) ?? cleanString(tags.amenity),
+    address: [cleanString(tags["addr:housenumber"]), cleanString(tags["addr:street"]), cleanString(tags["addr:postcode"])].filter((value): value is string => value !== undefined).join(", ") || undefined,
+    phone: cleanString(tags.phone) ?? cleanString(tags["contact:phone"]),
+    website: cleanString(tags.website) ?? cleanString(tags["contact:website"]),
+    openingHours: cleanString(tags.opening_hours),
+    operator: cleanString(tags.operator),
+    wheelchair: cleanString(tags.wheelchair),
+    lon: longitude,
+    lat: latitude,
+    x: local[0],
+    z: local[1],
+    geometry: { type: "Point", coordinates: [longitude, latitude] },
+    localGeometry: { type: "Point", coordinates: local },
+    confidence: "medium",
+    status: "active",
+    provenance: [{ featureId: stableId, property: "identity", winner: "osm", contenders: ["osm"], priority: 60, timestamp: source.timestamp }],
+    sourceRefs: [source],
+  }, stableId) as BusinessFeature;
+}
+
+class BusinessNormalizer {
+  private readonly features: BusinessFeature[] = [];
+  private readonly indexBySiret = new Map<string, number>();
+  private readonly indexByName = new Map<string, number[]>();
+  private readonly propertySource = new Map<string, Map<string, string>>();
+
+  constructor(private readonly boundaryIndex: BoundaryIndex) {}
+
+  private static priority(source: string): number {
+    if (source === "official-website") return 90;
+    if (source === "sirene") return 80;
+    if (source === "annuaire-entreprises") return 75;
+    if (source === "osm") return 60;
+    return 40;
+  }
+
+  private match(candidate: BusinessFeature): number | undefined {
+    if (candidate.siret) {
+      const index = this.indexBySiret.get(candidate.siret);
+      return index === undefined ? undefined : index;
+    }
+    const candidates = this.indexByName.get(normalizedText(candidate.businessName)) ?? [];
+    for (const index of candidates) {
+      const feature = this.features[index]!;
+      if (feature.siret) continue;
+      if (addressEvidence(candidate.address, feature.address)
+        && metricDistance([candidate.lon!, candidate.lat!], [feature.lon!, feature.lat!]) <= 150) return index;
+    }
+    return undefined;
+  }
+
+  private addSource(feature: BusinessFeature, reference: SourceReference): void {
+    if (!feature.sourceRefs.some((candidate) => candidate.source === reference.source && candidate.url === reference.url)) feature.sourceRefs.push(reference);
+  }
+
+  private mergeField(feature: BusinessFeature, property: keyof BusinessFeature, value: string | undefined, source: string): void {
     if (!value) return;
-    const sources = propertySource.get(feature.stableId) ?? new Map<string, string>();
+    const sources = this.propertySource.get(feature.stableId) ?? new Map<string, string>();
     const current = feature[property];
     const currentSource = sources.get(String(property)) ?? "unknown";
-    if (typeof current !== "string" || priority(source) > priority(currentSource)) {
+    if (typeof current !== "string" || BusinessNormalizer.priority(source) > BusinessNormalizer.priority(currentSource)) {
       (feature as unknown as Record<string, unknown>)[String(property)] = value;
       sources.set(String(property), source);
-      propertySource.set(feature.stableId, sources);
+      this.propertySource.set(feature.stableId, sources);
     }
-  };
-  const match = (candidate: BusinessFeature): BusinessFeature | undefined => features.find((feature) => {
-    if (candidate.siret) return feature.siret === candidate.siret;
-    return !feature.siret
-      && normalizedText(candidate.businessName) === normalizedText(feature.businessName)
-      && addressEvidence(candidate.address, feature.address)
-      && metricDistance([candidate.lon!, candidate.lat!], [feature.lon!, feature.lat!]) <= 150;
-  });
-  const merge = (candidate: BusinessFeature): void => {
-    const existing = match(candidate);
-    if (!existing) {
-      features.push(candidate);
+  }
+
+  accept(candidate: BusinessFeature): void {
+    if (!this.boundaryIndex.contains([candidate.lon!, candidate.lat!])) return;
+    const existing = this.match(candidate);
+    if (existing === undefined) {
+      const index = this.features.length;
+      this.features.push(candidate);
+      if (candidate.siret) this.indexBySiret.set(candidate.siret, index);
+      const nameKey = normalizedText(candidate.businessName);
+      const list = this.indexByName.get(nameKey) ?? [];
+      list.push(index);
+      this.indexByName.set(nameKey, list);
       const sources = new Map<string, string>();
       const source = candidate.sourceRefs[0]?.source ?? "unknown";
       for (const property of ["businessName", "legalName", "brand", "category", "nafCode", "nafLabel", "address", "website", "phone", "openingHours", "operator", "wheelchair"] as const) {
         if (candidate[property]) sources.set(property, source);
       }
-      propertySource.set(candidate.stableId, sources);
+      this.propertySource.set(candidate.stableId, sources);
       return;
     }
+    const target = this.features[existing]!;
     const reference = candidate.sourceRefs[0];
-    if (reference) addSource(existing, reference);
+    if (reference) this.addSource(target, reference);
     const source = reference?.source ?? "unknown";
     for (const property of ["address", "brand", "category", "nafCode", "nafLabel", "website", "phone", "openingHours", "operator", "wheelchair"] as const) {
-      mergeField(existing, property, candidate[property] as string | undefined, source, reference?.timestamp ?? now);
+      this.mergeField(target, property, candidate[property] as string | undefined, source);
     }
-  };
-  for (const record of raw.records ?? []) {
-    const coordinateValue = record.coordinate;
-    const coordinateRecord = typeof coordinateValue === "object" && coordinateValue !== null ? coordinateValue as Record<string, unknown> : {};
+  }
+
+  enrichWeb(raw: Record<string, unknown>): void {
+    if (raw.status !== "ok") return;
+    const businessName = cleanString(raw.name) ?? cleanString(raw.title);
+    if (!businessName) return;
+    const coordinateRecord = isRecord(raw.coordinate) ? raw.coordinate : {};
     const longitude = numberValue(coordinateRecord.lon);
     const latitude = numberValue(coordinateRecord.lat);
-    const businessName = cleanString(record.tradingName) ?? cleanString(record.legalName);
-    if (longitude === undefined || latitude === undefined || !businessName || !boundaryIndex.contains([longitude, latitude])) continue;
-    const siret = cleanString(record.siret);
-    const stableId = siret ? `business:siret/${siret}` : buildStableId("business", businessName, cleanString(record.address) ?? "", [longitude, latitude]);
-    const local = wgs84ToRender([longitude, latitude]);
-    const source = sourceRef("sirene", raw.sourceUrl ?? BUSINESS_URL, cleanString(record.acquiredAt) ?? now, raw.license ?? "Licence Ouverte / Open Licence 2.0");
-    merge(parseFeature({
-      kind: "business",
-      stableId,
-      sourceId: siret,
-      businessId: siret,
-      siret,
-      siren: cleanString(record.siren),
-      businessName,
-      legalName: cleanString(record.legalName),
-      brand: cleanString(record.tradingName),
-      category: cleanString(record.nafLabel),
-      nafCode: cleanString(record.nafCode),
-      nafLabel: cleanString(record.nafLabel),
-      name: businessName,
-      address: cleanString(record.address),
-      lon: longitude,
-      lat: latitude,
-      x: local[0],
-      z: local[1],
-      geometry: { type: "Point", coordinates: [longitude, latitude] },
-      localGeometry: { type: "Point", coordinates: local },
-      confidence: "high",
-      status: cleanString(record.administrativeStatus) === "A" || !record.administrativeStatus ? "active" : "uncertain",
-      provenance: [{ featureId: stableId, property: "identity", winner: "sirene", contenders: ["sirene"], priority: 80, timestamp: source.timestamp }],
-      sourceRefs: [source],
-      administrativeStatus: cleanString(record.administrativeStatus),
-      creationDate: cleanString(record.creationDate),
-    }, stableId) as BusinessFeature);
+    const candidates = this.indexByName.get(normalizedText(businessName)) ?? [];
+    for (const index of candidates) {
+      const feature = this.features[index]!;
+      if (longitude !== undefined && latitude !== undefined && metricDistance([feature.lon!, feature.lat!], [longitude, latitude]) > 150) continue;
+      const sourceId = cleanString(raw.sourceId) ?? "official-website";
+      const source = sourceId.includes("pagesjaunes") ? "pagesjaunes" : "official-website";
+      const reference: SourceReference = { source, url: cleanString(raw.url), timestamp: cleanString(raw.acquiredAt) ?? SOURCE_TIMESTAMP, license: undefined };
+      this.addSource(feature, reference);
+      this.mergeField(feature, "address", cleanString(raw.address), source);
+      this.mergeField(feature, "phone", cleanString(raw.phone), source);
+      this.mergeField(feature, "website", cleanString(raw.url), source);
+      return;
+    }
   }
-  const body = osmRaw.body;
-  const elements = typeof body === "object" && body !== null && Array.isArray((body as Record<string, unknown>).elements)
+
+  results(): BusinessFeature[] {
+    return this.features;
+  }
+}
+
+export async function normalizeBusinesses(sources: BusinessSources, boundary: BoundaryFeature, osmRaw?: Record<string, unknown>, webRaw?: Record<string, unknown>): Promise<BusinessFeature[]> {
+
+  const input: BusinessSources = { file: sources.file, header: sources.header, osm: sources.osm ?? osmRaw ?? {}, web: sources.web ?? webRaw ?? {} };
+  const boundaries = boundaryPolygons(boundary);
+  const boundaryIndex = createBoundaryIndex(boundaries.map((polygon) => polygon.coordinates));
+  const factory = businessSources(sources.header);
+  const normalizer = new BusinessNormalizer(boundaryIndex);
+  const recordStream = sources.records === undefined ? streamJsonArray(sources.file, "records") : null;
+  const inMemory = sources.records ?? [];
+  if (recordStream === null) {
+    for (const record of inMemory) {
+      try {
+        normalizer.accept(sireneBusiness(record, factory));
+      } catch {
+        continue;
+      }
+    }
+  } else {
+    try {
+      for await (const record of recordStream) {
+        try {
+          normalizer.accept(sireneBusiness(record, factory));
+        } catch {
+          continue;
+        }
+      }
+    } finally {
+      recordStream.close();
+    }
+  }
+  const body = input.osm.body;
+  const elements = isRecord(body) && Array.isArray((body as Record<string, unknown>).elements)
     ? (body as { elements: Record<string, unknown>[] }).elements
     : [];
   for (const element of elements) {
-    const tags = typeof element.tags === "object" && element.tags !== null ? element.tags as Record<string, string> : {};
-    const businessName = cleanString(tags.name);
-    const pointValue = element.type === "node" ? element : element.center;
-    const pointRecord = typeof pointValue === "object" && pointValue !== null ? pointValue as Record<string, unknown> : {};
-    const longitude = numberValue(pointRecord.lon);
-    const latitude = numberValue(pointRecord.lat);
-    if (!businessName || longitude === undefined || latitude === undefined || !boundaryIndex.contains([longitude, latitude])) continue;
-    const local = wgs84ToRender([longitude, latitude]);
-    const elementType = cleanString(element.type) ?? "element";
-    const elementId = numberValue(element.id) ?? 0;
-    const stableId = `business:osm/${elementType}/${elementId}`;
-    const source = sourceRef("osm", `${OSM_URL}/${elementType}/${elementId}`, SOURCE_TIMESTAMP, "ODbL-1.0");
-    merge(parseFeature({
-      kind: "business",
-      stableId,
-      sourceId: stableId,
-      businessId: stableId,
-      businessName,
-      name: businessName,
-      brand: cleanString(tags.brand),
-      category: cleanString(tags.shop) ?? cleanString(tags.office) ?? cleanString(tags.craft) ?? cleanString(tags.amenity),
-      address: [cleanString(tags["addr:housenumber"]), cleanString(tags["addr:street"]), cleanString(tags["addr:postcode"])].filter((value): value is string => value !== undefined).join(", ") || undefined,
-      phone: cleanString(tags.phone) ?? cleanString(tags["contact:phone"]),
-      website: cleanString(tags.website) ?? cleanString(tags["contact:website"]),
-      openingHours: cleanString(tags.opening_hours),
-      operator: cleanString(tags.operator),
-      wheelchair: cleanString(tags.wheelchair),
-      lon: longitude,
-      lat: latitude,
-      x: local[0],
-      z: local[1],
-      geometry: { type: "Point", coordinates: [longitude, latitude] },
-      localGeometry: { type: "Point", coordinates: local },
-      confidence: "medium",
-      status: "active",
-      provenance: [{ featureId: stableId, property: "identity", winner: "osm", contenders: ["osm"], priority: 60, timestamp: source.timestamp }],
-      sourceRefs: [source],
-    }, stableId) as BusinessFeature);
+    try {
+      normalizer.accept(osmBusiness(element, factory));
+    } catch {
+      continue;
+    }
   }
-  for (const result of webRaw.results ?? []) {
-    if (result.status !== "ok") continue;
-    const businessName = cleanString(result.name) ?? cleanString(result.title);
-    if (!businessName) continue;
-    const coordinateValue = result.coordinate;
-    const coordinateRecord = typeof coordinateValue === "object" && coordinateValue !== null ? coordinateValue as Record<string, unknown> : {};
-    const longitude = numberValue(coordinateRecord.lon);
-    const latitude = numberValue(coordinateRecord.lat);
-    const existing = features.find((feature) => normalizedText(feature.businessName) === normalizedText(businessName)
-      && (!longitude || !latitude || metricDistance([feature.lon!, feature.lat!], [longitude, latitude]) <= 150));
-    if (!existing) continue;
-    const sourceId = cleanString(result.sourceId) ?? "official-website";
-    const source = sourceId.includes("pagesjaunes") ? "pagesjaunes" : "official-website";
-    const reference = sourceRef(source, cleanString(result.url), cleanString(result.acquiredAt) ?? now, undefined);
-    addSource(existing, reference);
-    mergeField(existing, "address", cleanString(result.address), source, reference.timestamp);
-    mergeField(existing, "phone", cleanString(result.phone), source, reference.timestamp);
-    mergeField(existing, "website", cleanString(result.url), source, reference.timestamp);
-  }
-  return features;
+  const results = Array.isArray(input.web.results) ? input.web.results.filter(isRecord) : [];
+  for (const value of results) normalizer.enrichWeb(value);
+  return normalizer.results();
 }
 
 function normalizeIgn(raw: { features: Record<string, unknown>[]; unavailable: boolean }, boundary: BoundaryFeature): MapFeature[] {
@@ -808,212 +1623,143 @@ function normalizeIgn(raw: { features: Record<string, unknown>[]; unavailable: b
   return result;
 }
 
-async function readJson(filePath: string, required: boolean): Promise<unknown> {
-  try {
-    return JSON.parse(await fs.readFile(filePath, "utf8")) as unknown;
-  } catch (error) {
-    if (required) throw new Error(`Required source file missing or invalid: ${filePath}: ${error instanceof Error ? error.message : String(error)}`);
-    return null;
+async function writeNormalizedFeatures(outDir: string, writer: FeatureChunkWriter): Promise<void> {
+  for (const entry of await fs.readdir(outDir, { withFileTypes: true })) {
+    if (entry.isFile() && entry.name.endsWith(".json") && !PRESERVED_INTERMEDIATE_FILES.has(entry.name)) await fs.unlink(path.join(outDir, entry.name));
   }
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function isGeojsonFeatureCollection(value: unknown): value is { features: Record<string, unknown>[] } {
-  return typeof value === "object" && value !== null && "features" in value && Array.isArray(value.features);
-}
-
-function extractOsmObjectIds(features: Record<string, unknown>[]): Set<string> {
-  const ids = new Set<string>();
-  for (const feature of features) {
-    if (!isRecord(feature.properties)) continue;
-    const type = text(feature.properties["@type"]);
-    const id = numberValue(feature.properties["@id"]);
-    if (type === undefined || id === undefined) continue;
-    ids.add(`${type}/${id}`);
-  }
-  return ids;
-}
-function canonicalOsmObjectIds(sourceId: string | undefined): string[] {
-  if (sourceId === undefined) return [];
-  if (/^(node|way|relation)\/\d+$/.test(sourceId)) return [sourceId];
-  if (/^[nwr]\d+$/.test(sourceId)) {
-    const prefix = sourceId[0]!;
-    const type = prefix === "n" ? "node" : prefix === "w" ? "way" : "relation";
-    return [`${type}/${sourceId.slice(1)}`];
-  }
-  if (/^a\d+$/.test(sourceId)) return [`way/${sourceId.slice(1)}`, `relation/${sourceId.slice(1)}`];
-  return [];
-}
-
-async function loadRawSources(rawDir: string, scope?: NormalizeScope, intermediateDir = path.join(dataRoot(), "intermediate")): Promise<RawSources> {
-  const boundary = await readJson(path.join(rawDir, scope?.boundaryRawFile ?? GERS_TERRITORY.boundaryRawFile), true);
-  if (typeof boundary !== "object" || boundary === null) throw new Error("Admin Express boundary is not an object");
-  const osmParsed = await readJson(path.join(rawDir, "osm.json"), false);
-  let osm: RawOsm = typeof osmParsed === "object" && osmParsed !== null && Array.isArray((osmParsed as Record<string, unknown>).elements)
-    ? osmParsed as unknown as RawOsm
-    : { elements: [], timestamp: "", query: "" };
-  const bulkParsed = await readJson(path.join(rawDir, "osm-bulk.geojson"), false);
-  const osmBulk = typeof bulkParsed === "object" && bulkParsed !== null && Array.isArray((bulkParsed as Record<string, unknown>).features)
-    ? bulkParsed as { features: Record<string, unknown>[] }
-    : { features: [] };
-  if ((osmBulk.features?.length ?? 0) > 0) osm = { elements: [], timestamp: "bulk", query: "geofabrik-enrichment" };
-  const files = await fs.readdir(rawDir, { withFileTypes: true });
-  const bdtopoDir = scope?.bdtopoDir ?? rawDir;
-  const bdtopoEntries = bdtopoDir === rawDir ? files : await fs.readdir(bdtopoDir, { withFileTypes: true });
-  const bdtopoFiles = bdtopoEntries
-    .filter((entry) => entry.isFile() && /^bdtopo-(buildings|roads|water-surfaces|water-lines)\.geojson$/.test(entry.name))
-    .map((entry) => path.join(bdtopoDir, entry.name));
-  if (bdtopoFiles.length === 0) throw new Error("No canonical BD TOPO exports found");
-  const addressFile = scope === undefined ? "ban-addresses.json" : "ban-addresses-auch.json";
-  const addresses = (await readJson(path.join(rawDir, addressFile), true)) as { addresses?: Record<string, unknown>[]; license?: string };
-  const businesses = (await readJson(path.join(rawDir, "businesses-sirene.json"), true)) as RawSources["businesses"];
-  const businessesOsm = (await readJson(path.join(rawDir, "businesses-osm.json"), false)) as RawSources["businessesOsm"] ?? {};
-  const businessesWeb = (await readJson(path.join(rawDir, "businesses-web.json"), false)) as RawSources["businessesWeb"] ?? {};
-  const ign: RawSources["ign"] = { features: [], unavailable: true };
-  const ignUnavailable = await readJson(path.join(intermediateDir, "ign-unavailable.json"), false);
-  let osmExtract: RawSources["osmExtract"];
-  if (scope?.osmExtractFile !== undefined) {
-    const extractPath = path.join(rawDir, scope.osmExtractFile);
-    const parsed = await readJson(extractPath, true);
-    if (!isGeojsonFeatureCollection(parsed)) throw new Error(`OSM extract is not a GeoJSON FeatureCollection: ${extractPath}`);
-    osmExtract = { features: parsed.features };
-  }
-  for (const entry of files) {
-    if (!entry.isFile() || !/^ign-[^/]+\.json$/.test(entry.name) || entry.name === "ign-capabilities.json") continue;
-    const parsed = await readJson(path.join(rawDir, entry.name), false);
-    if (typeof parsed === "object" && parsed !== null && Array.isArray((parsed as Record<string, unknown>).features)) {
-      ign.features.push(...(parsed as { features: Record<string, unknown>[] }).features);
-      ign.unavailable = false;
-    }
-  }
-  if (typeof ignUnavailable === "object" && ignUnavailable !== null && text((ignUnavailable as Record<string, unknown>).reason)) {
-    ign.features = [];
-    ign.unavailable = true;
-  }
-  return { boundary: boundary as RawBoundary, osm, osmBulk, osmExtract, bdtopoFiles, addresses, businesses, businessesOsm, businessesWeb, ign };
-}
-
-async function writeJsonArray(filePath: string, values: Iterable<unknown>): Promise<void> {
-  const handle = await fs.open(filePath, "w");
-  let buffer = "";
-  let first = true;
-  try {
-    await handle.write("[");
-    for (const value of values) {
-      const encoded = JSON.stringify(value);
-      if (encoded === undefined) continue;
-      buffer += `${first ? "" : ",\n"}${encoded}`;
-      first = false;
-      if (buffer.length >= 1024 * 1024) {
-        await handle.write(buffer);
-        buffer = "";
+  await writer.close();
+  const pending: ProvenanceRecord[] = [];
+  for (const kind of writer.kinds()) {
+    const chunkCount = Math.max(1, Math.ceil(writer.recordCount(kind) / CHUNK_SIZE));
+    for (let chunk = 0; chunk < chunkCount; chunk += 1) {
+      const suffix = chunk === 0 ? "" : `-${String(chunk).padStart(4, "0")}`;
+      const parsed: unknown = JSON.parse(await fs.readFile(path.join(outDir, `${kind}${suffix}.json`), "utf8"));
+      if (!Array.isArray(parsed)) continue;
+      for (const value of parsed) {
+        if (!isRecord(value) || !Array.isArray(value.provenance)) continue;
+        for (const record of value.provenance) pending.push(record as ProvenanceRecord);
       }
     }
-    await handle.write(`${buffer}\n]\n`);
-  } finally {
-    await handle.close();
   }
+  await writeJsonArray(path.join(outDir, "provenance.json"), pending);
 }
 
-async function writeNormalizedFeatures(features: MapFeature[], outDir: string): Promise<void> {
-  const preserved = new Set(["boundary-source.json", "bdtopo-manifest.json", "ign-unavailable.json", "osm-manifest.json", "osm-bulk-manifest.json", "relation-issues.json", "normalization-issues.json"]);
-  for (const entry of await fs.readdir(outDir, { withFileTypes: true })) {
-    if (entry.isFile() && entry.name.endsWith(".json") && !preserved.has(entry.name)) await fs.unlink(path.join(outDir, entry.name));
-  }
-  const groups = new Map<string, MapFeature[]>();
-  for (const feature of features) {
-    const parsed = MapFeatureSchema.parse(feature);
-    const list = groups.get(parsed.kind) ?? [];
-    list.push(parsed);
-    groups.set(parsed.kind, list);
-  }
-  for (const [kind, list] of groups) {
-    const chunkSize = 20_000;
-    for (let offset = 0; offset < list.length; offset += chunkSize) {
-      const suffix = offset === 0 ? "" : `-${String(offset / chunkSize).padStart(4, "0")}`;
-      await writeJsonArray(path.join(outDir, `${kind}${suffix}.json`), list.slice(offset, offset + chunkSize));
-    }
-  }
-  function* provenanceRecords(): Iterable<unknown> {
-    for (const feature of features) yield* feature.provenance;
-  }
-  await writeJsonArray(path.join(outDir, "provenance.json"), provenanceRecords());
+function logPhase(phase: string, rss: () => number): void {
+  console.error(`[normalize] ${phase} rss=${megabytes(rss())}`);
 }
 
-function canonicalGeometry(geometry: Geometry): Geometry {
-  if (geometry.type !== "Polygon" && geometry.type !== "MultiPolygon") return geometry;
-  const normalized = normalizePolygonGeometry(geometry);
-  if (!normalized) throw new Error(`Area geometry has no non-degenerate polygon`);
-  return normalized;
-}
-
-function canonicalFeature(feature: MapFeature): MapFeature {
-  const sourceGeometry = feature.sourceGeometry ? canonicalGeometry(feature.sourceGeometry) : undefined;
-  const candidate = { ...feature, geometry: canonicalGeometry(feature.geometry), localGeometry: feature.localGeometry ? canonicalGeometry(feature.localGeometry) : undefined, sourceGeometry };
-  const parsed = MapFeatureSchema.safeParse(candidate);
-  if (!parsed.success) throw new Error(`Invalid normalized feature: ${parsed.error.message}`);
-  return parsed.data;
-}
-export async function normalizeAll(rawDir?: string, outDir?: string, scope?: NormalizeScope): Promise<void> {
+export async function normalizeAll(rawDir?: string, outDir?: string, scope?: NormalizeScope, options: NormalizeAllOptions = {}): Promise<FeatureCounts> {
   const root = dataRoot();
   const sourceDir = rawDir ?? path.join(root, "raw");
   const destinationDir = outDir ?? path.join(root, "intermediate");
+  const rss = options.rss ?? rssBytes;
+  const emit = options.emit;
   await fs.mkdir(destinationDir, { recursive: true });
+  logPhase("sources begin", rss);
   const sources = await loadRawSources(sourceDir, scope, destinationDir);
   const boundary = boundaryFromRaw(sources.boundary, scope);
   const boundaries = boundaryPolygons(boundary);
   const boundaryIndex = createBoundaryIndex(boundaries.map((polygon) => polygon.coordinates));
+  const bdtopoManifest = await readJson(path.join(destinationDir, "bdtopo-manifest.json"), false);
+  const bdtopoEdition = typeof bdtopoManifest === "object" && bdtopoManifest !== null ? text((bdtopoManifest as Record<string, unknown>).edition) : undefined;
   const osmResult = normalizeOsmWithReport(sources.osm, boundary);
-  const bdtopoFeatures: MapFeature[] = [];
-  for (const filePath of sources.bdtopoFiles) {
-    const parsed = await readJson(filePath, true);
-    if (typeof parsed !== "object" || parsed === null || !("features" in parsed) || !Array.isArray(parsed.features)) throw new Error(`Invalid BD TOPO export ${filePath}`);
-    const sourceLayer = path.basename(filePath);
-    const sourceFeatures = parsed.features.map((feature) => {
-      if (typeof feature !== "object" || feature === null) return {};
-      return { ...feature, sourceLayer };
-    });
-    const normalizedFeatures = normalizeBdtopo(sourceFeatures, boundaries.map((polygon) => polygon.coordinates));
-    for (const feature of normalizedFeatures) bdtopoFeatures.push(feature);
-  }
-  const osmBulkFeatures = normalizeOsmBulk(sources.osmBulk.features ?? [], { polygons: boundaries, index: boundaryIndex });
-  const extractObjectIds = sources.osmExtract === undefined ? null : extractOsmObjectIds(sources.osmExtract.features);
-  const deduplicatedBulkFeatures = extractObjectIds === null
-    ? osmBulkFeatures
-    : osmBulkFeatures.filter((feature) => !canonicalOsmObjectIds(feature.sourceId).some((id) => extractObjectIds.has(id)));
-  const auchOsmFeatures = sources.osmExtract === undefined
-    ? []
-    : normalizeOsmBulk(sources.osmExtract.features, { polygons: boundaries, index: boundaryIndex }, AUCH_OSM_CONFIG);
-  const addressFeatures = normalizeAddresses(sources.addresses, boundary);
-  const businessFeatures = normalizeBusinesses(sources.businesses, boundary, sources.businessesOsm, sources.businessesWeb);
-  const ignFeatures = normalizeIgn(sources.ign, boundary);
+  await fs.writeFile(path.join(destinationDir, "relation-issues.json"), `${JSON.stringify(osmResult.relationIssues, null, 2)}\n`, "utf8");
+  logPhase("sources ready", rss);
+
+  const writer = new FeatureChunkWriter(destinationDir);
   const invalidFeatures: Array<{ stableId: string; kind: string; error: string }> = [];
-  const features: MapFeature[] = [];
-  const candidates = [boundary].concat(bdtopoFeatures, deduplicatedBulkFeatures, auchOsmFeatures, osmResult.features, addressFeatures, businessFeatures, ignFeatures);
-  for (const feature of candidates) {
+  let invalidTruncated = false;
+  const counts: Record<string, number> = {};
+  let total = 0;
+  const accept = (candidate: MapFeature): void => {
     try {
-      features.push(canonicalFeature(feature));
+      const feature = canonicalFeature(candidate);
+      counts[feature.kind] = (counts[feature.kind] ?? 0) + 1;
+      total += 1;
+      writer.push(feature);
+      emit?.(feature);
     } catch (error) {
-      const reason = error instanceof Error ? error.message : String(error);
-      if (feature.kind === "boundary") throw error;
-      invalidFeatures.push({ stableId: feature.stableId, kind: feature.kind, error: reason });
+      if (candidate.kind === "boundary") throw error;
+      if (invalidFeatures.length < INVALID_ISSUE_LIMIT) {
+        invalidFeatures.push({ stableId: candidate.stableId, kind: candidate.kind, error: error instanceof Error ? error.message : String(error) });
+      } else {
+        invalidTruncated = true;
+      }
     }
+  };
+
+  accept(boundary);
+
+  for (const feature of osmResult.features) accept(feature);
+  logPhase(`osm overpass ${osmResult.features.length}`, rss);
+
+  const bdtopoBoundaryRings = boundaries.map((polygon) => polygon.coordinates);
+  for (const filePath of sources.bdtopoFiles) {
+    const sourceLayer = path.basename(filePath);
+    let produced = 0;
+    let batch: Record<string, unknown>[] = [];
+    const stream = streamFeatureCollection(filePath);
+    try {
+      for await (const feature of stream) {
+        batch.push({ ...feature, sourceLayer });
+        if (batch.length < FEATURE_BATCH_SIZE) continue;
+        for (const item of normalizeBdtopo(batch, bdtopoBoundaryRings, { edition: bdtopoEdition })) accept(item);
+        produced += batch.length;
+        batch = [];
+      }
+    } finally {
+      stream.close();
+    }
+    if (batch.length > 0) {
+      for (const item of normalizeBdtopo(batch, bdtopoBoundaryRings, { edition: bdtopoEdition })) accept(item);
+      produced += batch.length;
+    }
+    logPhase(`bdtopo ${sourceLayer} ${produced}`, rss);
   }
-  await fs.writeFile(path.join(destinationDir, "normalization-issues.json"), JSON.stringify(invalidFeatures, null, 2) + "\n", "utf8");
-  await fs.writeFile(path.join(destinationDir, "relation-issues.json"), JSON.stringify(osmResult.relationIssues, null, 2) + "\n", "utf8");
-  await writeNormalizedFeatures(features, destinationDir);
-  const counts = new Map<string, number>();
-  for (const feature of features) counts.set(feature.kind, (counts.get(feature.kind) ?? 0) + 1);
-  console.error(`[normalize] Wrote ${features.length} canonical features to ${destinationDir}`);
-  for (const [kind, count] of counts) console.error(`[normalize] ${kind}: ${count}`);
+
+  const extractObjectIds = sources.osmExtractFile === null ? null : await collectOsmObjectIds(sources.osmExtractFile);
+  if (sources.osmBulkFile !== null) {
+    const bulk = streamOsmBulk(sources.osmBulkFile, { polygons: boundaries, index: boundaryIndex });
+    for await (const feature of bulk) {
+      if (extractObjectIds !== null && canonicalOsmObjectIds(feature.sourceId).some((id) => extractObjectIds.has(id))) continue;
+      accept(feature);
+    }
+    await fs.writeFile(path.join(destinationDir, "osm-normalization.json"), normalizeOsmBulkReport(bulk.report), "utf8");
+    logPhase(`osm bulk kept ${bulk.report.keptTotal} dropped ${bulk.report.droppedTotal}`, rss);
+  }
+
+  if (sources.osmExtractFile !== null) {
+    const extract = streamOsmBulk(sources.osmExtractFile, { polygons: boundaries, index: boundaryIndex }, AUCH_OSM_CONFIG);
+    for await (const feature of extract) accept(feature);
+    logPhase(`osm extract kept ${extract.report.keptTotal}`, rss);
+  }
+
+  await normalizeAddressesInto({ file: sources.addressFile, license: sources.addressLicense }, boundary, accept as (feature: AddressFeature) => void);
+  logPhase("addresses", rss);
+
+  for (const feature of await normalizeBusinesses({ file: sources.businessFile, header: sources.businessHeader, osm: sources.businessesOsm, web: sources.businessesWeb }, boundary)) accept(feature);
+  logPhase("businesses", rss);
+
+  for (const feature of normalizeIgn(sources.ign, boundary)) accept(feature);
+
+  await writer.close();
+  await fs.writeFile(path.join(destinationDir, "normalization-issues.json"), `${JSON.stringify(invalidFeatures, null, 2)}\n`, "utf8");
+  if (invalidTruncated) console.error(`[normalize] normalization-issues.json truncated at ${INVALID_ISSUE_LIMIT} entries`);
+  logPhase("features written", rss);
+  await writeNormalizedFeatures(destinationDir, writer);
+  logPhase("provenance written", rss);
+  console.error(`[normalize] Wrote ${total} canonical features to ${destinationDir}`);
+  for (const [kind, count] of Object.entries(counts).sort(([first], [second]) => first.localeCompare(second))) console.error(`[normalize] ${kind}: ${count}`);
+  return { total, byKind: counts };
 }
 
 if (process.argv[1]?.endsWith("normalize.ts")) {
   const options = parseArgs(process.argv.slice(2));
-  normalizeAll(options.rawDir, options.outDir).catch((error: unknown) => {
+  const started = Date.now();
+  normalizeAll(options.rawDir, options.outDir).then((counts) => {
+    console.error(`[normalize] wall=${((Date.now() - started) / 1000).toFixed(1)}s peakRss=${megabytes(rssBytes())}`);
+    return counts;
+  }).catch((error: unknown) => {
     console.error("[normalize] Fatal:", error);
     process.exit(1);
   });

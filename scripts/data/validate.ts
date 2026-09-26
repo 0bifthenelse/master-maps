@@ -1,21 +1,27 @@
 #!/usr/bin/env tsx
-import type { Dirent } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { gunzipSync } from "node:zlib";
+import type { Dirent } from "node:fs";
 import {
   DatasetManifestSchema,
   MapFeatureSchema,
   SearchRecordSchema,
   TileManifestSchema,
-  type MapFeature,
+  TileMetaFeatureSchema,
   type TileManifest,
+  type TileMetaFeature,
 } from "../../src/lib/data/schema";
 import { GERS_TERRITORY } from "../../src/lib/data/territory";
+import { reconcileCoverage, readExclusionReport, type CoverageReconciliation, type ExclusionReport } from "./exclusion-report";
 import { createBoundaryIndex, type BoundaryIndex } from "./boundaryIndex";
+import { decodeRenderTile, renderLayerIndices, renderLayerPositions, renderLayerRanges, type DecodedRenderTile } from "../../src/lib/render/codec";
 
 const MAX_HEIGHT_METRES = 100;
 const MAX_TILE_BYTES = 2 * 1024 * 1024;
-const REQUIRED_KINDS = ["boundary", "building", "road", "water", "business", "address"] as const;
+const REQUIRED_KINDS = ["boundary", "building", "road", "water", "landuse", "poi", "transport", "place", "business", "address"] as const;
+const SEARCH_COVERED_KINDS = ["address", "business", "place", "poi", "road", "transport"] as const;
+const FICTIVE_SOURCE_METADATA_FLAG = "fictif";
 
 export interface ValidationScope {
   territoryCode: string;
@@ -64,28 +70,13 @@ function parseArgs(args: string[]): ValidateOptions {
 }
 
 
-function geometryVertices(geometry: MapFeature["geometry"]): Array<[number, number]> {
-  const vertices: Array<[number, number]> = [];
-  const visit = (value: unknown): void => {
-    if (!Array.isArray(value)) return;
-    if (value.length >= 2 && typeof value[0] === "number" && typeof value[1] === "number") {
-      vertices.push([value[0], value[1]]);
-      return;
-    }
-    for (const child of value) visit(child);
-  };
-  visit(geometry.coordinates);
-  return vertices;
-}
-
-function coordinateIssues(feature: MapFeature, boundaryIndex: BoundaryIndex): ValidationIssue[] {
+function coordinateIssues(feature: TileMetaFeature, boundaryIndex: BoundaryIndex): ValidationIssue[] {
   const issues: ValidationIssue[] = [];
   const featureId = feature.stableId;
   if (feature.lon === undefined || feature.lat === undefined || !Number.isFinite(feature.lon) || !Number.isFinite(feature.lat)) {
     issues.push({ severity: "error", message: "feature has no finite WGS84 anchor", featureId });
   } else if (!boundaryIndex.contains([feature.lon, feature.lat]) && feature.kind !== "boundary") {
-    const vertexInside = boundaryIndex.touches(geometryVertices(feature.geometry));
-    if (!vertexInside) issues.push({ severity: "error", message: "feature anchor lies outside the Gers boundary", featureId });
+    issues.push({ severity: "error", message: "feature anchor lies outside the Gers boundary", featureId });
   }
   if (feature.x === undefined || feature.z === undefined || !Number.isFinite(feature.x) || !Number.isFinite(feature.z)) {
     issues.push({ severity: "error", message: "feature has no finite local anchor", featureId });
@@ -96,14 +87,14 @@ function coordinateIssues(feature: MapFeature, boundaryIndex: BoundaryIndex): Va
   return issues;
 }
 
-function sourceIssues(feature: MapFeature): ValidationIssue[] {
+function sourceIssues(feature: TileMetaFeature): ValidationIssue[] {
   const issues: ValidationIssue[] = [];
   if (feature.sourceRefs.length === 0) issues.push({ severity: "error", message: "feature has no source reference", featureId: feature.stableId });
   if (feature.provenance.length === 0) issues.push({ severity: "error", message: "feature has no provenance", featureId: feature.stableId });
   return issues;
 }
 
-function requiredSourceIssues(features: MapFeature[], scope?: ValidationScope): ValidationIssue[] {
+function requiredSourceIssues(features: TileMetaFeature[], scope?: ValidationScope): ValidationIssue[] {
   const issues: ValidationIssue[] = [];
   const kinds = new Set(features.map((feature) => feature.kind));
   for (const kind of REQUIRED_KINDS) if (!kinds.has(kind)) issues.push({ severity: "error", message: `required layer ${kind} is absent` });
@@ -113,72 +104,254 @@ function requiredSourceIssues(features: MapFeature[], scope?: ValidationScope): 
   }
   return issues;
 }
-function tileIdentityIssues(tile: TileManifest, features: MapFeature[]): ValidationIssue[] {
+function tileIdentityIssues(tile: TileManifest, indexEntry: TileManifest | undefined, features: TileMetaFeature[]): ValidationIssue[] {
   const issues: ValidationIssue[] = [];
   if (tile.featureCount !== features.length) issues.push({ severity: "error", message: "manifest featureCount does not match payload", tileId: tile.tileId });
   const fragmentIds = features.map((feature) => feature.fragmentId ?? feature.stableId);
   if (new Set(fragmentIds).size !== fragmentIds.length) issues.push({ severity: "error", message: "duplicate fragment identity inside tile", tileId: tile.tileId });
-  const manifestIds = new Set(tile.features);
-  for (const feature of features) if (!manifestIds.has(feature.stableId)) issues.push({ severity: "error", message: `tile omits ${feature.stableId} from manifest identity list`, tileId: tile.tileId });
+  const manifestIds = indexEntry?.features;
+  if (manifestIds === undefined) {
+    issues.push({ severity: "warning", message: "tile-index.json carries no identity list for this tile", tileId: tile.tileId });
+    return issues;
+  }
+  const identity = new Set(manifestIds);
+  for (const feature of features) if (!identity.has(feature.stableId)) issues.push({ severity: "error", message: `tile omits ${feature.stableId} from manifest identity list`, tileId: tile.tileId });
+  if (indexEntry.fragmentIds !== undefined && indexEntry.fragmentIds.length !== manifestIds.length) issues.push({ severity: "error", message: "tile-index.json fragment list length differs from its identity list", tileId: tile.tileId });
   return issues;
 }
 
-async function loadTiles(generatedDir: string): Promise<{ features: MapFeature[]; manifests: TileManifest[]; issues: ValidationIssue[] }> {
-  const tilesDir = path.join(generatedDir, "tiles");
+const RENDER_TILE_DECODE_SAMPLE = 50;
+
+function renderStructureIssues(manifest: TileManifest, decoded: DecodedRenderTile): ValidationIssue[] {
   const issues: ValidationIssue[] = [];
-  const featuresById = new Map<string, { lod: number; feature: MapFeature }>();
-  const manifests: TileManifest[] = [];
-  let entries: Dirent[];
-  try {
-    entries = await fs.readdir(tilesDir, { withFileTypes: true });
-  } catch {
-    return { features: [], manifests, issues: [{ severity: "error", message: `cannot access ${tilesDir}` }] };
+  const tileId = manifest.tileId;
+  if (decoded.header.tileId !== tileId) issues.push({ severity: "error", message: "render tile header does not carry its tile id", tileId });
+  if (decoded.header.lod !== manifest.lod) issues.push({ severity: "error", message: `render tile LOD ${decoded.header.lod} disagrees with the manifest LOD ${manifest.lod}`, tileId });
+  if (decoded.header.bounds.some((value, position) => Math.abs(value - manifest.bounds[position]!) > 1e-6)) issues.push({ severity: "error", message: "render tile bounds disagree with the manifest bounds", tileId });
+  for (const layer of decoded.layers) {
+    const positions = renderLayerPositions(decoded.payload, layer);
+    const indices = renderLayerIndices(decoded.payload, layer);
+    const ranges = renderLayerRanges(decoded.payload, layer);
+    if (positions.length % 3 !== 0) issues.push({ severity: "error", message: `layer ${layer.id} vertex count is not a multiple of three`, tileId });
+    for (let vertex = 0; vertex < indices.length; vertex += 1) {
+      if (indices[vertex]! >= positions.length / 3) {
+        issues.push({ severity: "error", message: `layer ${layer.id} index ${indices[vertex]} exceeds the vertex count`, tileId });
+        break;
+      }
+    }
+    for (let vertex = 0; vertex < positions.length; vertex += 3) {
+      const x = positions[vertex]!;
+      const z = positions[vertex + 2]!;
+      if (!Number.isFinite(x) || !Number.isFinite(z) || x < manifest.bounds[0] || x > manifest.bounds[2] || z < manifest.bounds[1] || z > manifest.bounds[3]) {
+        issues.push({ severity: "error", message: `layer ${layer.id} vertex lies outside the tile bounds`, tileId });
+        break;
+      }
+    }
+    for (let entry = 0; entry < ranges.length; entry += 3) {
+      const indexStart = ranges[entry]!;
+      const indexCount = ranges[entry + 1]!;
+      const metaIndex = ranges[entry + 2]!;
+      if (indexStart + indexCount > indices.length) {
+        issues.push({ severity: "error", message: `layer ${layer.id} feature range runs past the index buffer`, tileId });
+        break;
+      }
+      if (metaIndex >= decoded.meta.length) {
+        issues.push({ severity: "error", message: `layer ${layer.id} feature range points at a missing meta entry`, tileId });
+        break;
+      }
+    }
   }
+  return issues;
+}
+
+async function renderTileIssues(generatedDir: string, manifests: TileManifest[]): Promise<ValidationIssue[]> {
+  const issues: ValidationIssue[] = [];
+  const renderDir = path.join(generatedDir, "render");
+  const sampleStride = Math.max(1, Math.floor(manifests.length / RENDER_TILE_DECODE_SAMPLE));
+  let decoded = 0;
+  for (let index = 0; index < manifests.length; index += 1) {
+    const manifest = manifests[index]!;
+    const filePath = path.join(renderDir, `${manifest.tileId}.mmt`);
+    const stats = await fs.stat(filePath).catch(() => null);
+    if (stats === null) {
+      issues.push({ severity: "error", message: "render tile is missing", tileId: manifest.tileId });
+      continue;
+    }
+    if (stats.size > MAX_TILE_BYTES) issues.push({ severity: "error", message: `render tile exceeds ${MAX_TILE_BYTES} byte hard limit`, tileId: manifest.tileId });
+    if (index % sampleStride !== 0) continue;
+    try {
+      const buffer = await fs.readFile(filePath);
+      const view = buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength) as ArrayBuffer;
+      const decodedTile = decodeRenderTile(view);
+      issues.push(...renderStructureIssues(manifest, decodedTile));
+      decoded += 1;
+    } catch (error) {
+      issues.push({ severity: "error", message: `render tile does not decode: ${error instanceof Error ? error.message : String(error)}`, tileId: manifest.tileId });
+    }
+  }
+  if (manifests.length > 0 && decoded === 0) issues.push({ severity: "error", message: "no render tile could be decoded" });
+  return issues;
+}
+
+function fictiveFlagIssues(features: TileMetaFeature[]): ValidationIssue[] {
+  const issues: ValidationIssue[] = [];
+  for (const feature of features) {
+    if (feature.kind !== "water" && feature.kind !== "road") continue;
+    const sourceFlag = (feature.sourceMetadata as Record<string, unknown> | undefined)?.[FICTIVE_SOURCE_METADATA_FLAG];
+    if (sourceFlag === true && feature.fictiveAxis !== true) {
+      issues.push({ severity: "error", message: `source marks the record as ${FICTIVE_SOURCE_METADATA_FLAG} but the canonical record lacks the fictiveAxis flag`, featureId: feature.stableId });
+    }
+  }
+  return issues;
+}
+
+function exclusionReportIssues(report: ExclusionReport | null, dataRoot: string): ValidationIssue[] {
+  if (report === null) return [{ severity: "error", message: `exclusion report is missing at ${path.join(dataRoot, "qa", "exclusion-report.json")}` }];
+  const issues: ValidationIssue[] = [];
+  if (report.totals.unexplained !== 0) issues.push({ severity: "error", message: `exclusion report declares ${report.totals.unexplained} unexplained records` });
+  for (const row of report.sources) {
+    if (row.source === "canonical") continue;
+    const excluded = row.excludedByRule.reduce((sum, entry) => sum + entry.count, 0);
+    if (row.accepted + excluded + row.invalidGeometry + row.outsideBoundary !== row.input) {
+      issues.push({ severity: "error", message: `exclusion accounting is unbalanced for ${row.key}` });
+    }
+  }
+  for (const entry of report.invariants.stagesUndeclared) issues.push({ severity: "warning", message: `stage drop without a source rule: ${entry}` });
+  return issues;
+}
+
+function coverageIssues(reconciliation: CoverageReconciliation, coveragePath: string): ValidationIssue[] {
+  const issues: ValidationIssue[] = [];
+  if (!reconciliation.totalReconciled) {
+    issues.push({ severity: "error", message: `coverage totals do not reconcile: ${coveragePath} declares ${reconciliation.coverageTotal} features while tiles decode ${reconciliation.canonicalTotal}` });
+  }
+  for (const kind of reconciliation.kindsUnmatched) {
+    issues.push({ severity: "error", message: `coverage kind ${kind} disagrees with canonical tile counts (${reconciliation.kindsCoverage[kind] ?? 0} declared, ${reconciliation.kindsCanonical[kind] ?? 0} decoded)` });
+  }
+  return issues;
+}
+
+interface CoverageSummary {
+  totalFeatures: number;
+  featureCounts: Record<string, number>;
+}
+
+async function readCoverage(coveragePath: string): Promise<CoverageSummary | null> {
+  const parsed: unknown = JSON.parse(await fs.readFile(coveragePath, "utf8"));
+  if (typeof parsed !== "object" || parsed === null) return null;
+  const candidate = parsed as Record<string, unknown>;
+  const featureCounts = candidate.featureCounts;
+  if (typeof featureCounts !== "object" || featureCounts === null) return null;
+  const counts: Record<string, number> = {};
+  for (const [kind, value] of Object.entries(featureCounts as Record<string, unknown>)) {
+    if (typeof value === "number" && Number.isFinite(value)) counts[kind] = value;
+  }
+  const declared = candidate.totalFeatures;
+  return { totalFeatures: typeof declared === "number" ? declared : Object.values(counts).reduce((sum, value) => sum + value, 0), featureCounts: counts };
+}
+
+async function readTileIndexEntries(generatedDir: string, issues: ValidationIssue[]): Promise<Map<string, TileManifest>> {
+  const index = new Map<string, TileManifest>();
+  const indexPath = path.join(generatedDir, "tile-index.json");
+  let raw: string;
+  try {
+    raw = await fs.readFile(indexPath, "utf8");
+  } catch {
+    issues.push({ severity: "warning", message: `tile-index.json is missing at ${indexPath}; per-tile identity checks are skipped` });
+    return index;
+  }
+  const parsed = JSON.parse(raw) as unknown;
+  if (!Array.isArray(parsed)) {
+    issues.push({ severity: "error", message: "tile-index.json is not an array" });
+    return index;
+  }
+  for (const value of parsed) {
+    const entry = TileManifestSchema.parse(value);
+    index.set(entry.tileId, entry);
+  }
+  return index;
+}
+
+async function loadMetaFeatures(metaDir: string, tileId: string, issues: ValidationIssue[]): Promise<TileMetaFeature[]> {
+  const parsed = JSON.parse(gunzipSync(await fs.readFile(path.join(metaDir, `${tileId}.json.gz`))).toString("utf8")) as unknown;
+  if (!Array.isArray(parsed)) {
+    issues.push({ severity: "error", message: "meta sidecar payload is not an array", tileId });
+    return [];
+  }
+  const features: TileMetaFeature[] = [];
+  for (const value of parsed) {
+    try {
+      features.push(TileMetaFeatureSchema.parse(value));
+    } catch (error) {
+      issues.push({ severity: "error", message: `invalid meta feature: ${error instanceof Error ? error.message : String(error)}`, tileId });
+    }
+  }
+  return features;
+}
+
+async function loadTiles(generatedDir: string): Promise<{ features: TileMetaFeature[]; manifests: TileManifest[]; issues: ValidationIssue[] }> {
+  const metaDir = path.join(generatedDir, "meta");
+  const issues: ValidationIssue[] = [];
+  const featuresById = new Map<string, { lod: number; feature: TileMetaFeature }>();
+  const manifests: TileManifest[] = [];
   const manifestValue = JSON.parse(await fs.readFile(path.join(generatedDir, "tile-manifest.json"), "utf8")) as unknown;
   if (!Array.isArray(manifestValue)) issues.push({ severity: "error", message: "tile-manifest.json is not an array" });
   else for (const value of manifestValue) manifests.push(TileManifestSchema.parse(value));
   const manifestById = new Map(manifests.map((manifest) => [manifest.tileId, manifest]));
+  const indexById = await readTileIndexEntries(generatedDir, issues);
+  const present = new Set<string>();
+  let entries: Dirent[];
+  try {
+    entries = await fs.readdir(metaDir, { withFileTypes: true });
+  } catch {
+    return { features: [], manifests, issues: [...issues, { severity: "error", message: `cannot access ${metaDir}` }] };
+  }
   for (const entry of entries) {
-    if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
-    const tileId = entry.name.slice(0, -5);
+    if (!entry.isFile() || !entry.name.endsWith(".json.gz")) continue;
+    const tileId = entry.name.slice(0, -".json.gz".length);
     const tile = manifestById.get(tileId);
     if (!tile) {
-      issues.push({ severity: "error", message: "tile file has no manifest entry", tileId });
+      issues.push({ severity: "error", message: "meta sidecar has no manifest entry", tileId });
       continue;
     }
-    const filePath = path.join(tilesDir, entry.name);
-    const stats = await fs.stat(filePath);
-    if (stats.size > MAX_TILE_BYTES) issues.push({ severity: "error", message: `tile exceeds ${MAX_TILE_BYTES} byte hard limit`, tileId });
-    const parsed = JSON.parse(await fs.readFile(filePath, "utf8")) as unknown;
-    if (!Array.isArray(parsed)) {
-      issues.push({ severity: "error", message: "tile payload is not an array", tileId });
+    const stats = await fs.stat(path.join(metaDir, entry.name));
+    if (stats.size > MAX_TILE_BYTES) issues.push({ severity: "error", message: `meta sidecar exceeds ${MAX_TILE_BYTES} byte hard limit`, tileId });
+    present.add(tileId);
+    let tileFeatures: TileMetaFeature[] = [];
+    try {
+      tileFeatures = await loadMetaFeatures(metaDir, tileId, issues);
+    } catch (error) {
+      issues.push({ severity: "error", message: `meta sidecar does not decode: ${error instanceof Error ? error.message : String(error)}`, tileId });
       continue;
     }
-    const tileFeatures: MapFeature[] = [];
-    for (const value of parsed) {
-      try {
-        const feature = MapFeatureSchema.parse(value);
-        tileFeatures.push(feature);
-        const previous = featuresById.get(feature.stableId);
-        if (!previous || tile.lod < previous.lod) featuresById.set(feature.stableId, { lod: tile.lod, feature });
-      } catch (error) {
-        issues.push({ severity: "error", message: `invalid canonical feature: ${error instanceof Error ? error.message : String(error)}`, tileId });
-      }
+    for (const feature of tileFeatures) {
+      const previous = featuresById.get(feature.stableId);
+      if (!previous || tile.lod < previous.lod) featuresById.set(feature.stableId, { lod: tile.lod, feature });
     }
-    issues.push(...tileIdentityIssues(tile, tileFeatures));
+    issues.push(...tileIdentityIssues(tile, indexById.get(tileId), tileFeatures));
+  }
+  for (const manifest of manifests) {
+    if (present.has(manifest.tileId)) continue;
+    issues.push({ severity: "error", message: "manifest tile has no meta sidecar", tileId: manifest.tileId });
   }
   return { features: [...featuresById.values()].map((value) => value.feature), manifests, issues };
 }
 
-async function validateSearch(root: string, manifests: TileManifest[]): Promise<ValidationIssue[]> {
+async function validateSearch(root: string, manifests: TileManifest[], features: TileMetaFeature[]): Promise<ValidationIssue[]> {
   const issues: ValidationIssue[] = [];
   try {
     const parsed = JSON.parse(await fs.readFile(path.join(root, "search", "index.json"), "utf8")) as unknown;
     if (!Array.isArray(parsed) || parsed.length === 0) return [{ severity: "error", message: "search index is empty or not an array" }];
     const tileIds = new Set(manifests.map((manifest) => manifest.tileId));
+    const indexedKinds = new Set<string>();
     for (const value of parsed) {
       const record = SearchRecordSchema.parse(value);
+      indexedKinds.add(record.kind);
       if (!tileIds.has(record.tileId)) issues.push({ severity: "error", message: `search record points to missing tile ${record.tileId}`, featureId: record.featureId });
+    }
+    const present = new Set(features.map((feature) => feature.kind));
+    for (const kind of SEARCH_COVERED_KINDS) {
+      if (present.has(kind) && !indexedKinds.has(kind)) issues.push({ severity: "error", message: `search index holds no record for the named canonical kind ${kind}` });
     }
   } catch (error) {
     issues.push({ severity: "error", message: `invalid search index: ${error instanceof Error ? error.message : String(error)}` });
@@ -215,12 +388,27 @@ export async function validate(generatedDir?: string, scope?: ValidationScope): 
   for (const feature of uniqueFeatures) {
     issues.push(...coordinateIssues(feature, boundaryIndex));
     issues.push(...sourceIssues(feature));
-    if (feature.kind === "road" && feature.localGeometry && ![ "LineString", "MultiLineString", "Polygon", "MultiPolygon" ].includes(feature.localGeometry.type)) issues.push({ severity: "error", message: "road geometry is neither linear nor areal", featureId: feature.stableId });
   }
   issues.push(...requiredSourceIssues(uniqueFeatures, scope));
-  issues.push(...await validateSearch(root, loaded.manifests));
+  issues.push(...fictiveFlagIssues(uniqueFeatures));
+  issues.push(...await validateSearch(root, loaded.manifests, uniqueFeatures));
   issues.push(...lodIssues(loaded.manifests));
-  const report = { checkedAt: new Date().toISOString(), featureCount: uniqueFeatures.length, tileCount: loaded.manifests.length, issues };
+  issues.push(...await renderTileIssues(outputDir, loaded.manifests));
+  const exclusion = await readExclusionReport(path.join(root, "qa", "exclusion-report.json")).catch(() => null);
+  issues.push(...exclusionReportIssues(exclusion, root));
+  const report: { checkedAt: string; featureCount: number; tileCount: number; issues: ValidationIssue[]; reconciliation?: CoverageReconciliation } = { checkedAt: new Date().toISOString(), featureCount: uniqueFeatures.length, tileCount: loaded.manifests.length, issues };
+  const coverage = await readCoverage(path.join(root, "manifests", "coverage.json"));
+  if (coverage !== null) {
+    const reconciliation = reconcileCoverage({
+      canonical: uniqueFeatures,
+      tiles: loaded.manifests.map((tile) => tile.featureCount),
+      featureCounts: coverage.featureCounts,
+      totalFeatures: coverage.totalFeatures,
+      unexplained: exclusion?.totals.unexplained ?? 0,
+    });
+    issues.push(...coverageIssues(reconciliation, path.join(root, "manifests", "coverage.json")));
+    report.reconciliation = reconciliation;
+  }
   await fs.mkdir(path.join(root, "qa"), { recursive: true });
   await fs.writeFile(path.join(root, "qa", "validation-report.json"), JSON.stringify(report, null, 2) + "\n", "utf8");
   const errors = issues.filter((issue) => issue.severity === "error");

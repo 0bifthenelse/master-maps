@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, type ReactNode } from 'react';
+import { useId, useState, type ReactNode } from 'react';
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                              */
@@ -12,8 +12,11 @@ export interface LayerState {
   water: boolean;
   landuse: boolean;
   pois: boolean;
+  places: boolean;
+  transport: boolean;
+  structures: boolean;
+  boundary: boolean;
   labels: boolean;
-  commercialAudit: boolean;
   [key: string]: boolean;
 }
 
@@ -23,8 +26,11 @@ export const DEFAULT_LAYERS: LayerState = {
   water: true,
   landuse: true,
   pois: true,
+  places: true,
+  transport: true,
+  structures: true,
+  boundary: true,
   labels: true,
-  commercialAudit: false,
 };
 
 export type LayerId = keyof LayerState;
@@ -34,7 +40,7 @@ export interface LayerControlsProps {
   layers: LayerState;
   /** Called when a single layer is toggled */
   onToggle: (layer: LayerId, visible: boolean) => void;
-  /** Called to reset all layers to default */
+  /** Called to reset the camera to the department view. */
   onReset?: () => void;
 }
 
@@ -45,17 +51,19 @@ export interface LayerControlsProps {
 interface LayerDef {
   id: LayerId;
   label: string;
-  defaultVisible: boolean;
 }
 
-const LAYERS: LayerDef[] = [
-  { id: 'buildings', label: 'Bâtiments', defaultVisible: true },
-  { id: 'roads', label: 'Routes', defaultVisible: true },
-  { id: 'water', label: 'Eau', defaultVisible: true },
-  { id: 'landuse', label: 'Occupation du sol', defaultVisible: true },
-  { id: 'pois', label: 'Points d\'intérêt', defaultVisible: true },
-  { id: 'labels', label: 'Étiquettes', defaultVisible: true },
-  { id: 'commercialAudit', label: 'Zone de chalandise Nocibé', defaultVisible: false },
+const LAYERS: readonly LayerDef[] = [
+  { id: 'labels', label: 'Étiquettes' },
+  { id: 'places', label: 'Lieux' },
+  { id: 'pois', label: "Points d'intérêt" },
+  { id: 'transport', label: 'Transports' },
+  { id: 'structures', label: 'Structures' },
+  { id: 'buildings', label: 'Bâtiments' },
+  { id: 'roads', label: 'Routes' },
+  { id: 'water', label: 'Eau' },
+  { id: 'landuse', label: 'Occupation du sol' },
+  { id: 'boundary', label: 'Limite du département' },
 ];
 
 /* ------------------------------------------------------------------ */
@@ -72,13 +80,15 @@ function CollapsiblePanel({
   children: ReactNode;
 }) {
   const [open, setOpen] = useState(defaultOpen);
+  const panelId = useId();
   return (
     <div className="layer-controls-panel">
       <button
+        type="button"
         className="panel-toggle"
         onClick={() => setOpen((v) => !v)}
         aria-expanded={open}
-        aria-label={label}
+        aria-controls={panelId}
       >
         <svg
           className={`panel-chevron${open ? ' open' : ''}`}
@@ -94,49 +104,9 @@ function CollapsiblePanel({
         </svg>
         <span>{label}</span>
       </button>
-      {open && <div className="panel-body">{children}</div>}
-    </div>
-  );
-}
-
-/* ------------------------------------------------------------------ */
-/*  Main component                                                     */
-/* ------------------------------------------------------------------ */
-
-export function LayerControls({ layers, onToggle, onReset }: LayerControlsProps) {
-  return (
-    <CollapsiblePanel label="Couches" defaultOpen={false}>
-      <div className="layer-list" role="group" aria-label="Couches de la carte">
-        {LAYERS.map((def) => (
-          <label key={def.id} className="layer-toggle">
-            <input
-              type="checkbox"
-              checked={layers[def.id]}
-              onChange={(e) => onToggle(def.id, e.target.checked)}
-              aria-label={def.label}
-            />
-            <span className="layer-label">{def.label}</span>
-          </label>
-        ))}
+      <div id={panelId} hidden={!open}>
+        {open && <div className="panel-body">{children}</div>}
       </div>
-
-      {onReset && (
-        <button className="reset-button" onClick={onReset} aria-label="Réinitialiser les couches">
-          <svg
-            width="14"
-            height="14"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="2"
-            aria-hidden="true"
-          >
-            <polyline points="1 4 1 10 7 10" />
-            <path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10" />
-          </svg>
-          <span>Réinitialiser</span>
-        </button>
-      )}
 
       <style jsx>{`
         .layer-controls-panel {
@@ -144,7 +114,7 @@ export function LayerControls({ layers, onToggle, onReset }: LayerControlsProps)
           border: 1px solid color-mix(in srgb, var(--color-ink) 12%, transparent);
           border-radius: 6px;
           overflow: hidden;
-          min-width: 200px;
+          min-width: 208px;
         }
 
         .panel-toggle {
@@ -166,6 +136,13 @@ export function LayerControls({ layers, onToggle, onReset }: LayerControlsProps)
 
         .panel-toggle:hover {
           background: color-mix(in srgb, var(--color-ink) 4%, transparent);
+        }
+
+        .panel-toggle:focus-visible,
+        .layer-toggle input:focus-visible,
+        .reset-button:focus-visible {
+          outline: var(--focus-ring-width) solid var(--color-focus-ring);
+          outline-offset: var(--focus-ring-offset);
         }
 
         .panel-chevron {
@@ -235,7 +212,63 @@ export function LayerControls({ layers, onToggle, onReset }: LayerControlsProps)
         .reset-button:hover {
           background: color-mix(in srgb, var(--color-ink) 6%, transparent);
         }
+
+        @media (prefers-reduced-motion: reduce) {
+          .panel-chevron {
+            transition: none;
+          }
+
+          .reset-button {
+            transition: none;
+          }
+        }
       `}</style>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/*  Main component                                                     */
+/* ------------------------------------------------------------------ */
+
+export function LayerControls({ layers, onToggle, onReset }: LayerControlsProps) {
+  return (
+    <CollapsiblePanel label="Couches" defaultOpen={false}>
+      <div className="layer-list" role="group" aria-label="Couches de la carte">
+        {LAYERS.map((def) => (
+          <label key={def.id} className="layer-toggle">
+            <input
+              type="checkbox"
+              checked={layers[def.id] !== false}
+              onChange={(e) => onToggle(def.id, e.target.checked)}
+            />
+            <span className="layer-label">{def.label}</span>
+          </label>
+        ))}
+      </div>
+
+      {onReset && (
+        <button
+          type="button"
+          className="reset-button"
+          onClick={onReset}
+          title="Recentrer la carte sur le département"
+        >
+          <svg
+            width="14"
+            height="14"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            aria-hidden="true"
+          >
+            <polyline points="1 4 1 10 7 10" />
+            <path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10" />
+          </svg>
+          <span>Recentrer la carte</span>
+        </button>
+      )}
     </CollapsiblePanel>
   );
 }

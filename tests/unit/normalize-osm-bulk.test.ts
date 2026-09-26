@@ -47,4 +47,15 @@ describe("bulk OSM normalization", () => {
     expect(features[1]).toMatchObject({ lanes: 2, bridge: true, provenance: [{ winner: "osm-auch", priority: 65 }] });
     expect(features[2]).toMatchObject({ waterType: "water", isSurface: true });
   });
+
+  it("uses complete retention by default for the department wide extract", () => {
+    const features = normalizeOsmBulk([
+      { id: "way/1", geometry: { type: "LineString", coordinates: [[0.5, 43.6], [0.6, 43.7]] }, properties: { highway: "track" } },
+      { id: "node/2", geometry: { type: "Point", coordinates: [0.55, 43.65] }, properties: { place: "village", name: "Auch" } },
+      { id: "way/3", geometry: { type: "LineString", coordinates: [[0.5, 43.6], [0.6, 43.6], [0.6, 43.7], [0.5, 43.6]] }, properties: { landuse: "forest" } },
+      { id: "node/4", geometry: { type: "Point", coordinates: [0.55, 43.65] }, properties: { highway: "bus_stop" } },
+    ]);
+    expect(features.map((feature) => feature.kind)).toEqual(["road", "place", "landuse", "transport"]);
+    expect(features.every((feature) => feature.stableId.startsWith("osm-bulk:"))).toBe(true);
+  });
 });

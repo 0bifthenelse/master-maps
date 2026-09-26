@@ -4,6 +4,7 @@ import { useThree, useFrame } from '@react-three/fiber';
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef } from 'react';
 import * as THREE from 'three';
 import type { MapControls as MapControlsImpl } from 'three-stdlib';
+import { normalizeHeading } from './mapNavigation';
 
 /* ------------------------------------------------------------------ */
 /*  Public API                                                         */
@@ -23,6 +24,16 @@ export interface CameraHandle {
   focusOn: (coord: [number, number], bounds?: [number, number, number, number], zoom?: number) => void;
   /** Reset to the full territory boundary view. */
   resetView: () => void;
+  /** Live orthographic camera, for callers that need the current frustum. */
+  getCamera: () => THREE.OrthographicCamera | null;
+  /** Heading in radians, applied on the next damped step. */
+  setHeading: (radians: number) => void;
+  /** Zoom factor multiplier, 1 leaves the zoom untouched. */
+  zoomBy: (factor: number) => void;
+  /** True while a focus or reset interpolation is still running. */
+  isInterpolating: () => boolean;
+  /** Any user interaction that must cancel a running interpolation. */
+  cancelInterpolation: () => void;
   /** Snapshot of current camera state for diagnostics. */
   getCameraState: () => CameraDiagnostics;
 }
@@ -42,11 +53,24 @@ export interface MapCameraProps {
   makeDefault?: boolean;
   /** Height of camera above the plane */
   cameraHeight?: number;
+  /** Smallest allowed zoom, applied to every zoom source. */
+  minZoom?: number;
+  /** Largest allowed zoom, applied to every zoom source. */
+  maxZoom?: number;
+  /** Observe prefers-reduced-motion: damping and interpolation become instant. */
+  reducedMotion?: boolean;
+  /** Notified whenever the camera or controls moved and a frame is needed. */
+  onCameraActivity?: () => void;
 }
 
+const DEFAULT_MIN_ZOOM = 1;
+const DEFAULT_MAX_ZOOM = 4000;
 const DAMPING = 0.08;
 const CAMERA_TOP_DOWN_PITCH = -Math.PI / 2;
 const ROTATION_SENSITIVITY = 0.005;
+const TARGET_EPSILON = 0.01;
+const ZOOM_EPSILON = 0.01;
+const HEADING_EPSILON = 1e-4;
 
 /** Three's right-handed top-down basis maps +Z to screen down at zero roll.
  * Flip only NDC-Y in the orthographic projection so +X remains screen-right
@@ -64,11 +88,20 @@ export const MapCamera = forwardRef<CameraHandle, MapCameraProps>(
       initialZoom = 1,
       makeDefault = true,
       cameraHeight = 500,
+      minZoom = DEFAULT_MIN_ZOOM,
+      maxZoom = DEFAULT_MAX_ZOOM,
+      reducedMotion = false,
+      onCameraActivity,
     },
     ref,
   ) => {
-    const { set, get, size, gl } = useThree();
+    const { set, get, size, gl, invalidate } = useThree();
     const cameraRef = useRef<THREE.OrthographicCamera>(null!);
+    const reducedMotionRef = useRef(reducedMotion);
+    const activityRef = useRef(onCameraActivity);
+
+    reducedMotionRef.current = reducedMotion;
+    activityRef.current = onCameraActivity;
 
     /* Heading state - authoritative in-plane rotation around viewing axis.
        0 = corrected north-up (Z=0), PI = old reversed default. */
@@ -104,11 +137,11 @@ export const MapCamera = forwardRef<CameraHandle, MapCameraProps>(
         camera.right = (fw / 2) * pad;
         camera.top = (fh / 2) * pad;
         camera.bottom = (-fh / 2) * pad;
-        camera.zoom = zoom;
+        camera.zoom = Math.min(maxZoom, Math.max(minZoom, zoom));
         updateNorthUpProjection(camera);
         return camera;
       },
-      [territoryBounds, size],
+      [territoryBounds, size, minZoom, maxZoom],
     );
 
     /* Centre of the territory */
@@ -122,6 +155,7 @@ export const MapCamera = forwardRef<CameraHandle, MapCameraProps>(
       initialTarget?.[1] ?? centreZ,
     ));
     const animating = useRef(false);
+    const desiredHeading = useRef(0);
     const desiredZoom = useRef(initialZoom);
     const initialised = useRef(false);
 
@@ -147,6 +181,49 @@ export const MapCamera = forwardRef<CameraHandle, MapCameraProps>(
       },
       [cameraHeight, get],
     );
+
+    const setZoom = useCallback(
+      (value: number): void => {
+        const camera = cameraRef.current;
+        if (!camera) return;
+        const clamped = Math.min(maxZoom, Math.max(minZoom, value));
+        if (camera.zoom === clamped) return;
+        camera.zoom = clamped;
+        updateNorthUpProjection(camera);
+      },
+      [minZoom, maxZoom],
+    );
+
+    /* --- Heading, driven by pointer drag and by the controls' own orbit --- */
+
+    const commitHeading = useCallback((radians: number): void => {
+      const camera = cameraRef.current;
+      if (!camera) return;
+      const heading = normalizeHeading(radians);
+      if (heading === headingRef.current) return;
+      headingRef.current = heading;
+      desiredHeading.current = heading;
+      camera.rotation.set(CAMERA_TOP_DOWN_PITCH, 0, heading);
+      camera.updateMatrixWorld();
+      activityRef.current?.();
+      invalidate();
+    }, [invalidate]);
+
+    /* The map is a strict top-down view: the camera always sits directly
+       above its target, which makes Object3D.lookAt a degenerate basis (the
+       view direction and the up vector are parallel). Three then falls back
+       to the matrix Z axis, which silently rolls the camera a few degrees on
+       every OrbitControls.update(). The heading is owned by this component,
+       so the aim step is neutralised and the controls keep the position. */
+    useEffect(() => {
+      const camera = cameraRef.current;
+      if (!camera) return;
+      const aim = camera.lookAt.bind(camera);
+      camera.lookAt = (): void => {};
+      return () => {
+        camera.lookAt = aim;
+      };
+    }, []);
 
     /* Re-fit the frustum whenever the Canvas is resized (mobile rotation,
        window resize) so the territory stays fully visible. */
@@ -178,7 +255,7 @@ export const MapCamera = forwardRef<CameraHandle, MapCameraProps>(
       let activePointerId: number | null = null;
 
       const onPointerDown = (e: PointerEvent) => {
-        if (e.button !== 2) return;
+        if (e.pointerType !== 'mouse' || e.button !== 2) return;
         isRotating = true;
         startX = e.clientX;
         startHeading = headingRef.current;
@@ -192,14 +269,7 @@ export const MapCamera = forwardRef<CameraHandle, MapCameraProps>(
       const onPointerMove = (e: PointerEvent) => {
         if (!isRotating) return;
         if (activePointerId !== null && e.pointerId !== activePointerId) return;
-        const deltaX = e.clientX - startX;
-        const newHeading = startHeading + deltaX * ROTATION_SENSITIVITY;
-        headingRef.current = newHeading;
-        const cam = cameraRef.current;
-        if (cam) {
-          cam.rotation.set(CAMERA_TOP_DOWN_PITCH, 0, newHeading);
-          cam.updateMatrixWorld();
-        }
+        commitHeading(startHeading + (e.clientX - startX) * ROTATION_SENSITIVITY);
       };
 
       const endRotation = (e: PointerEvent) => {
@@ -213,6 +283,7 @@ export const MapCamera = forwardRef<CameraHandle, MapCameraProps>(
       };
 
       const onContextMenu = (e: MouseEvent) => {
+        if (document.documentElement.dataset.featureContextOpen !== 'true') return;
         e.preventDefault();
       };
 
@@ -234,7 +305,7 @@ export const MapCamera = forwardRef<CameraHandle, MapCameraProps>(
           } catch {}
         }
       };
-    }, [gl]);
+    }, [gl, commitHeading]);
 
     /* --- Imperative API --- */
 
@@ -256,84 +327,134 @@ export const MapCamera = forwardRef<CameraHandle, MapCameraProps>(
           camera.right = nfw / 2;
           camera.top = nfh / 2;
           camera.bottom = -nfh / 2;
-          camera.zoom = 1;
-          updateNorthUpProjection(camera);
+          setZoom(1);
         }
-        desiredZoom.current = focusZoom ?? (focusBounds ? 1 : Math.max(initialZoom, 20));
+        desiredZoom.current = Math.min(
+          maxZoom,
+          Math.max(minZoom, focusZoom ?? (focusBounds ? 1 : Math.max(initialZoom, 20))),
+        );
         animating.current = true;
+        invalidate();
       },
-      [initialZoom, size],
+      [initialZoom, size, invalidate, setZoom, minZoom, maxZoom],
     );
 
     const doResetView = useCallback(() => {
       const camera = cameraRef.current;
       if (!camera) return;
 
-      headingRef.current = 0;
+      desiredHeading.current = 0;
       desiredTarget.current.set(centreX, 0, centreZ);
-      applyNorthUp(centreX, centreZ);
-      initialised.current = true;
       initFrustum(initialZoom);
-      desiredZoom.current = initialZoom;
+      desiredZoom.current = Math.min(maxZoom, Math.max(minZoom, initialZoom));
       animating.current = true;
-    }, [applyNorthUp, centreX, centreZ, initFrustum, initialZoom]);
+      invalidate();
+    }, [centreX, centreZ, initFrustum, initialZoom, invalidate, minZoom, maxZoom]);
+
+    const doSetHeading = useCallback((radians: number) => {
+      desiredHeading.current = normalizeHeading(radians);
+      animating.current = true;
+      invalidate();
+    }, [invalidate]);
+
+    const doZoomBy = useCallback((factor: number) => {
+      const camera = cameraRef.current;
+      if (!camera || !Number.isFinite(factor) || factor <= 0) return;
+      desiredZoom.current = Math.min(maxZoom, Math.max(minZoom, camera.zoom * factor));
+      animating.current = true;
+      invalidate();
+    }, [invalidate, minZoom, maxZoom]);
+
+    const doCancel = useCallback(() => {
+      if (!animating.current) return;
+      animating.current = false;
+      desiredHeading.current = headingRef.current;
+      desiredZoom.current = cameraRef.current?.zoom ?? desiredZoom.current;
+    }, []);
 
     /* --- Animation loop --- */
 
     useFrame(() => {
-      if (!initialised.current) {
-        applyNorthUp(desiredTarget.current.x, desiredTarget.current.z);
-        if (get().controls) initialised.current = true;
-      }
       const camera = cameraRef.current;
       if (!camera) return;
 
-      const applyHeading = () => {
-        camera.rotation.set(CAMERA_TOP_DOWN_PITCH, 0, headingRef.current);
-        camera.updateMatrixWorld();
-      };
-
-      if (!animating.current) {
-        applyHeading();
-        return;
-      }
-
-      /* Animate target via the controls when available. */
       const controls = get().controls as MapControlsImpl | null;
-      if (controls) {
-        const t = controls.target;
-        const dx = desiredTarget.current.x - t.x;
-        const dz = desiredTarget.current.z - t.z;
-        if (Math.abs(dx) < 0.01 && Math.abs(dz) < 0.01) {
-          t.x = desiredTarget.current.x;
-          t.z = desiredTarget.current.z;
-          animating.current = false;
-        } else {
-          t.x += dx * DAMPING;
-          t.z += dz * DAMPING;
-        }
-      } else {
-        /* Fallback: move camera position directly. */
-        const cp = camera.position;
-        const dx = desiredTarget.current.x - cp.x;
-        const dz = desiredTarget.current.z - cp.z;
-        if (Math.abs(dx) < 0.01 && Math.abs(dz) < 0.01) {
-          cp.x = desiredTarget.current.x;
-          cp.z = desiredTarget.current.z;
-          animating.current = false;
-        } else {
-          cp.x += dx * DAMPING;
-          cp.z += dz * DAMPING;
+      if (!initialised.current) {
+        if (controls) {
+          applyNorthUp(desiredTarget.current.x, desiredTarget.current.z);
+          initialised.current = true;
         }
       }
 
-      /* Animate zoom when desired. */
-      const zDelta = desiredZoom.current - camera.zoom;
-      if (Math.abs(zDelta) > 0.01) {
-        camera.zoom += zDelta * DAMPING;
-        updateNorthUpProjection(camera);
+      let moving = false;
+
+      if (animating.current) {
+        const instant = reducedMotionRef.current;
+        const blend = instant ? 1 : DAMPING;
+
+        const t = controls ? controls.target : null;
+        const dx = desiredTarget.current.x - (t ? t.x : camera.position.x);
+        const dz = desiredTarget.current.z - (t ? t.z : camera.position.z);
+        if (Math.abs(dx) < TARGET_EPSILON && Math.abs(dz) < TARGET_EPSILON) {
+          if (t) {
+            t.x = desiredTarget.current.x;
+            t.z = desiredTarget.current.z;
+          } else {
+            camera.position.x = desiredTarget.current.x;
+            camera.position.z = desiredTarget.current.z;
+          }
+        } else {
+          if (t) {
+            t.x += dx * blend;
+            t.z += dz * blend;
+          } else {
+            camera.position.x += dx * blend;
+            camera.position.z += dz * blend;
+          }
+          moving = true;
+        }
+
+        const zDelta = desiredZoom.current - camera.zoom;
+        if (Math.abs(zDelta) > ZOOM_EPSILON) {
+          setZoom(camera.zoom + zDelta * blend);
+          moving = true;
+        }
+
+        const hDelta = normalizeHeading(desiredHeading.current) - headingRef.current;
+        if (Math.abs(hDelta) > HEADING_EPSILON) {
+          const next = normalizeHeading(headingRef.current + hDelta * blend);
+          headingRef.current = next;
+          moving = true;
+        } else if (headingRef.current !== desiredHeading.current) {
+          headingRef.current = normalizeHeading(desiredHeading.current);
+        }
+
+        if (!moving) animating.current = false;
       }
-      applyHeading();
+
+      /* OrbitControls re-aims the camera at its target on every update, and
+         a pure lookAt leaves a roll whenever the two are not exactly
+         vertical. The heading is authoritative here, so the orientation is
+         re-asserted every frame instead of only while animating. */
+      if (camera.rotation.z !== headingRef.current) {
+        camera.rotation.set(CAMERA_TOP_DOWN_PITCH, 0, headingRef.current);
+        moving = true;
+      }
+      camera.updateMatrixWorld();
+
+      /* Keep the controls inside the zoom range even for wheel and pinch. */
+      if (
+        (camera.zoom < minZoom && camera.zoom !== minZoom)
+        || (camera.zoom > maxZoom && camera.zoom !== maxZoom)
+      ) {
+        setZoom(camera.zoom);
+        moving = true;
+      }
+
+      if (moving) {
+        activityRef.current?.();
+        invalidate();
+      }
     });
 
     /* --- Ref API exposed to parent --- */
@@ -341,6 +462,11 @@ export const MapCamera = forwardRef<CameraHandle, MapCameraProps>(
     useImperativeHandle(ref, () => ({
       focusOn: doFocusOn,
       resetView: doResetView,
+      getCamera: () => cameraRef.current ?? null,
+      setHeading: doSetHeading,
+      zoomBy: doZoomBy,
+      isInterpolating: () => animating.current,
+      cancelInterpolation: doCancel,
       getCameraState: (): CameraDiagnostics => {
         const camera = cameraRef.current;
         if (!camera) {

@@ -12,6 +12,15 @@ import { runSpatialQa } from "./qa-spatial";
 import { deduplicateOsmElements, isOsmElement } from "./osmRelations";
 import { MapFeatureSchema, TileManifestSchema, type MapFeature } from "../../src/lib/data/schema";
 import { AUCH_DETAIL_SCOPE, GERS_TERRITORY } from "../../src/lib/data/territory";
+import {
+  buildPipelineReport,
+  createStageDropSink,
+  defaultExclusionReportPath,
+  DROP_REASONS,
+  STAGES,
+  writeExclusionReport,
+  type StageDropAccounting,
+} from "./exclusion-report";
 const execFileAsync = promisify(execFile);
 
 const DATA_ROOT = process.env.MASTER_MAPS_DATA_DIR ?? "data";
@@ -471,10 +480,15 @@ export async function refreshAll(options: RefreshOptions = { offline: false, for
   const normalizeScope = paths.scope === "auch"
     ? { boundaryRawFile: AUCH_DETAIL_SCOPE.boundaryRawFile, osmExtractFile: AUCH_DETAIL_SCOPE.osmGeojsonFile, bdtopoDir: path.join(paths.rawDir, AUCH_DETAIL_SCOPE.bdtopoOutputDir) }
     : undefined;
+  const stageDrops: StageDropAccounting[] = [];
+  const stageSink = createStageDropSink(stageDrops);
+  const dedupAccounting = createDedupAccounting();
   await normalizeAll(paths.rawDir, paths.intermediateDir, normalizeScope);
-  await deduplicateAll(paths.intermediateDir, paths.intermediateDir);
+  await deduplicateAll(paths.intermediateDir, paths.intermediateDir, dedupAccounting);
   await buildTilesAll(paths.intermediateDir, paths.tilesDir);
   await buildIndexAll(paths.tilesDir, paths.searchDir);
+  const exclusionReport = await buildPipelineReport({ sources: dedupAccounting.sources, stageDrops, dataRoot: DATA_ROOT });
+  await writeExclusionReport(exclusionReport, defaultExclusionReportPath(DATA_ROOT));
   await writeSourceManifest(paths);
   await writeCoverageReport(paths);
   await writeGenerationManifest(paths);

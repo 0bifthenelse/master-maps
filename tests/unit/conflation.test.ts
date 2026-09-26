@@ -52,4 +52,32 @@ describe("metric cross-source conflation", () => {
     const second = feature("business", "business:osm/node/4", "osm", { type: "Point", coordinates: [5.0001, 5.0001] }, { businessName: "Different label", siret: "123", address: "1 Rue A", x: 5, z: 5 });
     expect(deduplicateFeatures([first, second])).toHaveLength(1);
   });
+
+  it("keeps BD TOPO water surface geometry while OSM contributes its class", () => {
+    const bdtopo = feature("water", "ign-bdtopo:surface/1", "IGN BD TOPO", square(0, 0, 20, 20), { waterType: "Ecoulement naturel", isSurface: true, x: 10, z: 10 });
+    const osm = feature("water", "osm-bulk:way/2", "osm-bulk", square(0.5, 0.5, 19.5, 19.5), { waterType: "Ecoulement naturel", isSurface: true, x: 10, z: 10 });
+    const result = deduplicateFeatures([osm, bdtopo]);
+    expect(result).toHaveLength(1);
+    expect(result[0]?.stableId).toBe(bdtopo.stableId);
+    expect(result[0]?.geometry).toEqual(square(0, 0, 20, 20));
+    expect(result[0]?.sourceRefs.map((ref) => ref.source)).toEqual(expect.arrayContaining(["osm-bulk", "IGN BD TOPO"]));
+  });
+
+  it("keeps OSM names on a BD TOPO building without replacing its geometry", () => {
+    const osm = feature("building", "osm-bulk:way/9", "osm-bulk", square(0, 0, 10, 10), { name: "Mairie", buildingType: "civic", x: 5, z: 5 });
+    const bdtopo = feature("building", "ign-bdtopo:building/9", "IGN BD TOPO", square(0.2, 0.2, 9.8, 9.8), { x: 5, z: 5 });
+    const result = deduplicateFeatures([osm, bdtopo]);
+    expect(result).toHaveLength(1);
+    expect(result[0]?.geometry).toEqual(square(0.2, 0.2, 9.8, 9.8));
+    expect(result[0]?.name).toBe("Mairie");
+  });
+
+  it("keeps OSM landuse, transport and place records as separate features", () => {
+    const forest = feature("landuse", "osm-bulk:way/1", "osm-bulk", square(0, 0, 40, 40), { landuseType: "forest", x: 20, z: 20 });
+    const rail = feature("transport", "osm-bulk:way/2", "osm-bulk", { type: "LineString", coordinates: [[0, 0], [100, 0]] }, { transportType: "rail", name: "Ligne d'Auch", x: 50, z: 0 });
+    const village = feature("place", "osm-bulk:node/3", "osm-bulk", { type: "Point", coordinates: [50, 0] }, { placeType: "village", name: "Auch", importance: 3, x: 50, z: 0 });
+    const result = deduplicateFeatures([forest, rail, village]);
+    expect(result).toHaveLength(3);
+    expect(result.map((item) => item.kind).sort()).toEqual(["landuse", "place", "transport"]);
+  });
 });

@@ -14,6 +14,13 @@ import {
   Vector3,
 } from "three";
 import type { BusinessFeature, PoiFeature } from "@/lib/data/schema";
+import { markerFamilyColor } from "@/lib/scene/materials";
+
+/* Colours come from the three scene roots via materials.ts, never as raw
+   hex: business markers take the accent family and hover/selection takes the
+   highlight family, the only saturated elements on the map. */
+const BUSINESS_COLOR = markerFamilyColor("poi");
+const BUSINESS_HOVER_COLOR = markerFamilyColor("highlight");
 
 type PointGeometry = Extract<PoiFeature["geometry"], { type: "Point" }>;
 type BusinessPointGeometry = Extract<BusinessFeature["geometry"], { type: "Point" }>;
@@ -60,10 +67,15 @@ export type PoiBuildResult = InstancedResult | PointsResult;
 
 // ─── Constants & shared state ───────────────────────────────────────────────
 
-const DEFAULT_BUSINESS_SIZE = 6;
-const BUSINESS_COLOR = '#d34f2f';
-const BUSINESS_HOVER_COLOR = '#ffb000';
-const DEFAULT_POI_SIZE = 4; // metres diameter
+/* Legacy JSON path marker sizing. Instanced circles are ground-plane discs,
+   so their size is a world radius in metres, not a screen constant: the
+   legacy path has no camera, and switching it to a screen-space Points
+   marker would change its picking contract (instanceId -> feature index),
+   which two existing callers depend on. The tile path owns the
+   screen-space-constant markers (materials.ts MARKER_SIZES). */
+const DEFAULT_BUSINESS_SIZE = 18;
+const DEFAULT_POI_SIZE = 12;
+
 
 const _matrix = new Matrix4();
 const _position = new Vector3();
