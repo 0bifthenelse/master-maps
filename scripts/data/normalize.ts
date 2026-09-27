@@ -1,5 +1,5 @@
 #!/usr/bin/env tsx
-import { closeSync, openSync, readSync } from "node:fs";
+import { closeSync, openSync, readSync, writeSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import {
@@ -96,6 +96,7 @@ export interface JsonObjectStream extends AsyncIterable<Record<string, unknown>>
 
 export interface OsmBulkStream extends AsyncIterable<MapFeature> {
   report: OsmNormalizeReport;
+  close: () => void;
 }
 
 export interface AddressSourceInput {
@@ -146,6 +147,7 @@ const PRESERVED_INTERMEDIATE_FILES: ReadonlySet<string> = new Set([
 ]);
 
 const CHUNK_SIZE = 20_000;
+const BUFFER_WRITE_BATCH = 256;
 const WINDOW_SIZE = 4096;
 const MAX_JSON_ERROR_DETAIL = 240;
 const INVALID_ISSUE_LIMIT = 10_000;
@@ -657,6 +659,7 @@ interface JsonScanner {
   cursor: number;
   closed: boolean;
   pull: () => string | null;
+  release?: () => void;
 }
 
 function fillScanner(state: JsonScanner): boolean {
@@ -856,6 +859,12 @@ function scannerFromChunks(chunks: Iterable<string>): JsonScanner {
 
 function scannerFromLines(filePath: string): JsonScanner {
   const handle = openSync(filePath, "r");
+  let closed = false;
+  const release = (): void => {
+    if (closed) return;
+    closed = true;
+    closeSync(handle);
+  };
   const buffer = Buffer.allocUnsafe(LINE_READ_SIZE);
   let position = 0;
   let pending = "";
@@ -864,6 +873,7 @@ function scannerFromLines(filePath: string): JsonScanner {
     text: "",
     cursor: 0,
     closed: false,
+    release,
     pull: () => {
       if (pending.length > 0) {
         const line = pending;
@@ -874,7 +884,7 @@ function scannerFromLines(filePath: string): JsonScanner {
       const read = readSync(handle, buffer, 0, buffer.length, position);
       if (read === 0) {
         done = true;
-        closeSync(handle);
+        release();
         return null;
       }
       position += read;
@@ -933,7 +943,7 @@ export function streamJsonArray(filePath: string, field?: string): JsonObjectStr
   const scanner = scannerFromLines(filePath);
   let located = field === undefined;
   return {
-    close: () => undefined,
+    close: () => scanner.release?.(),
     [Symbol.asyncIterator](): AsyncIterator<Record<string, unknown>> {
       return {
         next: async (): Promise<IteratorResult<Record<string, unknown>>> => {
@@ -965,7 +975,7 @@ export function streamFeatureCollection(filePath: string): JsonObjectStream {
   const scanner = scannerFromLines(filePath);
   let located = false;
   return {
-    close: () => undefined,
+    close: () => scanner.release?.(),
     [Symbol.asyncIterator](): AsyncIterator<Record<string, unknown>> {
       return {
         next: async (): Promise<IteratorResult<Record<string, unknown>>> => {
@@ -1013,6 +1023,7 @@ export function streamOsmBulk(filePath: string, boundary: BulkInputBoundary, con
   let located = false;
   return {
     report,
+    close: () => scanner.release?.(),
     [Symbol.asyncIterator](): AsyncIterator<MapFeature> {
       return {
         next: async (): Promise<IteratorResult<MapFeature>> => {
@@ -1044,10 +1055,10 @@ export function streamOsmBulk(filePath: string, boundary: BulkInputBoundary, con
 type FileHandle = Awaited<ReturnType<typeof fs.open>>;
 
 class FeatureChunkWriter {
-  private readonly handles = new Map<string, FileHandle>();
+  private readonly handles = new Map<string, number>();
+  private readonly buffers = new Map<string, string[]>();
   private readonly counts = new Map<string, number>();
   private readonly directory: string;
-  private chain: Promise<void> = Promise.resolve();
   private total = 0;
 
   constructor(directory: string) {
@@ -1066,36 +1077,49 @@ class FeatureChunkWriter {
     return this.total;
   }
 
-  private async writeChunk(feature: MapFeature, count: number): Promise<void> {
-    const kind = feature.kind;
-    let handle = this.handles.get(kind);
-    if (handle === undefined || count % CHUNK_SIZE === 0) {
-      if (handle !== undefined) {
-        await handle.write("\n]\n");
-        await handle.close();
-      }
-      const suffix = count === 0 ? "" : `-${String(count / CHUNK_SIZE).padStart(4, "0")}`;
-      handle = await fs.open(path.join(this.directory, `${kind}${suffix}.json`), "w");
-      this.handles.set(kind, handle);
-      await handle.write("[");
+  private flush(kind: string, force: boolean): void {
+    const buffered = this.buffers.get(kind);
+    if (buffered === undefined || buffered.length === 0) return;
+    if (!force && buffered.length < BUFFER_WRITE_BATCH) return;
+    const handle = this.handles.get(kind);
+    if (handle === undefined) return;
+    writeSync(handle, buffered.join(""));
+    buffered.length = 0;
+  }
+
+  private openChunk(kind: string, count: number): void {
+    const existing = this.handles.get(kind);
+    if (existing !== undefined) {
+      this.flush(kind, true);
+      writeSync(existing, "\n]\n");
+      closeSync(existing);
     }
-    await handle.write(count % CHUNK_SIZE === 0 ? "\n" : ",\n");
-    await handle.write(JSON.stringify(feature));
-    this.counts.set(kind, count + 1);
-    this.total += 1;
+    const suffix = count === 0 ? "" : `-${String(count / CHUNK_SIZE).padStart(4, "0")}`;
+    const handle = openSync(path.join(this.directory, `${kind}${suffix}.json`), "w");
+    this.handles.set(kind, handle);
+    this.buffers.set(kind, ["["]);
   }
 
   push(feature: MapFeature): void {
-    this.chain = this.chain.then(() => this.writeChunk(feature, this.counts.get(feature.kind) ?? 0));
+    const kind = feature.kind;
+    const count = this.counts.get(kind) ?? 0;
+    if (this.handles.get(kind) === undefined || count % CHUNK_SIZE === 0) this.openChunk(kind, count);
+    const buffered = this.buffers.get(kind)!;
+    buffered.push(count % CHUNK_SIZE === 0 ? "\n" : ",\n", JSON.stringify(feature));
+    this.counts.set(kind, count + 1);
+    this.total += 1;
+    this.flush(kind, false);
   }
 
-  async close(): Promise<void> {
-    await this.chain;
-    for (const handle of this.handles.values()) {
-      await handle.write("\n]\n");
-      await handle.close();
+  close(): void {
+    for (const kind of this.handles.keys()) {
+      this.flush(kind, true);
+      const handle = this.handles.get(kind)!;
+      writeSync(handle, "\n]\n");
+      closeSync(handle);
     }
     this.handles.clear();
+    this.buffers.clear();
   }
 }
 
@@ -1630,7 +1654,6 @@ async function clearStaleIntermediateFiles(outDir: string): Promise<void> {
 }
 
 async function writeNormalizedFeatures(outDir: string, writer: FeatureChunkWriter): Promise<void> {
-  await writer.close();
   const pending: ProvenanceRecord[] = [];
   for (const kind of writer.kinds()) {
     const chunkCount = Math.max(1, Math.ceil(writer.recordCount(kind) / CHUNK_SIZE));
@@ -1746,7 +1769,7 @@ export async function normalizeAll(rawDir?: string, outDir?: string, scope?: Nor
 
   for (const feature of normalizeIgn(sources.ign, boundary)) accept(feature);
 
-  await writer.close();
+  writer.close();
   await fs.writeFile(path.join(destinationDir, "normalization-issues.json"), `${JSON.stringify(invalidFeatures, null, 2)}\n`, "utf8");
   if (invalidTruncated) console.error(`[normalize] normalization-issues.json truncated at ${INVALID_ISSUE_LIMIT} entries`);
   logPhase("features written", rss);

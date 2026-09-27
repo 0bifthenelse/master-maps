@@ -88,7 +88,7 @@ export class DecodeQueue {
 
 
   submit(job: PoolJob, resolve: (tile: DecodedRenderTile) => void, reject: (error: Error) => void): boolean {
-    if (isStaleJob(job, this.currentGeneration)) {
+    if (job.gen !== 0 && isStaleJob(job, this.currentGeneration)) {
       this.droppedStale += 1;
       reject(new TileDecodeCancelled(job.tileId, job.gen));
       return false;
@@ -119,7 +119,8 @@ export class DecodeQueue {
   }
 
   cancelOlderThan(gen: number): number {
-    if (gen > this.currentGeneration) this.currentGeneration = gen;
+    if (gen <= this.currentGeneration) return 0;
+    this.currentGeneration = gen;
     const kept: PoolJob[] = [];
     let removed = 0;
     for (const job of this.jobs) {
@@ -205,7 +206,7 @@ export interface WorkerPoolOptions {
   maxQueueLength?: number;
 }
 
-export const DEFAULT_MAX_QUEUE_LENGTH = 64;
+export const DEFAULT_MAX_QUEUE_LENGTH = 1024;
 
 export class TileWorkerPool {
   private readonly queue: DecodeQueue;

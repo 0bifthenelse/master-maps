@@ -67,6 +67,7 @@ export interface DecodedTileView {
   payload: ArrayBuffer;
   layers: DecodedLayerView[];
   featureCount: number;
+  rangeCount: number;
 }
 
 export class RenderTileViewError extends Error {
@@ -119,13 +120,24 @@ export function viewDecodedTile(tile: DecodedRenderTile): DecodedTileView {
     throw new RenderTileViewError(`tile ${tile.header.tileId} carries no payload slab`);
   }
   const layers = tile.layers.map((layer) => viewLayer(slab, layer));
-  const featureCount = layers.reduce((total, layer) => total + layer.ranges.length / 3, 0);
-  if (featureCount !== tile.meta.length) {
-    throw new RenderTileViewError(
-      `tile ${tile.header.tileId} declares ${featureCount} features but carries ${tile.meta.length} meta entries`,
-    );
+  /* One feature can emit geometry in several layers (a bridge is a road plus a
+     structure, a place can carry both a point and an area), so the sum of the
+     per-layer ranges is a range count, never a feature count. The flat meta
+     array is the feature count; the invariant that must hold is that every
+     range points at a real meta entry, which the loop below enforces. */
+  let rangeCount = 0;
+  for (const layer of layers) {
+    rangeCount += layer.ranges.length / 3;
+    for (let range = 0; range < layer.ranges.length / 3; range += 1) {
+      const metaIndex = layer.ranges[range * 3 + 2]!;
+      if (metaIndex >= tile.meta.length) {
+        throw new RenderTileViewError(
+          `tile ${tile.header.tileId} layer ${layer.id} range ${range} points at meta ${metaIndex} of ${tile.meta.length}`,
+        );
+      }
+    }
   }
-  return { tileId: tile.header.tileId, lod: tile.header.lod, payload: slab, layers, featureCount };
+  return { tileId: tile.header.tileId, lod: tile.header.lod, payload: slab, layers, featureCount: tile.meta.length, rangeCount };
 }
 
 export function layerViewById(view: DecodedTileView, id: RenderLayerId): DecodedLayerView | undefined {

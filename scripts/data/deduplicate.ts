@@ -13,6 +13,7 @@ import {
 } from "./exclusion-report";
 import { wgs84ToRender } from "../../src/lib/geo/crs";
 import * as os from "node:os";
+import { createInterface } from "node:readline";
 import { createReadStream } from "node:fs";
 import readline from "node:readline";
 
@@ -649,49 +650,36 @@ class ChunkSink {
 }
 
 async function* featureRecords(file: string): AsyncGenerator<string> {
-  const stream = createReadStream(file, { encoding: "utf8", highWaterMark: 1 << 20 });
-  let buffer = "";
-  let scanned = 0;
-  let depth = 0;
-  let start = -1;
-  let inString = false;
-  let escaped = false;
-  for await (const piece of stream) {
-    buffer += piece as string;
-    while (scanned < buffer.length) {
-      const character = buffer[scanned]!;
-      scanned += 1;
-      if (inString) {
-        if (escaped) escaped = false;
-        else if (character === "\\") escaped = true;
-        else if (character === '"') inString = false;
+  const lines = createInterface({ input: createReadStream(file, { encoding: "utf8" }), crlfDelay: Number.POSITIVE_INFINITY });
+  let pending = "";
+  for await (const line of lines) {
+    const trimmed = line.trim().replace(/,$/, "");
+    if (trimmed === "" || trimmed === "[" || trimmed === "]") continue;
+    const candidate = pending.length === 0 ? trimmed : `${pending}${trimmed}`;
+    if (!candidate.startsWith("{")) {
+      pending = "";
+      continue;
+    }
+    try {
+      JSON.parse(candidate);
+    } catch {
+      if (candidate.length > 0 && !isCompleteJson(candidate)) {
+        pending = candidate;
         continue;
-      }
-      if (character === '"') {
-        inString = true;
-        continue;
-      }
-      if (character === "{") {
-        if (depth === 0) start = scanned - 1;
-        depth += 1;
-        continue;
-      }
-      if (character === "}") {
-        depth -= 1;
-        if (depth === 0 && start >= 0) {
-          yield buffer.slice(start, scanned);
-          start = -1;
-        }
       }
     }
-    if (start >= 0) {
-      buffer = buffer.slice(start);
-      scanned -= start;
-      start = 0;
-    } else {
-      buffer = "";
-      scanned = 0;
-    }
+    pending = "";
+    yield candidate;
+  }
+  if (pending.length > 0) yield pending;
+}
+
+function isCompleteJson(text: string): boolean {
+  try {
+    JSON.parse(text);
+    return true;
+  } catch {
+    return false;
   }
 }
 

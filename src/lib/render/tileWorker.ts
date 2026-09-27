@@ -15,7 +15,7 @@ function reply(message: WorkerToMainMessage): void {
 }
 
 function handleDecode(request: Extract<MainToWorkerMessage, { t: 'decode' }>): void {
-  if (request.gen < currentGeneration) {
+  if (request.gen !== MIN_GENERATION && request.gen < currentGeneration) {
     const stale: ErrorResponse = {
       t: 'error',
       tileId: request.tileId,

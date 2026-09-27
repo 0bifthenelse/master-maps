@@ -241,13 +241,15 @@ function emitPolygon(mesh: MeshBuilder, polygon: PolygonCoordinates, metaIndex: 
   const indexOffset = mesh.indices.length;
   const vertexOffset = mesh.positions.length / 3;
   const ringVertices: Vector2[] = [...contour, ...holes.flat()];
+  let emitted = 0;
   for (const face of ShapeUtils.triangulateShape(contour, holes)) {
     const [a, b, c] = face;
     for (const corner of [a!, b!, c!]) {
       const vertex = ringVertices[corner]!;
       mesh.positions.push(vertex.x, 0, vertex.y);
     }
-    mesh.indices.push(vertexOffset + a!, vertexOffset + c!, vertexOffset + b!);
+    mesh.indices.push(vertexOffset + emitted, vertexOffset + emitted + 2, vertexOffset + emitted + 1);
+    emitted += 3;
   }
   mesh.ranges.push(indexOffset, mesh.indices.length - indexOffset, metaIndex);
 }

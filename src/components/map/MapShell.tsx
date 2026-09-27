@@ -37,6 +37,7 @@ interface TileRuntimeDiagnostics {
   aborted: string[];
   failed: string[];
   loaded: string[];
+  reasons: Record<string, number>;
 }
 
 declare global {
@@ -47,7 +48,7 @@ declare global {
 
 function tileRuntimeDiagnostics(): TileRuntimeDiagnostics {
   if (!window.__masterMapsTileDiagnostics) {
-    window.__masterMapsTileDiagnostics = { requested: [], aborted: [], failed: [], loaded: [] };
+    window.__masterMapsTileDiagnostics = { requested: [], aborted: [], failed: [], loaded: [], reasons: {} };
   }
   return window.__masterMapsTileDiagnostics;
 }
@@ -55,7 +56,7 @@ function tileRuntimeDiagnostics(): TileRuntimeDiagnostics {
 
 const EMPTY_SCENE_FEATURES: SceneFeature[] = [];
 
-const TILE_LOAD_CONCURRENCY = 8;
+const TILE_LOAD_CONCURRENCY = 24;
 const DATASET_BOUNDARY_TILE_ID = "boundary";
 const DEFAULT_LAYERS: LayerState = { ...BASE_LAYERS, commercialAudit: false };
 const LS_THEME_KEY = "map-theme";
@@ -307,6 +308,9 @@ export default function MapShell() {
         }
         showTileFailureRef.current = true;
         tileRuntimeDiagnostics().failed.push(tileId);
+        const reason = (cause instanceof Error ? `${cause.name}: ${cause.message}` : String(cause)).slice(0, 150);
+        const bucket = tileRuntimeDiagnostics().reasons;
+        bucket[reason] = (bucket[reason] ?? 0) + 1;
         console.warn(`Tile ${tileId} fetch failed`, cause);
       } finally {
         inFlightRef.current.delete(tileId);

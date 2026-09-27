@@ -19,7 +19,6 @@ const envNumber = (name: string, fallback: number): number => {
 const RENDER_GZIP_LEVEL = envNumber("MASTER_MAPS_TILE_GZIP_LEVEL", 9);
 const META_GZIP_LEVEL = envNumber("MASTER_MAPS_TILE_META_GZIP_LEVEL", 6);
 const ZLIB_CONCURRENCY = envNumber("MASTER_MAPS_TILE_ZLIB_CONCURRENCY", 4);
-const PASS_BATCH_TILES = envNumber("MASTER_MAPS_TILE_PASS_BATCH", 512);
 const AUDIT_EVERY = envNumber("MASTER_MAPS_TILE_AUDIT_SAMPLE", 64);
 const ZOD_AUDIT_PER_TILE = envNumber("MASTER_MAPS_TILE_ZOD_AUDIT", 2);
 const META_BYTES_PER_FEATURE_ESTIMATE = 1200;
@@ -690,26 +689,26 @@ async function mergeTileJsonArrays(target: string, parts: string[]): Promise<voi
   const handle = await fs.open(target, "w");
   try {
     await handle.write("[");
-    const heads: Array<{ iterator: AsyncIterator<string>; pending: string | undefined }> = [];
+    const lines: string[][] = [];
     for (const part of parts) {
-      const iterator = createReadStream(part, { encoding: "utf8", highWaterMark: 1 << 20 })[Symbol.asyncIterator]();
-      let pending = (await iterator.next()).value as string | undefined;
-      if (pending !== undefined && (pending.startsWith("[\n") || pending === "[")) pending = pending.slice(1);
-      heads.push({ iterator, pending });
+      const text = await fs.readFile(part, "utf8");
+      const values = text.split("\n").map((line) => line.trim().replace(/,$/, "")).filter((line) => line.startsWith("{"));
+      lines.push(values);
     }
+    const positions = new Array<number>(lines.length).fill(0);
     let written = 0;
     for (;;) {
-      let best: (typeof heads)[number] | undefined;
-      for (const head of heads) {
-        if (head.pending === undefined) continue;
-        if (best === undefined || head.pending < best.pending!) best = head;
+      let bestPart = -1;
+      for (let part = 0; part < lines.length; part += 1) {
+        const candidate = lines[part]![positions[part]!];
+        if (candidate === undefined) continue;
+        if (bestPart < 0 || candidate < lines[bestPart]![positions[bestPart]!]!) bestPart = part;
       }
-      if (best === undefined) break;
-      const value = best.pending.replace(/\n\]\n?$/, "");
+      if (bestPart < 0) break;
+      const value = lines[bestPart]![positions[bestPart]!]!;
+      positions[bestPart] += 1;
       await handle.write(written === 0 ? `\n${value}` : `,\n${value}`);
       written += 1;
-      const next = await best.iterator.next();
-      best.pending = next.done === true ? undefined : (next.value as string);
     }
     await handle.write(written === 0 ? "]\n" : "\n]\n");
   } finally {
@@ -853,7 +852,6 @@ async function streamLevel(context: BuildContext, files: string[], level: 0 | 1 
         }
       }
     }
-    if (open.size >= PASS_BATCH_TILES) await flushOpenTiles(pass, level, size, originX, originZ, entries);
     log(`[tiles] LOD ${level} ${file}: ${pass.featuresRead} features read, ${open.size} tiles buffered, rss ${(process.memoryUsage.rss() / 2 ** 20).toFixed(0)} MiB, elapsed ${((Date.now() - context.startedAt) / 1000).toFixed(0)}s`);
   }
   await flushOpenTiles(pass, level, size, originX, originZ, entries);
@@ -983,7 +981,7 @@ export async function buildTilesAll(inDir?: string, outDir?: string, forceSize?:
     metaTileHardLimitBytes: META_TILE_HARD_LIMIT_BYTES,
     datasetVersion,
     jsonTiles: emitJsonTiles,
-    compression: { renderGzipLevel: RENDER_GZIP_LEVEL, metaGzipLevel: META_GZIP_LEVEL, zlibConcurrency: ZLIB_CONCURRENCY, passBatchTiles: PASS_BATCH_TILES },
+    compression: { renderGzipLevel: RENDER_GZIP_LEVEL, metaGzipLevel: META_GZIP_LEVEL, zlibConcurrency: ZLIB_CONCURRENCY },
     validation: {
       structuralSampleEvery: AUDIT_EVERY,
       structuralChecked: context.cheapChecked,
@@ -1034,7 +1032,6 @@ if (process.argv[1]?.endsWith("build-tiles.ts")) {
       levels: LOD_LEVELS,
       detailedTargetBytes: DETAILED_TARGET_BYTES,
       detailedHardLimitBytes: DETAILED_HARD_LIMIT_BYTES,
-      passBatchTiles: PASS_BATCH_TILES,
       renderGzipLevel: RENDER_GZIP_LEVEL,
       metaGzipLevel: META_GZIP_LEVEL,
       zlibConcurrency: ZLIB_CONCURRENCY,

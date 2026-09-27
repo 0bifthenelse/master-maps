@@ -131,8 +131,11 @@ export async function loadRenderTile(tileId: string, signal?: AbortSignal): Prom
     return pending;
   }
   misses += 1;
-  const gen = currentGeneration;
-  const request = fetchRenderTile(tileId, signal).then((buffer) => getTileWorkerPool().decode(tileId, buffer, gen));
+  /* The generation is read when the decode is dispatched, not when the fetch
+     starts: a viewport change during the network wait must not mark the tile
+     stale before its bytes have even arrived, which cancelled most of a
+     department load. */
+  const request = fetchRenderTile(tileId, signal).then((buffer) => getTileWorkerPool().decode(tileId, buffer, currentGeneration));
   inFlight.set(tileId, request);
   try {
     const tile = await request;
