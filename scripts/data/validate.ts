@@ -370,6 +370,10 @@ function lodIssues(manifests: TileManifest[]): ValidationIssue[] {
   if (regional > 0 && overview >= regional) issues.push({ severity: "error", message: "LOD2 is not reduced from LOD1" });
   return issues;
 }
+function append(target: ValidationIssue[], source: ValidationIssue[]): void {
+  for (const issue of source) target.push(issue);
+}
+
 export async function validate(generatedDir?: string, scope?: ValidationScope): Promise<void> {
   const defaultRoot = dataRoot();
   const root = scope?.root ?? defaultRoot;
@@ -383,19 +387,19 @@ export async function validate(generatedDir?: string, scope?: ValidationScope): 
   const boundaryGeometry = await readBoundaryGeometry(rawDir, scope);
   const boundaryIndex = createBoundaryIndex(boundaryGeometry);
   const loaded = await loadTiles(outputDir);
-  issues.push(...loaded.issues);
+  append(issues, loaded.issues);
   const uniqueFeatures = [...new Map(loaded.features.map((feature) => [feature.stableId, feature])).values()];
   for (const feature of uniqueFeatures) {
-    issues.push(...coordinateIssues(feature, boundaryIndex));
-    issues.push(...sourceIssues(feature));
+    append(issues, coordinateIssues(feature, boundaryIndex));
+    append(issues, sourceIssues(feature));
   }
-  issues.push(...requiredSourceIssues(uniqueFeatures, scope));
-  issues.push(...fictiveFlagIssues(uniqueFeatures));
-  issues.push(...await validateSearch(root, loaded.manifests, uniqueFeatures));
-  issues.push(...lodIssues(loaded.manifests));
-  issues.push(...await renderTileIssues(outputDir, loaded.manifests));
+  append(issues, requiredSourceIssues(uniqueFeatures, scope));
+  append(issues, fictiveFlagIssues(uniqueFeatures));
+  append(issues, await validateSearch(root, loaded.manifests, uniqueFeatures));
+  append(issues, lodIssues(loaded.manifests));
+  append(issues, await renderTileIssues(outputDir, loaded.manifests));
   const exclusion = await readExclusionReport(path.join(root, "qa", "exclusion-report.json")).catch(() => null);
-  issues.push(...exclusionReportIssues(exclusion, root));
+  append(issues, exclusionReportIssues(exclusion, root));
   const report: { checkedAt: string; featureCount: number; tileCount: number; issues: ValidationIssue[]; reconciliation?: CoverageReconciliation } = { checkedAt: new Date().toISOString(), featureCount: uniqueFeatures.length, tileCount: loaded.manifests.length, issues };
   const coverage = await readCoverage(path.join(root, "manifests", "coverage.json"));
   if (coverage !== null) {
