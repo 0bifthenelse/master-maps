@@ -1,7 +1,6 @@
 "use client";
 
-import { useEffect, useLayoutEffect, useMemo, useRef } from "react";
-import type { ReactNode } from "react";
+import { useEffect, useLayoutEffect, useMemo } from "react";
 import { useFrame } from "@react-three/fiber";
 import type { ThreeEvent } from "@react-three/fiber";
 import type { BufferGeometry, Material } from "three";
@@ -11,9 +10,8 @@ import {
   buildingMat,
   landuseMat,
   boundaryLineMat,
-  poiMat,
-  accentLineMat,
   getPaperColor,
+  materialForLayer,
 } from "@/lib/scene/materials";
 import { sceneMetrics, publishSceneDiagnostics } from "@/lib/scene/sceneMetrics";
 import type { Geometry, MapFeature } from "@/lib/data/schema";
@@ -23,16 +21,20 @@ import { buildRoads } from "@/lib/scene/buildRoads";
 import buildWater from "@/lib/scene/buildWater";
 import { buildLanduse } from "@/lib/scene/buildLanduse";
 import buildPois from "@/lib/scene/buildPois";
-import {
-  getTileCacheEntry,
-  hasPendingTileGpuDisposals,
-  pickStableId,
-  type TileCacheEntry,
-  releasePendingTileGpuDisposals,
-  type TileLayerEntry,
-} from "@/lib/render/tileGpuCache";
+import { getTileCacheEntry, markFrameCommitted, syncMountedTiles } from "@/lib/render/tileGpuCache";
 import { ORDERED_RENDER_LAYER_IDS } from "@/lib/render/sceneFromDecoded";
 import type { RenderLayerId } from "@/lib/render/codec";
+import {
+  buildBatches,
+  hasPosition,
+  planTileObjects,
+  resolveMergedIndexPick,
+  resolveMergedPointPick,
+  type MergedIndexPick,
+  type MergedPointPick,
+  type MountedBatch,
+  type TileLayerSource,
+} from "@/components/map/sceneObjectPlan";
 import LabelLayer from "@/components/map/LabelLayer";
 
 type AreaGeometry = Extract<Geometry, { type: "Polygon" | "MultiPolygon" }>;
@@ -60,30 +62,25 @@ export interface CitySceneProps {
   onContextMenu?: (tileId: string, stableId: string, clientX: number, clientY: number) => void;
 }
 
-interface LayerStyle {
-  material: Material;
-  renderOrder: number;
-  object: "mesh" | "lineSegments";
-}
-
-const LAYER_STYLES: Readonly<Record<RenderLayerId, LayerStyle>> = {
-  habitat: { material: landuseMat, renderOrder: 0, object: "mesh" },
-  landuse: { material: landuseMat, renderOrder: 0, object: "mesh" },
-  water_surface: { material: waterMat, renderOrder: 1, object: "mesh" },
-  water_line: { material: waterMat, renderOrder: 2, object: "mesh" },
-  transport_area: { material: landuseMat, renderOrder: 1, object: "mesh" },
-  transport_line: { material: accentLineMat, renderOrder: 3, object: "lineSegments" },
-  structure_line: { material: accentLineMat, renderOrder: 4, object: "lineSegments" },
-  structure_area: { material: buildingMat, renderOrder: 5, object: "mesh" },
-  road_tunnel: { material: roadMat, renderOrder: 6, object: "mesh" },
-  road_normal: { material: roadMat, renderOrder: 7, object: "mesh" },
-  road_bridge: { material: roadMat, renderOrder: 8, object: "mesh" },
-  buildings: { material: buildingMat, renderOrder: 9, object: "mesh" },
-  structures_point: { material: poiMat, renderOrder: 10, object: "mesh" },
-  poi: { material: poiMat, renderOrder: 11, object: "mesh" },
-  address: { material: poiMat, renderOrder: 12, object: "mesh" },
-  place: { material: poiMat, renderOrder: 13, object: "mesh" },
-  boundary: { material: boundaryLineMat, renderOrder: 14, object: "lineSegments" },
+/** Painter order, the codec render order of the layer. */
+const LAYER_RENDER_ORDERS: Readonly<Record<RenderLayerId, number>> = {
+  habitat: 0,
+  landuse: 1,
+  water_surface: 2,
+  water_line: 3,
+  transport_area: 4,
+  transport_line: 5,
+  structure_line: 6,
+  structure_area: 7,
+  road_tunnel: 8,
+  road_normal: 9,
+  road_bridge: 10,
+  buildings: 11,
+  structures_point: 12,
+  poi: 13,
+  address: 14,
+  place: 15,
+  boundary: 16,
 };
 
 function visible(feature: SceneFeature, layers: Record<string, boolean>): boolean {
@@ -134,85 +131,39 @@ function disposeMaterial(material: Material | Material[]): void {
   }
 }
 
-function hasPosition(geometry: { getAttribute: (name: string) => { count: number } | undefined }): boolean {
-  return (geometry.getAttribute("position")?.count ?? 0) > 0;
-}
-
-function layerHidden(layerId: RenderLayerId, layers: Record<string, boolean>): boolean {
-  if (layerId === "buildings") return layers.buildings === false;
-  if (layerId === "road_tunnel" || layerId === "road_normal" || layerId === "road_bridge") return layers.roads === false;
-  if (layerId === "water_surface" || layerId === "water_line") return layers.water === false;
-  if (layerId === "landuse" || layerId === "habitat") return layers.landuse === false;
-  if (layerId === "transport_area" || layerId === "transport_line") return layers.transport === false;
-  if (layerId === "structure_area" || layerId === "structure_line" || layerId === "structures_point") return layers.structures === false;
-  if (layerId === "poi" || layerId === "address") return layers.pois === false;
-  if (layerId === "place") return layers.places === false;
-  if (layerId === "boundary") return layers.boundary === false;
-  return false;
-}
-
-interface TileLayerNodeProps {
-  layer: TileLayerEntry;
-  tileId: string;
+interface BatchNodeProps {
+  batch: MountedBatch;
   onPick: (tileId: string, stableId: string) => void;
   onContextMenu: (tileId: string, stableId: string, clientX: number, clientY: number) => void;
 }
 
-function TileLayerNode({ layer, tileId, onPick, onContextMenu }: TileLayerNodeProps) {
-  const style = LAYER_STYLES[layer.layerId as RenderLayerId];
-  if (style === undefined || !hasPosition(layer.geometry)) return null;
-  const resolveStableId = (faceIndex: number | null | undefined): string | undefined => {
-    if (typeof faceIndex !== "number") return undefined;
-    const entry = getTileCacheEntry(tileId);
-    if (entry === undefined) return undefined;
-    return pickStableId(entry, layer.layerId, faceIndex);
-  };
+function BatchNode({ batch, onPick, onContextMenu }: BatchNodeProps) {
+  const resolveHit = (hitIndex: number): MergedIndexPick | MergedPointPick | null => batch.pickIndexKind === "vertex"
+    ? resolveMergedPointPick(batch, hitIndex)
+    : resolveMergedIndexPick(batch, batch.geometry, hitIndex);
   const handleClick = (event: ThreeEvent<MouseEvent>): void => {
     event.stopPropagation();
-    const stableId = resolveStableId(event.faceIndex);
-    if (stableId !== undefined) onPick(tileId, stableId);
+    const hit = resolveHit(event.index ?? -1);
+    if (hit === null || hit.stableId === undefined) return;
+    onPick(hit.tileId, hit.stableId);
   };
   const handleContextMenu = (event: ThreeEvent<MouseEvent>): void => {
-    const stableId = resolveStableId(event.faceIndex);
-    if (stableId === undefined) return;
+    const hit = resolveHit(event.index ?? -1);
+    if (hit === null || hit.stableId === undefined) return;
     event.stopPropagation();
     const native = event.nativeEvent;
     native.preventDefault();
-    onContextMenu(tileId, stableId, native.clientX, native.clientY);
+    onContextMenu(hit.tileId, hit.stableId, native.clientX, native.clientY);
   };
-  if (style.object === "lineSegments") {
-    return <lineSegments geometry={layer.geometry} material={style.material} renderOrder={style.renderOrder} onClick={handleClick} onContextMenu={handleContextMenu} />;
+  const material = materialForLayer(batch.materialKey);
+  const renderOrder = LAYER_RENDER_ORDERS[batch.layerId];
+  if (batch.objectKind === "lineSegments") {
+    return <lineSegments geometry={batch.geometry} material={material} renderOrder={renderOrder} onClick={handleClick} onContextMenu={handleContextMenu} />;
   }
-  return <mesh geometry={layer.geometry} material={style.material} renderOrder={style.renderOrder} onClick={handleClick} onContextMenu={handleContextMenu} />;
-}
-
-interface TileGroupProps {
-  tileId: string;
-  entry: TileCacheEntry;
-  layers: Record<string, boolean>;
-  onPick: (tileId: string, stableId: string) => void;
-  onContextMenu: (tileId: string, stableId: string, clientX: number, clientY: number) => void;
-}
-
-function TileGroup({ tileId, entry, layers, onPick, onContextMenu }: TileGroupProps) {
-  const nodes: ReactNode[] = [];
-  for (const layerId of ORDERED_RENDER_LAYER_IDS) {
-
-    const layer = entry.layers.get(layerId);
-    if (layer === undefined) continue;
-    if (LAYER_STYLES[layerId] === undefined) continue;
-    if (layerHidden(layerId, layers)) continue;
-    nodes.push(
-      <TileLayerNode
-        key={`${tileId}:${layerId}`}
-        layer={layer}
-        tileId={tileId}
-        onPick={onPick}
-        onContextMenu={onContextMenu}
-      />,
-    );
+  if (batch.objectKind === "points") {
+    return <points geometry={batch.geometry} material={material} renderOrder={renderOrder} onClick={handleClick} onContextMenu={handleContextMenu} />;
   }
-  return <group>{nodes}</group>;
+  return <mesh geometry={batch.geometry} material={material} renderOrder={renderOrder} onClick={handleClick} onContextMenu={handleContextMenu} />;
 }
 
 interface DatasetBoundaryProps {
@@ -235,6 +186,7 @@ interface JsonSceneProps {
   features: SceneFeature[];
   layers: Record<string, boolean>;
 }
+
 function JsonScene({ features, layers }: JsonSceneProps) {
   const active = useMemo(() => features.filter((feature) => visible(feature, layers)), [features, layers]);
   const groups = useMemo(() => ({
@@ -274,59 +226,76 @@ function JsonScene({ features, layers }: JsonSceneProps) {
   );
 }
 
+function noopPick(): void {}
+
+function noopContextMenu(): void {}
+
+/* One merged-geometry cache for the single mounted CityScene. Module scope
+   keeps React out of it: the cache is read while planning during render and
+   written by the same pure builder, so no ref is touched during render. */
+const batchCache = new Map<string, MountedBatch>();
+
 export default function CityScene({ features, layers, tileIds, onPick, onContextMenu }: CitySceneProps) {
-  const tileGroups = useMemo(() => {
+  const sources = useMemo<TileLayerSource[] | null>(() => {
     if (tileIds === undefined) return null;
-    const resolved: { tileId: string; entry: TileCacheEntry }[] = [];
+    const resolved: TileLayerSource[] = [];
     for (const tileId of tileIds) {
       const entry = getTileCacheEntry(tileId);
       if (entry === undefined) continue;
-      resolved.push({ tileId, entry });
+      resolved.push({
+        tileId,
+        layers: new Map([...entry.layers].map(([layerId, layer]) => [layerId, {
+          geometry: layer.geometry,
+          rangeLength: layer.rangeLength,
+          featureCount: layer.featureCount,
+          isPointLayer: layer.isPointLayer,
+        }])),
+      });
     }
     return resolved;
   }, [tileIds]);
-  const tileGroupsRef = useRef(tileGroups);
-  const releaseFrameRef = useRef<number | null>(null);
+  const mountedTiles = useMemo(() => sources?.map((source) => source.tileId), [sources]);
+  const plans = useMemo(() => (sources === null ? [] : planTileObjects(sources, layers)), [sources, layers]);
+  const batches = useMemo(
+    () => (sources === null ? [] : buildBatches(sources, plans, batchCache)),
+    [sources, plans],
+  );
+  const boundaryFeatures = useMemo(
+    () => (sources === null ? features.filter(isBoundaryFeature) : []),
+    [features, sources],
+  );
+  const boundaryVisible = layers.boundary !== false;
 
   useLayoutEffect(() => {
-    tileGroupsRef.current = tileGroups;
-  }, [tileGroups]);
+    syncMountedTiles(mountedTiles ?? []);
+  }, [mountedTiles]);
 
   useFrame(() => {
-    if (releaseFrameRef.current !== null || !hasPendingTileGpuDisposals()) return;
-    releaseFrameRef.current = window.requestAnimationFrame(() => {
-      releaseFrameRef.current = null;
-      releasePendingTileGpuDisposals(tileGroupsRef.current);
-    });
+    markFrameCommitted();
   });
 
   useEffect(() => {
     return () => {
-      if (releaseFrameRef.current !== null) window.cancelAnimationFrame(releaseFrameRef.current);
-      releaseFrameRef.current = null;
-      releasePendingTileGpuDisposals();
+      for (const batch of batchCache.values()) batch.geometry.dispose();
+      batchCache.clear();
     };
   }, []);
 
-  const boundaryFeatures = useMemo(
-    () => (tileGroups === null ? features.filter(isBoundaryFeature) : []),
-    [features, tileGroups],
-  );
-  const boundaryVisible = layers.boundary !== false;
-
   useEffect(() => {
-    let drawCalls = 0;
-    if (tileGroups !== null) {
-      for (const { entry } of tileGroups) drawCalls += entry.layers.size;
+    let unbatchedDrawCalls = 0;
+    if (sources !== null) {
+      for (const source of sources) unbatchedDrawCalls += source.layers.size;
     }
     sceneMetrics.loadedFeatureCount = features.length;
-    sceneMetrics.drawCalls = drawCalls;
+    sceneMetrics.drawCalls = batches.length;
+    sceneMetrics.unbatchedDrawCalls = unbatchedDrawCalls;
+    sceneMetrics.batchCount = batches.length;
     publishSceneDiagnostics(true);
-  }, [features, tileGroups]);
+  }, [features, sources, batches]);
 
   const decodedTileIds = useMemo(
-    () => (tileGroups === null ? [] : tileGroups.map((entry) => entry.tileId)),
-    [tileGroups],
+    () => (sources === null ? [] : sources.map((source) => source.tileId)),
+    [sources],
   );
   const labelsVisible = layers.labels !== false;
 
@@ -334,20 +303,16 @@ export default function CityScene({ features, layers, tileIds, onPick, onContext
     <>
       <color attach="background" args={[getPaperColor()]} />
       <group>
-        {tileGroups === null ? (
+        {sources === null ? (
           <JsonScene features={features} layers={layers} />
-        ) : tileGroups.map(({ tileId, entry }) => (
-          <TileGroup key={tileId} tileId={tileId} entry={entry} layers={layers} onPick={onPick ?? noopPick} onContextMenu={onContextMenu ?? noopContextMenu} />
+        ) : batches.map((batch) => (
+          <BatchNode key={batch.key} batch={batch} onPick={onPick ?? noopPick} onContextMenu={onContextMenu ?? noopContextMenu} />
         ))}
-        {tileGroups === null && boundaryVisible ? <DatasetBoundary features={boundaryFeatures} /> : null}
+        {sources === null && boundaryVisible ? <DatasetBoundary features={boundaryFeatures} /> : null}
       </group>
-      {tileGroups !== null && labelsVisible ? <LabelLayer tileIds={decodedTileIds} layers={layers} /> : null}
+      {sources !== null && labelsVisible ? <LabelLayer tileIds={decodedTileIds} layers={layers} /> : null}
     </>
   );
 }
 
-function noopPick(): void {}
-
-function noopContextMenu(): void {}
-
-export type { BufferGeometry };
+export type { BufferGeometry, ORDERED_RENDER_LAYER_IDS };

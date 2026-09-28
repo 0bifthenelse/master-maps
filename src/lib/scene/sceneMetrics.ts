@@ -11,13 +11,24 @@ export interface SceneMetrics {
   waterCount: number;
   businessCount: number;
   landuseCount: number;
+  /** One draw call per mounted scene object, after per-layer batching. */
   drawCalls: number;
+  /** Draw calls the same tile set would cost mounted one object per (tile, layer). */
+  unbatchedDrawCalls: number;
+  /** Number of mounted merged batch objects. */
+  batchCount: number;
   /** Real camera target X, local metres — published from the mounted camera, not a requested focus. */
   cameraTargetX: number;
   /** Real camera target Z, local metres. */
   cameraTargetZ: number;
   /** Real orthographic camera zoom level. */
   cameraZoom: number;
+  /** True when world north projects above the camera target, from the live matrices. */
+  northScreenUp: boolean;
+  /** True when world east projects right of the camera target, from the live matrices. */
+  eastScreenRight: boolean;
+  /** Signed Y scale of the live projection matrix: negative is the north-up convention. */
+  projectionYScale: number;
   rendererError: string;
   cameraState: string;
 }
@@ -34,9 +45,14 @@ export const sceneMetrics: SceneMetrics = {
   waterCount: 0,
   landuseCount: 0,
   drawCalls: 0,
+  unbatchedDrawCalls: 0,
+  batchCount: 0,
   cameraTargetX: 0,
   cameraTargetZ: 0,
   cameraZoom: 0,
+  northScreenUp: false,
+  eastScreenRight: false,
+  projectionYScale: 1,
   cameraState: "unknown",
   rendererError: "none",
 };
@@ -62,9 +78,14 @@ export function publishSceneDiagnostics(force = false): void {
     "business-count": sceneMetrics.businessCount,
     "poi-count": sceneMetrics.poiCount,
     "draw-calls": sceneMetrics.drawCalls,
+    "unbatched-draw-calls": sceneMetrics.unbatchedDrawCalls,
+    "batch-count": sceneMetrics.batchCount,
     "camera-target-x": sceneMetrics.cameraTargetX,
     "camera-target-z": sceneMetrics.cameraTargetZ,
     "camera-zoom": sceneMetrics.cameraZoom,
+    "orientation-north-up": String(sceneMetrics.northScreenUp),
+    "orientation-east-right": String(sceneMetrics.eastScreenRight),
+    "projection-y-scale": sceneMetrics.projectionYScale,
     "camera-state": sceneMetrics.cameraState,
     "renderer-error": sceneMetrics.rendererError,
   };
