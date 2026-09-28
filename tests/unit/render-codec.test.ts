@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   RENDER_LAYER_IDS,
+  RENDER_LAYER_KINDS,
   alignRenderTileOffset,
   decodeRenderTile,
   encodeRenderTile,
@@ -202,5 +203,66 @@ describe("render tile codec", () => {
     expect(isRenderLayerId("nope")).toBe(false);
     expect(renderLayerOrder("habitat")).toBe(0);
     expect(renderLayerOrder("boundary")).toBe(16);
+  });
+});
+
+describe("render layer primitives", () => {
+  it("declares one primitive per layer id", () => {
+    expect(Object.keys(RENDER_LAYER_KINDS).sort()).toEqual([...RENDER_LAYER_IDS].sort());
+    expect(RENDER_LAYER_KINDS.boundary).toBe("lines");
+    /* Ribbons are a triangle strip, so these carry triangle indices even
+       though the scene mounts them as hairlines. */
+    expect(RENDER_LAYER_KINDS.transport_line).toBe("triangles");
+    expect(RENDER_LAYER_KINDS.structure_line).toBe("triangles");
+    expect(RENDER_LAYER_KINDS.water_line).toBe("triangles");
+    expect(RENDER_LAYER_KINDS.poi).toBe("points");
+    expect(RENDER_LAYER_KINDS.landuse).toBe("triangles");
+  });
+
+  it("encodes a segment list for a line layer and reads it back verbatim", () => {
+    const decoded = decodeRenderTile(encodeRenderTile({
+      ...sampleTile(),
+      layers: [{
+        id: "boundary",
+        positions: new Float32Array([0, 0.5, 0, 10, 0.5, 0, 10, 0.5, 10, 0, 0.5, 10]),
+        indices: new Uint32Array([0, 1, 1, 2, 2, 3]),
+        ranges: new Uint32Array([0, 6, 0]),
+      }],
+      meta: [metaEntry(0)],
+    }));
+    const layer = decoded.layers[0]!;
+    expect(layer.id).toBe("boundary");
+    expect(Array.from(renderLayerIndices(decoded.payload, layer))).toEqual([0, 1, 1, 2, 2, 3]);
+    expect(Array.from(renderLayerRanges(decoded.payload, layer))).toEqual([0, 6, 0]);
+  });
+
+  it("rejects an index slab that cannot express the layer primitive", () => {
+    const input = sampleTile();
+    const oddLines = { id: "boundary" as const, positions: new Float32Array([0, 0.5, 0, 1, 0.5, 0, 2, 0.5, 0]), indices: new Uint32Array([0, 1, 2]), ranges: new Uint32Array([0, 3, 0]) };
+    expect(() => encodeRenderTile({ ...input, layers: [oddLines] })).toThrow(/line indices, not a multiple of 2/);
+    const oddTriangles = { ...input.layers[0]!, indices: new Uint32Array([0, 1, 2, 0, 2]) };
+    expect(() => encodeRenderTile({ ...input, layers: [oddTriangles] })).toThrow(/triangle indices, not a multiple of 3/);
+    const indexedPoint = { id: "poi" as const, positions: new Float32Array([0, 2, 0, 1, 2, 1]), indices: new Uint32Array([0, 1]), ranges: new Uint32Array([0, 2, 0]) };
+    expect(() => encodeRenderTile({ ...input, layers: [indexedPoint] })).toThrow(/point layer and carries 2 indices/);
+  });
+
+  it("still rejects a line layer whose featureRanges do not cover its segments", () => {
+    const input = sampleTile();
+    const partial = { id: "boundary" as const, positions: new Float32Array([0, 0.5, 0, 1, 0.5, 0, 2, 0.5, 0]), indices: new Uint32Array([0, 1, 1, 2]), ranges: new Uint32Array([0, 2, 0]) };
+    expect(() => encodeRenderTile({ ...input, layers: [partial] })).toThrow(/featureRanges cover 2 of 4 indices/);
+  });
+
+  it("keeps a ribbon layer on triangle groups and rejects a bare pair list", () => {
+    const input = sampleTile();
+    const ribbon = {
+      id: "water_line" as const,
+      positions: new Float32Array([0, 0, -1, 0, 0, 1, 10, 0, 1, 10, 0, -1]),
+      indices: new Uint32Array([0, 1, 2, 1, 3, 2]),
+      ranges: new Uint32Array([0, 6, 0]),
+    };
+    const decoded = decodeRenderTile(encodeRenderTile({ ...input, layers: [ribbon], meta: [metaEntry(0)] }));
+    expect(Array.from(renderLayerIndices(decoded.payload, decoded.layers[0]!))).toEqual([0, 1, 2, 1, 3, 2]);
+    const pairs = { ...ribbon, indices: new Uint32Array([0, 1, 1, 2]) };
+    expect(() => encodeRenderTile({ ...input, layers: [pairs] })).toThrow(/triangle indices, not a multiple of 3/);
   });
 });

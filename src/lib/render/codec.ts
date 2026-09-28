@@ -24,6 +24,29 @@ export const RENDER_LAYER_IDS = [
 
 export type RenderLayerId = (typeof RENDER_LAYER_IDS)[number];
 
+/** Primitive a layer's index slab encodes: a triangle list, a segment list or bare points. */
+export type RenderLayerPrimitive = "triangles" | "lines" | "points";
+
+export const RENDER_LAYER_KINDS: Readonly<Record<RenderLayerId, RenderLayerPrimitive>> = {
+  habitat: "triangles",
+  landuse: "triangles",
+  water_surface: "triangles",
+  water_line: "triangles",
+  transport_area: "triangles",
+  transport_line: "triangles",
+  structure_line: "triangles",
+  structure_area: "triangles",
+  road_tunnel: "triangles",
+  road_normal: "triangles",
+  road_bridge: "triangles",
+  buildings: "triangles",
+  structures_point: "points",
+  poi: "points",
+  address: "points",
+  place: "points",
+  boundary: "lines",
+};
+
 export type RenderBounds = readonly [number, number, number, number];
 
 export interface FeatureMeta {
@@ -220,7 +243,7 @@ function planLayers(layers: RenderLayerInput[], metaLength: number): PlannedLaye
 function planLayer(layer: RenderLayerInput, metaLength: number): PlannedLayer {
   const { id, positions, indices, ranges } = layer;
   if (positions.length % 3 !== 0) throw new Error(`render tile: layer ${id} has ${positions.length} position values, not a multiple of 3`);
-  if (indices.length % 3 !== 0) throw new Error(`render tile: layer ${id} has ${indices.length} indices, not a multiple of 3`);
+  requirePrimitiveIndexCount(id, indices.length);
   if (ranges.length % 3 !== 0) throw new Error(`render tile: layer ${id} has ${ranges.length} featureRange values, not a multiple of 3`);
   const vertexCount = positions.length / 3;
   for (let index = 0; index < indices.length; index += 1) {
@@ -239,6 +262,13 @@ function planLayer(layer: RenderLayerInput, metaLength: number): PlannedLayer {
   }
   if (covered !== indices.length) throw new Error(`render tile: layer ${id} featureRanges cover ${covered} of ${indices.length} indices`);
   return { id, positions, indices, ranges, vertexCount, indexCount: indices.length, featureCount, positionOffset: 0, indexOffset: 0, rangeOffset: 0 };
+}
+
+function requirePrimitiveIndexCount(id: RenderLayerId, indexCount: number): void {
+  const kind = RENDER_LAYER_KINDS[id];
+  if (kind === "triangles" && indexCount % 3 !== 0) throw new Error(`render tile: layer ${id} has ${indexCount} triangle indices, not a multiple of 3`);
+  if (kind === "lines" && indexCount % 2 !== 0) throw new Error(`render tile: layer ${id} has ${indexCount} line indices, not a multiple of 2`);
+  if (kind === "points" && indexCount !== 0) throw new Error(`render tile: layer ${id} is a point layer and carries ${indexCount} indices`);
 }
 
 function planPayload(layers: PlannedLayer[], metaBytes: number): { plan: PlannedLayer[]; payloadBytes: number } {

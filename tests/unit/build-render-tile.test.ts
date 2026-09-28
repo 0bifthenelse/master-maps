@@ -1,9 +1,10 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
-import { MapFeatureSchema, type MapFeature } from "@/lib/data/schema";
+import { MapFeatureSchema, type Geometry, type MapFeature } from "@/lib/data/schema";
 import { decodeRenderTile, encodeRenderTile, renderLayerIndices, renderLayerPositions, renderLayerRanges, type DecodedRenderLayer, type DecodedRenderTile, type RenderLayerId } from "@/lib/render/codec";
 import { DEFAULT_BUILDING_HEIGHT_METRES, buildRenderTile, landuseLayerFor, resolveRoadWidth, roadLayerFor } from "@/lib/render/buildRenderTile";
+import { layerObjectKind } from "@/lib/render/sceneFromDecoded";
 
 const BOUNDS: [number, number, number, number] = [0, 0, 2048, 2048];
 const TILE_ID = "l0_0_0";
@@ -275,5 +276,118 @@ describe("buildRenderTile", () => {
     }
     expect(buildingHeights.size).toBeGreaterThan(1);
     expect(encoded.byteLength).toBeGreaterThan(0);
+  });
+});
+
+type Point = readonly [number, number];
+
+function boundaryFeature(geometry: Geometry): MapFeature {
+  return feature({ kind: "boundary", stableId: "boundary/32", territoryCode: "32", geometry });
+}
+
+function rings(geometry: Geometry): readonly (readonly Point[])[] {
+  if (geometry.type === "Polygon") return geometry.coordinates;
+  if (geometry.type === "MultiPolygon") return geometry.coordinates.flatMap((polygon) => polygon);
+  throw new Error("expected an area geometry");
+}
+
+function perimeterEdges(geometry: Geometry): Set<string> {
+  const edges = new Set<string>();
+  for (const closed of rings(geometry)) {
+    const ring = closed[0]![0] === closed[closed.length - 1]![0] && closed[0]![1] === closed[closed.length - 1]![1] ? closed.slice(0, -1) : closed;
+    for (let index = 0; index < ring.length; index += 1) {
+      const [ax, az] = ring[index]!;
+      const [bx, bz] = ring[(index + 1) % ring.length]!;
+      edges.add(ax < bx || (ax === bx && az <= bz) ? `${ax},${az}|${bx},${bz}` : `${bx},${bz}|${ax},${az}`);
+    }
+  }
+  return edges;
+}
+
+function emittedEdges(tile: DecodedRenderTile): Set<string> {
+  const found = layer(tile, "boundary")!;
+  const indices = renderLayerIndices(tile.payload, found);
+  const positions = renderLayerPositions(tile.payload, found);
+  const edges = new Set<string>();
+  for (let index = 0; index < indices.length; index += 2) {
+    const a = indices[index]!;
+    const b = indices[index + 1]!;
+    const ax = positions[a * 3]!;
+    const az = positions[a * 3 + 2]!;
+    const bx = positions[b * 3]!;
+    const bz = positions[b * 3 + 2]!;
+    edges.add(ax < bx || (ax === bx && az <= bz) ? `${ax},${az}|${bx},${bz}` : `${bx},${bz}|${ax},${az}`);
+  }
+  return edges;
+}
+
+describe("boundary layer geometry", () => {
+  it("emits exactly the ring perimeter of a Polygon, with no diagonal", () => {
+    const geometry: Geometry = {
+      type: "Polygon",
+      coordinates: [
+        [[0, 0], [40, 0], [40, 25], [0, 25], [0, 0]],
+        [[10, 5], [10, 20], [30, 20], [30, 5], [10, 5]],
+      ],
+    };
+    const tile = build([boundaryFeature(geometry)]);
+    const expected = perimeterEdges(geometry);
+    const emitted = emittedEdges(tile);
+    expect(emitted).toEqual(expected);
+    const positions = renderLayerPositions(tile.payload, layer(tile, "boundary")!);
+    const heights = new Set(Array.from({ length: positions.length / 3 }, (_unused, index) => positions[index * 3 + 1]!));
+    expect([...heights]).toEqual([0.5]);
+  });
+
+  it("keeps every polygon of a MultiPolygon separate and never joins two of them", () => {
+    const geometry: Geometry = {
+      type: "MultiPolygon",
+      coordinates: [
+        [[[0, 0], [30, 0], [30, 30], [0, 30], [0, 0]]],
+        [[[100, 100], [140, 100], [140, 160], [100, 160], [100, 100]], [[110, 110], [110, 150], [130, 150], [130, 110], [110, 110]]],
+      ],
+    };
+    const tile = build([boundaryFeature(geometry)]);
+    const emitted = emittedEdges(tile);
+    expect(emitted).toEqual(perimeterEdges(geometry));
+    /* Every emitted edge must have both endpoints in the same polygon, so no
+       chord can bridge the two parts of a MultiPolygon. */
+    const rings = geometry.coordinates.map((polygon) => new Set(polygon.flatMap((ring) => ring.map(([x, z]) => `${x},${z}`))));
+    for (const edge of emitted) {
+      const [from, to] = edge.split("|") as [string, string];
+      expect(rings.filter((ring) => ring.has(from) && ring.has(to)), `edge ${edge} bridges two polygons`).toHaveLength(1);
+    }
+    expect(layerObjectKind("boundary")).toBe("lineSegments");
+  });
+
+  it("emits one closing segment for a minimal triangle and never triangulates it", () => {
+    /* Three vertices yield three segments, four indices, where the old
+       triangulation produced six triangle indices and long chords. */
+    const geometry: Geometry = { type: "Polygon", coordinates: [[[0, 0], [30, 0], [15, 25], [0, 0]]] };
+    const tile = build([boundaryFeature(geometry)]);
+    expect(layer(tile, "boundary")!.indexLength).toBe(6);
+    expect([...emittedEdges(tile)].sort()).toEqual([...perimeterEdges(geometry)].sort());
+    expect(emittedEdges(tile).size).toBe(3);
+  });
+
+  it("keeps the boundary index slab even, contiguous and valid for picking", () => {
+    const tile = build([
+      boundaryFeature({ type: "Polygon", coordinates: [[[0, 0], [50, 0], [50, 50], [0, 50], [0, 0]]] }),
+      boundaryFeature({ type: "Polygon", coordinates: [[[80, 80], [90, 80], [90, 90], [80, 80]]] }),
+    ]);
+    const found = layer(tile, "boundary")!;
+    const indices = renderLayerIndices(tile.payload, found);
+    const ranges = renderLayerRanges(tile.payload, found);
+    expect(indices.length % 2).toBe(0);
+    expect(found.rangeLength / 3).toBe(2);
+    let covered = 0;
+    for (let range = 0; range < found.rangeLength / 3; range += 1) {
+      expect(ranges[range * 3]).toBe(covered);
+      expect(ranges[range * 3 + 1]! % 2).toBe(0);
+      expect(ranges[range * 3 + 2]! < tile.meta.length).toBe(true);
+      covered += ranges[range * 3 + 1]!;
+    }
+    expect(covered).toBe(indices.length);
+    for (const index of indices) expect(index).toBeLessThan(found.positionLength / 3);
   });
 });

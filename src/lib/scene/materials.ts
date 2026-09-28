@@ -1,14 +1,16 @@
 /**
- * @file Shared Three.js materials for the flat Gers map scene.
- *
  * COLOUR SYSTEM. Exactly three roots exist in this project:
  *   --color-accent: #ff7d27   --color-ink: #000000   --color-paper: #ffffff
  * Every other colour below is computed from those roots by mixing toward a
  * root (sRGB interpolation) and layering alpha over the paper background,
  * so no unrelated brand hue can enter the scene. Mix factors and the WCAG
  * contrast each resulting tint reaches against paper and ink are recorded
- * next to each entry; they are the checked values quoted in
- * reports/wave3/W3-LAYERS.md.
+ * next to each entry.
+ *
+ * ACCENT DISCIPLINE. Full-strength ROOT_ACCENT marks only what the map means
+ * to emphasise: the department boundary, poi markers, place labels and the
+ * interaction highlight. Every other family is a neutral mix of ink toward
+ * paper, or, for the settlement wash, a barely warm accent tint at t=0.94.
  *
  * Material selection. One material per render-layer family, keyed by the
  * codec layer ids (RENDER_LAYER_IDS) so a tile layer always resolves to
@@ -107,37 +109,39 @@ interface FamilyStyle {
 type RootKey = "accent" | "ink" | "paper";
 
 const FAMILIES: Readonly<Record<MaterialFamily, FamilyStyle>> = {
-  // Habitat is the lightest accent wash: a settlement is a warm tint, never a
-  // blob. contrast(paper) 1.14, contrast(ink) 18.45.
-  habitat: { from: "accent", to: "paper", t: 0.86, opacity: 0.16, polygonOffset: -1, options: { depthWrite: false, side: 2 } },
-  // Landuse reads one step denser than habitat so forests and farmland stay
-  // legible over it. contrast(paper) 1.14, contrast(ink) 18.45.
-  landuse: { from: "accent", to: "paper", t: 0.84, opacity: 0.26, polygonOffset: -1, options: { depthWrite: false, side: 2 } },
+  // Habitat is the faintest wash in the map: a settlement is a barely warm
+  // tint on paper, never a coloured blob. contrast(paper) 1.06.
+  habitat: { from: "accent", to: "paper", t: 0.94, opacity: 0.16, polygonOffset: -1, options: { depthWrite: false, side: 2 } },
+  // Landuse is the neutral land-cover wash that carries about 86 percent of
+  // the dataset's landuse features, so it reads grey rather than orange.
+  // contrast(paper) 17.40, contrast(ink) 1.21.
+  landuse: { from: "ink", to: "paper", t: 0.10, opacity: 0.26, polygonOffset: -1, options: { depthWrite: false, side: 2 } },
   // Aerodrome, runway and parking aprons: a neutral, unmistakably non-organic
-  // grey. contrast(paper) 17.4, contrast(ink) 1.21.
+  // grey. contrast(paper) 17.40, contrast(ink) 1.21.
   aerial: { from: "ink", to: "paper", t: 0.10, opacity: 1, polygonOffset: -3, options: { depthWrite: false, side: 2 } },
-  // Water surface: near-ink slate at low alpha; the map stays monochrome in
-  // the body and the accent only ever marks points of interest.
+  // Water surface: near-ink slate at low alpha. contrast(paper) 11.73, contrast(ink) 1.79.
   water: { from: "ink", to: "paper", t: 0.22, opacity: 0.55, options: { depthWrite: false, side: 2 } },
-  // Rail: darker than any road, and dashed-looking through the hairline
-  // treatment, so rail never reads as a road at any zoom.
+  // Rail: darker than any road, so rail never reads as a road at any zoom.
+  // contrast(paper) 8.45, contrast(ink) 2.48.
   rail: { from: "ink", to: "paper", t: 0.30, opacity: 0.95, polygonOffset: -2, options: { depthWrite: false, side: 2 } },
   // Roads: the darkest ink at full strength for the carriageway.
+  // contrast(paper) 19.17, contrast(ink) 1.10.
   road: { from: "ink", to: "paper", t: 0.06, opacity: 0.94, polygonOffset: -4, options: { depthWrite: false, side: 2 } },
-  // Structures: accent-derived, denser than landuse so a barrage or a
-  // retaining wall stays visible against a forest wash.
-  structure: { from: "accent", to: "ink", t: 0.42, opacity: 0.6, polygonOffset: -2, options: { depthWrite: false, side: 2 } },
-  // Buildings: the existing approach, kept. Roof faces are the accent-tinted
-  // faces produced by the render builder's y-height split; the wall material
-  // stays ink so the mass reads solid. contrast(paper) 1.88, contrast(ink) 11.18.
+  // Structures: the same neutral grey as the land cover, denser than it, so a
+  // barrage or a retaining wall stays visible against a forest wash.
+  // contrast(paper) 8.45, contrast(ink) 2.48.
+  structure: { from: "ink", to: "paper", t: 0.30, opacity: 0.6, polygonOffset: -2, options: { depthWrite: false, side: 2 } },
+  // Buildings: ink fill with accent-tinted roof faces from the height split.
+  // contrast(paper) 10.05, contrast(ink) 2.09.
   building: { from: "ink", to: "paper", t: 0.26, opacity: 0.5, polygonOffset: -5, options: { depthWrite: false, side: 2 } },
-  // Water hairline (streams, ditches).
+  // Water hairline (streams, ditches). contrast(paper) 7.23, contrast(ink) 2.91.
   waterLine: { from: "ink", to: "paper", t: 0.34, opacity: 0.9, options: { depthWrite: false, side: 2 } },
-  // Rail hairline over a wider corridor.
+  // Rail hairline over a wider corridor. contrast(paper) 10.86, contrast(ink) 1.93.
   railLine: { from: "ink", to: "paper", t: 0.24, opacity: 1, options: { depthWrite: false, side: 2 } },
-  // Structure hairline (murs, ecluses, alignments).
+  // Structure hairline (murs, ecluses, alignments). contrast(paper) 5.33, contrast(ink) 3.94.
   structureLine: { from: "ink", to: "paper", t: 0.42, opacity: 0.85, options: { depthWrite: false, side: 2 } },
-  // Boundary: pure accent, the only full-saturation element besides markers.
+  // Boundary: pure accent, one of the four full-strength accent elements.
+  // contrast(paper) 2.56, contrast(ink) 8.21.
   boundary: { from: "accent", to: "paper", t: 0, opacity: 1, options: { depthWrite: false, side: 2 } },
   // Marker families. Point sizes are screen-space pixels, not metres.
   poi: { from: "accent", to: "paper", t: 0, opacity: 1, options: { depthWrite: false, side: 1 } },

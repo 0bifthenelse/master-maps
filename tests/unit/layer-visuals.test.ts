@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { Color, MeshBasicMaterial, PointsMaterial, LineBasicMaterial } from "three";
 import {
   RENDER_LAYER_IDS,
+  RENDER_LAYER_KINDS,
   decodeRenderTile,
   encodeRenderTile,
   type FeatureMeta,
@@ -23,6 +24,7 @@ import {
   getResidentDecodedTiles,
   getTileGpuCacheStats,
   hasTileCacheEntry,
+  markFrameCommitted,
   pickStableId,
   putDecodedTile,
   resetTileGpuCache,
@@ -50,13 +52,12 @@ const POINT_LAYERS: ReadonlySet<RenderLayerId> = new Set([
   "address",
   "place",
 ]);
-/* Layers mounted as hairlines. */
-const LINE_LAYERS: ReadonlySet<RenderLayerId> = new Set([
+const RIBBON_LAYERS: ReadonlySet<RenderLayerId> = new Set([
   "water_line",
   "transport_line",
   "structure_line",
-  "boundary",
 ]);
+const LINE_LAYERS: ReadonlySet<RenderLayerId> = new Set([...RIBBON_LAYERS, "boundary"]);
 
 function square(positions: number[], x: number, z: number, size: number): number {
   const base = positions.length / 3;
@@ -73,7 +74,7 @@ function ribbon(positions: number[], indices: number[], x: number, z: number): n
   const base = positions.length / 3;
   positions.push(x, 0, z, x, 0, z + 4, x + 60, 0, z + 4, x + 60, 0, z);
   const indexStart = indices.length;
-  indices.push(base, base + 1, base + 2, base, base + 2, base + 3);
+  indices.push(base, base + 1, base + 2, base + 1, base + 3, base + 2);
   return indexStart;
 }
 
@@ -145,6 +146,15 @@ function contrastRatio(a: string, b: string): number {
   const lighter = Math.max(first, second);
   const darker = Math.min(first, second);
   return (lighter + 0.05) / (darker + 0.05);
+}
+
+function luminanceDistance(hex: string, target: string): number {
+  return Math.abs(relativeLuminance(hex) - relativeLuminance(target));
+}
+
+function spread(hex: string): number {
+  const values = [1, 3, 5].map((index) => parseInt(hex.slice(index, index + 2), 16));
+  return Math.max(...values) - Math.min(...values);
 }
 
 afterEach(() => {
@@ -221,11 +231,43 @@ describe("render layer materials", () => {
   });
 });
 
+describe("accent discipline", () => {
+  it("keeps ordinary land cover out of the accent hue and near the neutral axis", () => {
+    /* Landuse is a neutral ink wash and habitat a barely warm paper tint, so
+       neither may sit closer to the accent than to its own neutral anchor. */
+    const landuse = `#${(materialForLayer("landuse") as MeshBasicMaterial).color.getHexString()}`;
+    /* landuse sits in luminance far from the accent and near ink, so the bulk
+       land-cover fill can never read as brand orange. */
+    expect(luminanceDistance(landuse, ROOT_ACCENT)).toBeGreaterThan(0.3);
+    expect(luminanceDistance(landuse, ROOT_INK)).toBeLessThan(0.05);
+    const habitat = `#${(materialForLayer("habitat") as MeshBasicMaterial).color.getHexString()}`;
+    expect(luminanceDistance(habitat, ROOT_PAPER)).toBeLessThan(0.06);
+    /* Landuse is neutral grey: it must carry the accent hue's chroma only in
+       the faint habitat wash, never in the bulk land-cover fill. */
+    expect(spread(landuse)).toBeLessThan(spread(`#${new Color(ROOT_ACCENT).getHexString()}`) / 4);
+  });
+
+  it("reserves full-strength accent for the boundary and poi markers", () => {
+    const accentLayers: readonly string[] = ["boundary", "poi"];
+    for (const id of RENDER_LAYER_IDS) {
+      const hex = `#${(materialForLayer(id) as MeshBasicMaterial).color.getHexString()}`;
+      if (accentLayers.includes(id)) expect(hex, `${id} is a full-strength accent layer`).toBe(ROOT_ACCENT);
+      else expect(hex, `${id} must not be full-strength accent`).not.toBe(ROOT_ACCENT);
+    }
+  });
+
+  it("hands out one shared material instance per layer id", () => {
+    for (const id of RENDER_LAYER_IDS) expect(materialForLayer(id)).toBe(materialForLayer(id));
+  });
+});
+
+
 describe("decoded layer mount strategy", () => {
   it("assigns an object kind to every layer id", () => {
     expect(Object.keys(LAYER_OBJECT_KINDS).sort()).toEqual([...RENDER_LAYER_IDS].sort());
     for (const id of RENDER_LAYER_IDS) {
-      expect(layerObjectKind(id)).toBe(POINT_LAYERS.has(id) ? "points" : LINE_LAYERS.has(id) ? "lineSegments" : "mesh");
+      expect(layerObjectKind(id)).toBe(POINT_LAYERS.has(id) ? "points" : id === "boundary" ? "lineSegments" : "mesh");
+      expect(RENDER_LAYER_KINDS[id]).toBe(POINT_LAYERS.has(id) ? "points" : id === "boundary" ? "lines" : "triangles");
     }
   });
 
@@ -318,6 +360,8 @@ describe("multi-layer tile picking", () => {
     let disposed = 0;
     for (const geometry of geometries) geometry.addEventListener("dispose", () => { disposed += 1; });
     expect(evictTile(TILE_ID)).toBe(true);
+    expect(disposed).toBe(0);
+    markFrameCommitted();
     expect(disposed).toBe(geometries.length);
     expect(getResidentDecodedTile(TILE_ID)).toBeUndefined();
     expect(hasTileCacheEntry(TILE_ID)).toBe(false);

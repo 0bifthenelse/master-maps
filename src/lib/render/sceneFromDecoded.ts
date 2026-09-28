@@ -17,6 +17,8 @@ import {
   type DecodedRenderTile,
   type RenderLayerId,
   renderLayerOrder,
+  RENDER_LAYER_KINDS,
+  type RenderLayerPrimitive,
 } from './codec';
 
 export interface DecodedLayerView {
@@ -33,33 +35,16 @@ export interface DecodedLayerView {
 /** How a layer's geometry must be mounted so it is both visible and pickable. */
 export type LayerObjectKind = "mesh" | "lineSegments" | "points";
 
-/**
- * Mount strategy per render layer. The codec emits ribbons and polygons for
- * every surface layer, so all of them mount as a mesh; water_line,
- * transport_line, structure_line and boundary are hairlines by design and
- * mount as lineSegments; poi, address, place and structures_point carry one
- * vertex per feature with a zero-length range, so they mount as Points and
- * are picked by vertex index rather than by face index.
- */
-export const LAYER_OBJECT_KINDS: Readonly<Record<RenderLayerId, LayerObjectKind>> = {
-  habitat: "mesh",
-  landuse: "mesh",
-  water_surface: "mesh",
-  water_line: "lineSegments",
-  transport_area: "mesh",
-  transport_line: "lineSegments",
-  structure_line: "lineSegments",
-  structure_area: "mesh",
-  road_tunnel: "mesh",
-  road_normal: "mesh",
-  road_bridge: "mesh",
-  buildings: "mesh",
-  structures_point: "points",
-  poi: "points",
-  address: "points",
-  place: "points",
-  boundary: "lineSegments",
+const OBJECT_KIND: Readonly<Record<RenderLayerPrimitive, LayerObjectKind>> = {
+  triangles: "mesh",
+  lines: "lineSegments",
+  points: "points",
 };
+
+/** Mount strategy per render layer, derived from the codec primitive map. */
+export const LAYER_OBJECT_KINDS: Readonly<Record<RenderLayerId, LayerObjectKind>> = Object.fromEntries(
+  RENDER_LAYER_IDS.map((id) => [id, OBJECT_KIND[RENDER_LAYER_KINDS[id]]]),
+) as Record<RenderLayerId, LayerObjectKind>;
 
 export interface DecodedTileView {
   tileId: string;

@@ -38,6 +38,7 @@ const EXTRA_META_KEYS: Readonly<Record<string, readonly string[]>> = {
 const BRIDGE_LIFT_METRES = 0.6;
 const TUNNEL_DEPTH_METRES = -1;
 const POINT_LAYER_Y = 2;
+const BOUNDARY_Y = 0.5;
 const STRUCTURE_DEFAULT_WIDTH_METRES = 4;
 const STRUCTURE_MAX_WIDTH_METRES = 40;
 
@@ -113,7 +114,7 @@ export function buildRenderTile(features: MapFeature[], options: BuildRenderTile
       emitFeaturePoint(meshFor("place"), feature, metaIndexFor(feature, extra));
       continue;
     }
-    emitPolygons(meshFor("boundary"), localGeometry(feature), metaIndexFor(feature, extra));
+    emitSegments(meshFor("boundary"), localGeometry(feature), metaIndexFor(feature, extra));
   }
   return {
     tileId: options.tileId,
@@ -252,6 +253,36 @@ function emitPolygon(mesh: MeshBuilder, polygon: PolygonCoordinates, metaIndex: 
     emitted += 3;
   }
   mesh.ranges.push(indexOffset, mesh.indices.length - indexOffset, metaIndex);
+}
+
+function emitSegments(mesh: MeshBuilder, geometry: Geometry | undefined, metaIndex: number): void {
+  const positionStart = mesh.positions.length;
+  for (const polygon of geometryPolygons(geometry)) {
+    for (const ring of polygon) {
+      const vertices = usableRing(ring);
+      for (let index = 0; index < vertices.length; index += 1) {
+        const [x, z] = vertices[index]!;
+        const [nextX, nextZ] = vertices[(index + 1) % vertices.length]!;
+        mesh.positions.push(x, BOUNDARY_Y, z, nextX, BOUNDARY_Y, nextZ);
+      }
+    }
+  }
+  const segments = (mesh.positions.length - positionStart) / 6;
+  if (segments === 0) return;
+  const indexStart = mesh.indices.length;
+  for (let segment = 0; segment < segments; segment += 1) {
+    const vertex = positionStart / 3 + segment * 2;
+    mesh.indices.push(vertex, vertex + 1);
+  }
+  mesh.ranges.push(indexStart, mesh.indices.length - indexStart, metaIndex);
+}
+
+function usableRing(ring: RingCoordinates): PointCoordinates[] {
+  const points = ring.filter(([x, z]) => Number.isFinite(x) && Number.isFinite(z));
+  if (points.length < 3) return [];
+  const first = points[0]!;
+  const last = points[points.length - 1]!;
+  return (first[0] === last[0] && first[1] === last[1]) ? points.slice(0, -1) : points;
 }
 
 function extrudePolygon(mesh: MeshBuilder, polygon: PolygonCoordinates, height: number, metaIndex: number): void {
