@@ -17,7 +17,10 @@ import {
   panStepFor,
   worldPanFor,
   zoomDirectionFor,
-  supplementaryWheelScale,
+  WHEEL_LINE_HEIGHT,
+  WHEEL_NOTCH_PIXELS,
+  WHEEL_ZOOM_BASE,
+  wheelScaleFor,
   writeCursorMapPoint,
   KEY_PANS,
 } from "@/components/map/mapNavigation";
@@ -150,25 +153,38 @@ describe("zoom range", () => {
     expect(clampZoom(1 * ZOOM_KEY_FACTOR, 1, 4000)).toBeCloseTo(1.25, 9);
   });
 });
-describe("supplementary wheel scale", () => {
-  it("normalizes one line or page notch to one wheel ratio", () => {
-    const scale = Math.pow(0.95, WHEEL_ZOOM_SPEED);
-    expect(supplementaryWheelScale(-3, 1, WHEEL_ZOOM_SPEED)).toBeCloseTo(scale, 12);
-    expect(supplementaryWheelScale(-1, 2, WHEEL_ZOOM_SPEED)).toBeCloseTo(scale, 12);
-    expect(supplementaryWheelScale(3, 1, WHEEL_ZOOM_SPEED)).toBeCloseTo(1 / scale, 12);
-    expect(supplementaryWheelScale(1, 2, WHEEL_ZOOM_SPEED)).toBeCloseTo(1 / scale, 12);
+describe("wheel scale", () => {
+  it("turns one line or page notch into one wheel ratio", () => {
+    const scale = Math.pow(WHEEL_ZOOM_BASE, WHEEL_ZOOM_SPEED);
+    expect(wheelScaleFor(-3, 1, WHEEL_ZOOM_SPEED)).toBeCloseTo(scale, 12);
+    expect(wheelScaleFor(-1, 2, WHEEL_ZOOM_SPEED)).toBeCloseTo(scale, 12);
+    expect(wheelScaleFor(3, 1, WHEEL_ZOOM_SPEED)).toBeCloseTo(1 / scale, 12);
+    expect(wheelScaleFor(1, 2, WHEEL_ZOOM_SPEED)).toBeCloseTo(1 / scale, 12);
+  });
+
+  it("zooms pixel mode too, so no delta mode is left to a second owner", () => {
+    expect(wheelScaleFor(-WHEEL_NOTCH_PIXELS, 0, WHEEL_ZOOM_SPEED)).toBeCloseTo(
+      Math.pow(WHEEL_ZOOM_BASE, WHEEL_ZOOM_SPEED),
+      12,
+    );
+    expect(wheelScaleFor(WHEEL_NOTCH_PIXELS, 0, WHEEL_ZOOM_SPEED)).toBeCloseTo(
+      1 / Math.pow(WHEEL_ZOOM_BASE, WHEEL_ZOOM_SPEED),
+      12,
+    );
   });
 
   it("bounds large wheel deltas to three notches", () => {
-    expect(supplementaryWheelScale(-100, 2, WHEEL_ZOOM_SPEED)).toBeCloseTo(
-      Math.pow(0.95, 3 * WHEEL_ZOOM_SPEED),
+    expect(wheelScaleFor(-100, 2, WHEEL_ZOOM_SPEED)).toBeCloseTo(
+      Math.pow(WHEEL_ZOOM_BASE, 3 * WHEEL_ZOOM_SPEED),
       12,
     );
-    expect(supplementaryWheelScale(Number.NaN, 1, WHEEL_ZOOM_SPEED)).toBe(1);
+    expect(wheelScaleFor(Number.NaN, 1, WHEEL_ZOOM_SPEED)).toBe(1);
   });
 
-  it("ignores pixel-mode deltas reserved for OrbitControls", () => {
-    expect(supplementaryWheelScale(-100, 0, WHEEL_ZOOM_SPEED)).toBe(1);
+  it("leaves the zoom alone for a zero or unusable delta", () => {
+    expect(wheelScaleFor(0, 0, WHEEL_ZOOM_SPEED)).toBe(1);
+    expect(wheelScaleFor(120, 0, Number.NaN)).toBe(1);
+    expect(wheelScaleFor(120, 0, -1)).toBe(1);
   });
 });
 
@@ -183,7 +199,7 @@ describe("cursor world anchor", () => {
     const halfWidth = 900;
     const halfHeight = 500;
     const heading = Math.PI / 5;
-    const scale = supplementaryWheelScale(-3, 1, WHEEL_ZOOM_SPEED);
+    const scale = wheelScaleFor(-WHEEL_LINE_HEIGHT, 1, WHEEL_ZOOM_SPEED);
     writeCursorMapPoint(before, ndcX, ndcY, targetX, targetZ, halfWidth, halfHeight, heading);
     writeCursorMapPoint(after, ndcX, ndcY, targetX, targetZ, halfWidth * scale, halfHeight * scale, heading);
     const nextTargetX = targetX + before.x - after.x;
@@ -202,6 +218,7 @@ describe("cursor world anchor", () => {
     expect(after.z).toBeCloseTo(before.z, 10);
   });
 });
+
 
 describe("heading normalisation", () => {
   it("keeps a right drag inside plus or minus half a turn", () => {

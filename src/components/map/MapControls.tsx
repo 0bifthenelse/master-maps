@@ -12,7 +12,7 @@ import {
   worldPanFor,
   zoomDirectionFor,
   KEY_PANS,
-  supplementaryWheelScale,
+  wheelScaleFor,
   writeCursorMapPoint,
 } from './mapNavigation';
 
@@ -110,27 +110,44 @@ export const MapControls = forwardRef<ControlsHandle, MapControlsProps>(
       return 0;
     }, [get]);
 
+    /* A damping pan keeps moving after the last pointer event, and a demand
+       rendered Canvas only draws the frames it has been asked for. The
+       controls stop reporting a change exactly when the pan has settled, so
+       a settled update is what ends this loop. */
+    const panSettled = useRef(true);
+    const requestFrame = useCallback(() => {
+      panSettled.current = false;
+      invalidate();
+    }, [invalidate]);
+
+    /* One wheel owner for every deltaMode. The listener is registered on the
+       canvas in the capture phase and drei's OrbitControls registers its own
+       bubble-phase wheel listener on that same element, so at the DOM target
+       the capture listener always runs first and stopImmediatePropagation
+       keeps the library from applying a second zoom to the same event. */
     useEffect(() => {
-      const controls = controlsRef.current;
-      if (!controls) return;
+      const wheelElement = get().gl.domElement as HTMLCanvasElement | undefined;
+      if (!wheelElement) return;
       const onWheel = (event: WheelEvent): void => {
-        cameraRef.current?.cancelInterpolation();
-        if (event.deltaMode === 0) return;
+        /* drei recreates the controls instance when the default camera is
+           swapped in, so the live instance is resolved per event rather than
+           captured: a captured one would zoom a discarded camera. */
+        const controls = controlsRef.current;
+        if (!controls) return;
         event.preventDefault();
         event.stopImmediatePropagation();
-        const scale = supplementaryWheelScale(event.deltaY, event.deltaMode, controls.zoomSpeed);
+        cameraRef.current?.cancelInterpolation();
+        const scale = wheelScaleFor(event.deltaY, event.deltaMode, controls.zoomSpeed);
         if (scale === 1) return;
         const camera = get().camera as unknown as OrthographicCamera;
         if (!camera || camera.isOrthographicCamera !== true || camera.zoom <= 0) return;
-        const canvas = controls.domElement;
-        if (!canvas) return;
-        const rect = canvas.getBoundingClientRect();
+        const rect = wheelElement.getBoundingClientRect();
         if (rect.width <= 0 || rect.height <= 0) return;
         const ndcX = ((event.clientX - rect.left) / rect.width) * 2 - 1;
         const ndcY = 1 - ((event.clientY - rect.top) / rect.height) * 2;
+        const heading = readHeading();
         const halfWidth = Math.abs(camera.right - camera.left) / (2 * camera.zoom);
         const halfHeight = Math.abs(camera.top - camera.bottom) / (2 * camera.zoom);
-        const heading = readHeading();
         const anchors = wheelAnchors.current;
         writeCursorMapPoint(
           anchors.before,
@@ -143,41 +160,38 @@ export const MapControls = forwardRef<ControlsHandle, MapControlsProps>(
           heading,
         );
         controls.setScale(scale);
+        /* The scale accumulator is only consumed here, and this update has to
+           land before the after-anchor so it reads the new camera.zoom. */
+        controls.update();
+        const afterHalfWidth = Math.abs(camera.right - camera.left) / (2 * camera.zoom);
+        const afterHalfHeight = Math.abs(camera.top - camera.bottom) / (2 * camera.zoom);
         writeCursorMapPoint(
           anchors.after,
           ndcX,
           ndcY,
           controls.target.x,
           controls.target.z,
-          Math.abs(camera.right - camera.left) / (2 * camera.zoom),
-          Math.abs(camera.top - camera.bottom) / (2 * camera.zoom),
+          afterHalfWidth,
+          afterHalfHeight,
           heading,
         );
+        /* update() recentres the camera from target plus offset, so both the
+           target and the camera move by the shift, and an update then keeps
+           the pair consistent while the change event publishes the new view. */
         const deltaX = anchors.before.x - anchors.after.x;
         const deltaZ = anchors.before.z - anchors.after.z;
         controls.target.x += deltaX;
         controls.target.z += deltaZ;
         camera.position.x += deltaX;
         camera.position.z += deltaZ;
+        controls.update();
         camera.updateMatrixWorld();
-        invalidate();
+        onChange?.();
+        requestFrame();
       };
-      const canvas = controls.domElement ?? null;
-      if (!canvas) return;
-      canvas.addEventListener('wheel', onWheel, { passive: false, capture: true });
-      return () => canvas.removeEventListener('wheel', onWheel, { capture: true } as EventListenerOptions);
-    }, [get, invalidate, readHeading]);
-
-
-    /* A damping pan keeps moving after the last pointer event, and a demand
-       rendered Canvas only draws the frames it has been asked for. The
-       controls stop reporting a change exactly when the pan has settled, so
-       a settled update is what ends this loop. */
-    const panSettled = useRef(true);
-    const requestFrame = useCallback(() => {
-      panSettled.current = false;
-      invalidate();
-    }, [invalidate]);
+      wheelElement.addEventListener('wheel', onWheel, { passive: false, capture: true });
+      return () => wheelElement.removeEventListener('wheel', onWheel, { capture: true } as EventListenerOptions);
+    }, [get, readHeading, onChange, requestFrame]);
 
     useEffect(() => {
       const controls = controlsRef.current;

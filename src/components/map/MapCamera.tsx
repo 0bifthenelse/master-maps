@@ -10,6 +10,7 @@ import {
   normalizeHeading,
   touchHeadingForGesture,
   TOUCH_PINCH_TOLERANCE,
+  type Orientation,
 } from './mapNavigation';
 
 /* ------------------------------------------------------------------ */
@@ -23,7 +24,16 @@ export interface CameraDiagnostics {
   azimuthalAngle: number;
   headingRadians: number;
   rotationZ: number;
+  northScreenUp: boolean;
+  eastScreenRight: boolean;
+  projectionYScale: number;
 }
+
+export const IDLE_ORIENTATION: Orientation = {
+  northScreenUp: false,
+  eastScreenRight: false,
+  projectionYScale: 1,
+};
 
 export interface CameraHandle {
   /** Animate camera target to world coordinate with optional tight bounds. */
@@ -85,12 +95,62 @@ function applyCameraHeading(camera: THREE.OrthographicCamera, heading: number): 
   camera.rotation.set(CAMERA_TOP_DOWN_PITCH, 0, heading);
 }
 
-/** Three's right-handed top-down basis maps +Z to screen down at zero roll.
- * Flip only NDC-Y in the orthographic projection so +X remains screen-right
- * and +Z remains screen-up without mutating geographic geometry. */
+/* The map is strictly north-up, so the frustum itself is mirrored: top sits at
+   -halfHeight and bottom at +halfHeight. Three derives the projection Y scale
+   from (top - bottom) inside updateProjectionMatrix(), so the reflection
+   survives every later rebuild (R3F resize, OrbitControls zoom, reset) instead
+   of being an ephemeral edit of a generated matrix. The camera is pitched
+   -PI/2 about X, so its local +Y (screen up) is world -Z (south); a negative Y
+   scale is what puts world +Z (north) back at the top of the screen. */
 export function updateNorthUpProjection(camera: THREE.OrthographicCamera): void {
+  applyNorthUpFrustum(
+    camera,
+    Math.abs(camera.right - camera.left) / 2,
+    Math.abs(camera.top - camera.bottom) / 2,
+  );
   camera.updateProjectionMatrix();
-  camera.projectionMatrix.elements[5] *= -1;
+}
+
+export function applyNorthUpFrustum(
+  camera: THREE.OrthographicCamera,
+  halfWidth: number,
+  halfHeight: number,
+): void {
+  camera.left = -halfWidth;
+  camera.right = halfWidth;
+  camera.top = -halfHeight;
+  camera.bottom = halfHeight;
+}
+
+const NORTH = new THREE.Vector3(0, 0, 1);
+const EAST = new THREE.Vector3(1, 0, 0);
+const direction = new THREE.Vector3();
+const anchor = new THREE.Vector3();
+
+/* Measured from the live matrices, never from the intended convention: the
+   world directions go through matrixWorldInverse and projectionMatrix, so a
+   flipped or rebuilt projection reports itself as wrong. */
+export function readOrientation(camera: THREE.OrthographicCamera): Orientation {
+  camera.updateMatrixWorld();
+  const axisX = screenAxisX(camera, EAST);
+  const axisY = screenAxisY(camera, NORTH);
+  return {
+    northScreenUp: axisY > 0,
+    eastScreenRight: axisX > 0,
+    projectionYScale: camera.projectionMatrix.elements[5],
+  };
+}
+
+function screenAxisX(camera: THREE.OrthographicCamera, worldDirection: THREE.Vector3): number {
+  anchor.set(0, 0, 0).project(camera);
+  direction.copy(worldDirection).project(camera);
+  return direction.x - anchor.x;
+}
+
+function screenAxisY(camera: THREE.OrthographicCamera, worldDirection: THREE.Vector3): number {
+  anchor.set(0, 0, 0).project(camera);
+  direction.copy(worldDirection).project(camera);
+  return direction.y - anchor.y;
 }
 
 export const MapCamera = forwardRef<CameraHandle, MapCameraProps>(
@@ -146,10 +206,7 @@ export const MapCamera = forwardRef<CameraHandle, MapCameraProps>(
 
         // 15% padding keeps the territory boundary visible with margin.
         const pad = 1.15;
-        camera.left = (-fw / 2) * pad;
-        camera.right = (fw / 2) * pad;
-        camera.top = (fh / 2) * pad;
-        camera.bottom = (-fh / 2) * pad;
+        applyNorthUpFrustum(camera, (fw / 2) * pad, (fh / 2) * pad);
         camera.zoom = Math.min(maxZoom, Math.max(minZoom, zoom));
         updateNorthUpProjection(camera);
         return camera;
@@ -202,7 +259,7 @@ export const MapCamera = forwardRef<CameraHandle, MapCameraProps>(
         const clamped = Math.min(maxZoom, Math.max(minZoom, value));
         if (camera.zoom === clamped) return;
         camera.zoom = clamped;
-        updateNorthUpProjection(camera);
+        camera.updateProjectionMatrix();
       },
       [minZoom, maxZoom],
     );
@@ -236,6 +293,14 @@ export const MapCamera = forwardRef<CameraHandle, MapCameraProps>(
       return () => {
         camera.lookAt = aim;
       };
+    }, []);
+
+    /* R3F's resize path rewrites left/right/top/bottom from the Canvas size
+       and rebuilds the projection, which would silently drop the mirrored
+       frustum this component owns. manual = true hands the frustum over. */
+    useEffect(() => {
+      const camera = cameraRef.current as (THREE.OrthographicCamera & { manual?: boolean }) | null;
+      if (camera) camera.manual = true;
     }, []);
 
     /* Re-fit the frustum whenever the Canvas is resized (mobile rotation,
@@ -424,10 +489,8 @@ export const MapCamera = forwardRef<CameraHandle, MapCameraProps>(
           const pad = 1.2;
           const nfw = fw / fh > aspect ? fw * pad : fh * pad * aspect;
           const nfh = fw / fh > aspect ? fw * pad / aspect : fh * pad;
-          camera.left = -nfw / 2;
-          camera.right = nfw / 2;
-          camera.top = nfh / 2;
-          camera.bottom = -nfh / 2;
+          applyNorthUpFrustum(camera, nfw / 2, nfh / 2);
+          camera.updateProjectionMatrix();
           setZoom(1);
         }
         desiredZoom.current = Math.min(
@@ -580,6 +643,7 @@ export const MapCamera = forwardRef<CameraHandle, MapCameraProps>(
             azimuthalAngle: 0,
             headingRadians: 0,
             rotationZ: 0,
+            ...IDLE_ORIENTATION,
           };
         }
         const controls = get().controls as MapControlsImpl | null;
@@ -597,6 +661,7 @@ export const MapCamera = forwardRef<CameraHandle, MapCameraProps>(
           azimuthalAngle: headingRef.current,
           headingRadians: headingRef.current,
           rotationZ: camera.rotation.z,
+          ...readOrientation(camera),
         };
       },
     }));

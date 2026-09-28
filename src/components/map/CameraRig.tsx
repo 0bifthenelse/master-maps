@@ -2,7 +2,7 @@
 
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef } from "react";
 import { useFrame } from "@react-three/fiber";
-import { MapCamera, type CameraDiagnostics, type CameraHandle } from "./MapCamera";
+import { MapCamera, IDLE_ORIENTATION, type CameraDiagnostics, type CameraHandle } from "./MapCamera";
 import { MapControls, type CameraCommandSink, type ControlsDiagnostics, type ControlsHandle } from "./MapControls";
 import { sceneMetrics, publishSceneDiagnostics } from "@/lib/scene/sceneMetrics";
 
@@ -13,6 +13,7 @@ const IDLE_CAMERA_STATE: CameraDiagnostics = {
   azimuthalAngle: 0,
   headingRadians: 0,
   rotationZ: 0,
+  ...IDLE_ORIENTATION,
 };
 
 const IDLE_CONTROLS_STATE: ControlsDiagnostics = {
@@ -120,6 +121,9 @@ export const CameraRig = forwardRef<CameraRigHandle, CameraRigProps>(
       sceneMetrics.cameraTargetZ = snapshot.target[1];
       sceneMetrics.cameraZoom = snapshot.zoom;
       sceneMetrics.cameraState = JSON.stringify(cameraState);
+      sceneMetrics.northScreenUp = cameraState.northScreenUp;
+      sceneMetrics.eastScreenRight = cameraState.eastScreenRight;
+      sceneMetrics.projectionYScale = cameraState.projectionYScale;
       publishSceneDiagnostics(true);
       onViewportChange?.(snapshot);
     }, [onViewportChange]);

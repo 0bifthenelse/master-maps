@@ -5,6 +5,10 @@ export const PAN_MIN_STEP = 25;
 export const PAN_MAX_STEP = 400;
 export const ZOOM_KEY_FACTOR = 1.25;
 export const WHEEL_ZOOM_SPEED = 0.5;
+export const WHEEL_ZOOM_BASE = 0.95;
+export const WHEEL_NOTCH_PIXELS = 100;
+export const WHEEL_LINE_HEIGHT = 3;
+export const WHEEL_MAX_NOTCHES = 3;
 export const MIN_HEADING = -Math.PI;
 export const MAX_HEADING = Math.PI;
 export const HEADING_EPSILON = 1e-4;
@@ -48,12 +52,8 @@ export function worldPanFor(
   pan: KeyPan,
 ): { dx: number; dz: number } {
   const step = panStepFor(visibleWidth, visibleHeight);
-  const screenRight = { x: Math.cos(heading), z: -Math.sin(heading) };
-  const screenUp = { x: Math.sin(heading), z: Math.cos(heading) };
-  return {
-    dx: step * (pan.screenX * screenRight.x + pan.screenY * screenUp.x),
-    dz: step * (pan.screenX * screenRight.z + pan.screenY * screenUp.z),
-  };
+  const direction = screenDirectionFor(heading, pan.screenX, pan.screenY);
+  return { dx: step * direction.x, dz: step * direction.z };
 }
 
 export interface CursorMapPoint {
@@ -61,12 +61,40 @@ export interface CursorMapPoint {
   z: number;
 }
 
-export function supplementaryWheelScale(deltaY: number, deltaMode: number, zoomSpeed: number): number {
-  if (!Number.isFinite(deltaY) || !Number.isFinite(zoomSpeed) || zoomSpeed < 0) return 1;
-  const notches = deltaMode === 1 ? deltaY / 3 : deltaMode === 2 ? deltaY : 0;
-  if (notches === 0) return 1;
-  const clamped = Math.max(-3, Math.min(3, notches));
-  return Math.pow(0.95, -clamped * zoomSpeed);
+export interface Orientation {
+  northScreenUp: boolean;
+  eastScreenRight: boolean;
+  projectionYScale: number;
+}
+
+/* Top-down right-handed basis: the camera is pitched -PI/2 about X, so its local
+   +Y (screen up) points at world -Z (south). North is screen up only when the
+   projection Y scale is negative, which the mirrored frustum encodes. */
+export const NORTH_SCREEN_UP_Y_SCALE = -1;
+
+export function wheelScaleFor(deltaY: number, deltaMode: number, zoomSpeed: number): number {
+  const notches = deltaMode === 0
+    ? deltaY / WHEEL_NOTCH_PIXELS
+    : deltaMode === 1
+      ? deltaY / WHEEL_LINE_HEIGHT
+      : deltaY;
+  if (!Number.isFinite(notches) || notches === 0) return 1;
+  if (!Number.isFinite(zoomSpeed) || zoomSpeed < 0) return 1;
+  const clamped = Math.max(-WHEEL_MAX_NOTCHES, Math.min(WHEEL_MAX_NOTCHES, notches));
+  return Math.pow(WHEEL_ZOOM_BASE, -clamped * zoomSpeed);
+}
+
+export function screenDirectionFor(
+  heading: number,
+  screenX: number,
+  screenY: number,
+): { x: number; z: number } {
+  const cosine = Math.cos(heading);
+  const sine = Math.sin(heading);
+  return {
+    x: cosine * screenX + sine * screenY,
+    z: -sine * screenX + cosine * screenY,
+  };
 }
 
 export function writeCursorMapPoint(
@@ -79,14 +107,10 @@ export function writeCursorMapPoint(
   halfHeight: number,
   heading: number,
 ): void {
-  const cosine = Math.cos(heading);
-  const sine = Math.sin(heading);
-  const screenX = ndcX * halfWidth;
-  const screenZ = ndcY * halfHeight;
-  point.x = targetX + cosine * screenX + sine * screenZ;
-  point.z = targetZ - sine * screenX + cosine * screenZ;
+  const direction = screenDirectionFor(heading, ndcX * halfWidth, ndcY * halfHeight);
+  point.x = targetX + direction.x;
+  point.z = targetZ + direction.z;
 }
-
 export function zoomDirectionFor(event: KeyboardEvent): number {
   if (event.altKey || event.ctrlKey || event.metaKey) return 0;
   if (event.code in KEY_ZOOMS) return KEY_ZOOMS[event.code] ?? 0;
