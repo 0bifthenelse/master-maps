@@ -56,6 +56,13 @@ const DEFAULT_TARGET = "http://127.0.0.1:3100/";
 const VIEWPORT = { w: 1440, h: 900 };
 const FRAME_SAMPLE_MS = 10_000;
 const LOCK_RETRY_MS = 20_000;
+const ORIENTATION_ATTRIBUTE = "data-orientation-north-up";
+const EAST_RIGHT_ATTRIBUTE = "data-orientation-east-right";
+const Y_SCALE_ATTRIBUTE = "data-projection-y-scale";
+const LOD_STRESS_CYCLES = 10;
+const HEADING_STEP = Math.PI / 12;
+const TRUTHY = ["true", "1", "yes"];
+const NOT_DRIVEN = "notDriven";
 const HARD_STOP_MS = 20 * 60 * 1000;
 
 const TOWN = "Lectoure";
@@ -68,6 +75,15 @@ const THRESHOLDS = {
   consoleErrorsMax: 0,
   gpuValidationErrorsMax: 0,
 };
+
+/* The camera zooms by a factor per key press, so a key sweep and the
+   keyboardZoomFactor default of 1.25 let the stress run reach the LOD
+   range without inventing a path the app does not have. */
+const KEYBOARD_ZOOM_FACTOR = 1.25;
+const ZOOM_KEY_IN_PRESSES = 48;
+const ZOOM_KEY_OUT_PRESSES = 14;
+const ORIENTATION_TRUTHY = "true, 1 or yes";
+const FOCUS_ZOOM = 80;
 
 function log(message: string): void {
   process.stdout.write(`${message}\n`);
@@ -273,7 +289,7 @@ const CAMERA_PROBE = `(() => {
   if (state === null) return null;
   try {
     const camera = JSON.parse(state);
-    return { target: camera.target, zoom: camera.zoom, azimuthalAngle: camera.azimuthalAngle ?? null, frustumWidth: camera.frustumWidth ?? null, frustumHeight: camera.frustumHeight ?? null };
+    return { target: camera.target, zoom: camera.zoom, azimuthalAngle: camera.azimuthalAngle ?? null, headingRadians: camera.headingRadians ?? null, rotationZ: camera.rotationZ ?? null, frustumWidth: camera.frustumWidth ?? null, frustumHeight: camera.frustumHeight ?? null };
   } catch (error) { return { error: String(error) }; }
 })()`;
 
@@ -291,6 +307,170 @@ const CANVAS_PROBE = `(() => {
     devicePixelRatio: window.devicePixelRatio,
   };
 })()`;
+
+/**
+ * One state read, written as a complete object literal so every field
+ * exists on every run: an absent attribute reads as null, never as a
+ * missing key, so a key-wise diff of two runs stays valid before and
+ * after a sibling slice publishes the orientation attributes.
+ */
+const MATRIX_STATE_PROBE = `(() => {
+  const element = document.getElementById("scene-diagnostics");
+  if (element === null) return { present: false, canvasPresent: false, rendererStatus: null, backend: null, rendererError: null, cameraTargetX: null, cameraTargetZ: null, targetX: null, targetZ: null, cameraZoom: null, loadedTileCount: null, drawCalls: null, unbatchedDrawCalls: null, batchCount: null, mountedTileCount: null, retiredPending: null, orientationNorthUp: null, orientationEastRight: null, projectionYScale: null };
+  const attribute = (name) => { const value = element.getAttribute(name); return value === null ? null : value; };
+  const number = (name) => { const value = attribute(name); return value === null ? null : Number(value); };
+  const canvas = document.querySelector("canvas");
+  const rect = canvas === null ? null : canvas.getBoundingClientRect();
+  return {
+    present: true,
+    canvasPresent: canvas !== null,
+    rendererStatus: attribute("data-renderer-status"),
+    backend: attribute("data-backend"),
+    rendererError: attribute("data-renderer-error"),
+    cameraTargetX: number("data-camera-target-x"),
+    cameraTargetZ: number("data-camera-target-z"),
+    targetX: attribute("data-camera-target-x"),
+    targetZ: attribute("data-camera-target-z"),
+    cameraZoom: number("data-camera-zoom"),
+    loadedTileCount: number("data-loaded-tile-count"),
+    drawCalls: number("data-draw-calls"),
+    unbatchedDrawCalls: number("data-unbatched-draw-calls"),
+    batchCount: number("data-batch-count"),
+    mountedTileCount: number("data-mounted-tile-count"),
+    retiredPending: number("data-retired-pending"),
+    orientationNorthUp: attribute(${JSON.stringify(ORIENTATION_ATTRIBUTE)}),
+    orientationEastRight: attribute(${JSON.stringify(EAST_RIGHT_ATTRIBUTE)}),
+    projectionYScale: number("data-projection-y-scale"),
+    canvasCssWidth: rect === null ? null : Math.round(rect.width),
+    canvasCssHeight: rect === null ? null : Math.round(rect.height),
+  };
+})()`;
+
+const RESIZE_PROBE = `() => new Promise((resolve) => {
+  const element = document.getElementById("scene-diagnostics");
+  window.dispatchEvent(new Event("resize"));
+  let round = 0;
+  const tick = () => {
+    round += 1;
+    if (round >= 12) {
+      const canvas = document.querySelector("canvas");
+      const rect = canvas === null ? null : canvas.getBoundingClientRect();
+      resolve({ dispatched: true, canvasCssWidth: rect === null ? null : Math.round(rect.width), canvasCssHeight: rect === null ? null : Math.round(rect.height), zoom: element === null ? null : element.getAttribute("data-camera-zoom") });
+      return;
+    }
+    requestAnimationFrame(tick);
+  };
+  requestAnimationFrame(tick);
+})`;
+
+const WHEEL_BURST_PROBE = `(deltaMode, deltaY, count, fractionX, fractionY) => new Promise((resolve) => {
+  const canvas = document.querySelector("canvas");
+  if (canvas === null) { resolve({ dispatched: 0, prevented: 0, reason: "no canvas" }); return; }
+  const rect = canvas.getBoundingClientRect();
+  const x = Math.round(rect.left + rect.width * fractionX);
+  const y = Math.round(rect.top + rect.height * fractionY);
+  let prevented = 0;
+  for (let index = 0; index < count; index += 1) {
+    const event = new WheelEvent("wheel", { clientX: x, clientY: y, deltaX: 0, deltaY, deltaMode, bubbles: true, cancelable: true, composed: true, view: window });
+    canvas.dispatchEvent(event);
+    if (event.defaultPrevented) prevented += 1;
+  }
+  let round = 0;
+  const tick = () => {
+    round += 1;
+    if (round >= 8) { resolve({ dispatched: count, prevented, deltaMode, deltaY, x, y, onCanvas: canvas === document.elementFromPoint(x, y) }); return; }
+    requestAnimationFrame(tick);
+  };
+  requestAnimationFrame(tick);
+})`;
+
+const KEY_BURST_PROBE = `(code, key, count) => new Promise((resolve) => {
+  const element = document.getElementById("scene-diagnostics");
+  const zoomBefore = element === null ? null : element.getAttribute("data-camera-zoom");
+  const init = { key, code, bubbles: true, cancelable: true, composed: true, view: window };
+  for (let index = 0; index < count; index += 1) {
+    window.dispatchEvent(new KeyboardEvent("keydown", init));
+    window.dispatchEvent(new KeyboardEvent("keyup", init));
+  }
+  let round = 0;
+  const tick = () => {
+    round += 1;
+    if (round >= 8) { resolve({ dispatched: count, code, key, zoomBefore, zoomAfter: element === null ? null : element.getAttribute("data-camera-zoom") }); return; }
+    requestAnimationFrame(tick);
+  };
+  requestAnimationFrame(tick);
+})`;
+
+/**
+ * The app tile counters, the scheduler counters and the GPU cache stats.
+ * Every absent global is a null field, never a missing key, so a key-wise
+ * diff of two runs stays valid before and after a sibling slice
+ * publishes one of them.
+ */
+const TILE_RUNTIME_PROBE = `(() => {
+  const element = document.getElementById("scene-diagnostics");
+  const attribute = element === null ? null : (name) => { const value = element.getAttribute(name); return value === null ? null : Number(value); };
+  const lengths = (list) => Array.isArray(list) ? list.length : null;
+  const d = window.__masterMapsTileDiagnostics;
+  const tile = d === undefined || d === null ? { present: false, requested: null, loaded: null, aborted: null, failed: null, evicted: null, retiredPending: null, reasons: null } : {
+    present: true,
+    requested: lengths(d.requested),
+    loaded: lengths(d.loaded),
+    aborted: lengths(d.aborted),
+    failed: lengths(d.failed),
+    evicted: lengths(d.evicted),
+    retiredPending: attribute === null ? null : attribute("data-retired-pending"),
+    reasons: d.reasons === undefined || d.reasons === null ? null : JSON.parse(JSON.stringify(d.reasons)),
+  };
+  const s = window.__masterMapsSchedulerDiagnostics;
+  const scalar = (value) => value === undefined || value === null ? null : value;
+  const scheduler = s === undefined || s === null ? { present: false, lod: null, concurrency: null, planCount: null, planned: null, queueDepth: null, inFlight: null } : {
+    present: true,
+    lod: scalar(s.lod),
+    concurrency: scalar(s.concurrency),
+    planCount: scalar(s.planCount),
+    planned: scalar(s.planned),
+    queueDepth: scalar(s.queueDepth),
+    inFlight: scalar(s.inFlight),
+  };
+  const g = window.__masterMapsGpuCacheDiagnostics;
+  const cache = g === undefined || g === null ? { present: false, resident: null, bytes: null, retiredPending: null, evictions: null, allocations: null } : {
+    present: true,
+    resident: scalar(g.resident),
+    bytes: scalar(g.bytes),
+    retiredPending: scalar(g.retiredPending),
+    evictions: scalar(g.evictions),
+    allocations: scalar(g.allocations),
+  };
+  const memory = performance.memory;
+  return { tile, scheduler, cache, jsHeapUsedBytes: memory === undefined ? null : memory.usedJSHeapSize, jsHeapLimitBytes: memory === undefined ? null : memory.jsHeapSizeLimit };
+})()`;
+
+/** The uncaught and console error lists, counted and sampled, not cleared. */
+const ERROR_TALLY_PROBE = `(() => {
+  const rt = window.__w5rt;
+  if (rt === undefined) return { present: false, uncaughtErrors: 0, uncaughtRejections: 0, consoleErrors: 0, gpuValidationErrors: 0, uncaughtSample: null, consoleErrorSample: null, gpuValidationSample: null };
+  return {
+    present: true,
+    uncaughtErrors: rt.errors.length,
+    uncaughtRejections: rt.rejections.length,
+    consoleErrors: rt.consoleErrors.length,
+    gpuValidationErrors: rt.gpuValidationErrors.length,
+    uncaughtSample: rt.errors.slice(0, 4),
+    consoleErrorSample: rt.consoleErrors.slice(0, 4),
+    gpuValidationSample: rt.gpuValidationErrors.slice(0, 4),
+  };
+})()`;
+
+const CLEAR_ERROR_TALLY_PROBE = `(() => {
+  const rt = window.__w5rt;
+  if (rt === undefined) return false;
+  rt.errors.length = 0;
+  rt.rejections.length = 0;
+  rt.consoleErrors.length = 0;
+  rt.gpuValidationErrors.length = 0;
+  return true;
+})`;
 
 const ADAPTER_PROBE = `(async () => {
   const out = {
@@ -466,18 +646,6 @@ const COLLECT_ERRORS_PROBE = `(() => {
   };
 })()`;
 
-const CLEAR_ERRORS_PROBE = `(() => {
-  const rt = window.__w5rt;
-  if (rt === undefined) return false;
-  rt.consoleErrors.length = 0;
-  rt.consoleWarnings.length = 0;
-  rt.errors.length = 0;
-  rt.rejections.length = 0;
-  rt.gpuValidationErrors.length = 0;
-  rt.longTasks.length = 0;
-  rt.canvasPointerEvents.length = 0;
-  return true;
-})()`;
 
 /**
  * Arm one measurement. A rAF loop records frame durations for the whole
@@ -669,6 +837,40 @@ const RESET_VIEW_PROBE = `(() => {
   return true;
 })()`;
 
+/**
+ * The focus path the app really has: type the known town, wait for the
+ * result list, click the first result through a real pointer sequence.
+ * The listbox sits below the fold at 900 px, so the click is attempted
+ * only when elementFromPoint says the option is the top element there.
+ */
+const FOCUS_RESULT_PROBE = `(() => {
+  const input = document.querySelector('[data-testid="search-input"]');
+  if (input === null) return false;
+  const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+  setter.call(input, ${JSON.stringify(TOWN)});
+  input.dispatchEvent(new Event("input", { bubbles: true }));
+  input.focus();
+  return true;
+})()`;
+
+const FOCUS_RESULT_CLICK_PROBE = `(index) => {
+  const options = Array.from(document.querySelectorAll('[role="option"]'));
+  const option = options[index];
+  if (option === null || option === undefined) return { clicked: false, reason: "no option at this index", count: options.length };
+  const rect = option.getBoundingClientRect();
+  const x = Math.round(rect.left + rect.width / 2);
+  const y = Math.round(rect.top + rect.height / 2);
+  if (rect.width === 0 || rect.height === 0) return { clicked: false, reason: "the option has no box", count: options.length };
+  const top = document.elementFromPoint(x, y);
+  if (top === null || !option.contains(top)) return { clicked: false, reason: "the option is not the top element at its own centre, it is below the fold", count: options.length, x, y, top: top === null ? null : top.tagName };
+  const base = { bubbles: true, cancelable: true, composed: true, view: window, pointerId: 77, pointerType: "mouse", isPrimary: true };
+  option.dispatchEvent(new PointerEvent("pointermove", Object.assign({}, base, { clientX: x, clientY: y, button: 0, buttons: 0 })));
+  option.dispatchEvent(new PointerEvent("pointerdown", Object.assign({}, base, { clientX: x, clientY: y, button: 0, buttons: 1 })));
+  option.dispatchEvent(new PointerEvent("pointerup", Object.assign({}, base, { clientX: x, clientY: y, button: 0, buttons: 0 })));
+  option.dispatchEvent(new MouseEvent("click", Object.assign({}, base, { clientX: x, clientY: y, button: 0 })));
+  return { clicked: true, count: options.length, x, y, text: option.textContent };
+}`;
+
 const CONTEXT_MENU_PROBE = `(() => {
   const menu = document.querySelector('[data-testid="feature-context-menu"]');
   if (menu === null) return { open: false, flag: document.documentElement.dataset.featureContextOpen ?? null };
@@ -783,6 +985,8 @@ interface CameraState {
   target: [number, number, number];
   zoom: number;
   azimuthalAngle: number | null;
+  headingRadians: number | null;
+  rotationZ: number | null;
   frustumWidth: number | null;
   frustumHeight: number | null;
 }
@@ -806,6 +1010,71 @@ interface StepRecord {
   detail: string;
 }
 
+interface OrientationRecord {
+  northUp: string | null;
+  eastRight: string | null;
+  projectionYScale: number | null;
+  observable: boolean;
+}
+
+interface NotDrivenRecord {
+  path: string;
+  notDriven: true;
+  reason: string;
+}
+
+type ZoomPathRecord = Record<string, unknown> & { path: string; notDriven?: false };
+type ZoomPathEntry = ZoomPathRecord | NotDrivenRecord;
+type HeadingStep = Record<string, unknown> & { path: string; notDriven?: false };
+type HeadingEntry = HeadingStep | NotDrivenRecord;
+type DragEntry = Record<string, unknown> & { path: string; notDriven?: false };
+type StressCycle = Record<string, unknown> & { index: number; notDriven?: false };
+type ErrorTally = {
+  present: boolean;
+  uncaughtErrors: number;
+  uncaughtRejections: number;
+  consoleErrors: number;
+  gpuValidationErrors: number;
+  uncaughtSample: string[] | null;
+  consoleErrorSample: string[] | null;
+  gpuValidationSample: string[] | null;
+};
+type TileRuntime = {
+  tile: Record<string, unknown> & { present: boolean; evicted: number | null; retiredPending: number | null };
+  scheduler: Record<string, unknown> & { present: boolean };
+  cache: Record<string, unknown> & { present: boolean };
+  jsHeapUsedBytes: number | null;
+  jsHeapLimitBytes: number | null;
+};
+
+function isNotDriven(entry: ZoomPathEntry | HeadingEntry | DragEntry | StressCycle): entry is NotDrivenRecord {
+  return (entry as NotDrivenRecord).notDriven === true;
+}
+
+function isTruthyAttribute(value: string | null): boolean {
+  return value !== null && TRUTHY.indexOf(value.trim().toLowerCase()) >= 0;
+}
+
+function isNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
+function numericOrNaN(value: unknown): number {
+  return isNumber(value) ? value : Number.NaN;
+}
+
+function orientationOf(state: Record<string, unknown> | null): OrientationRecord {
+  const northUp = typeof state?.orientationNorthUp === "string" ? state.orientationNorthUp : null;
+  const eastRight = typeof state?.orientationEastRight === "string" ? state.orientationEastRight : null;
+  const yScale = isNumber(state?.projectionYScale) ? Number(state?.projectionYScale) : null;
+  return { northUp, eastRight, projectionYScale: yScale, observable: northUp !== null || eastRight !== null };
+}
+
+function describeNotDriven(path: string, reason: string): NotDrivenRecord {
+  log(`notDriven ${path}: ${reason}`);
+  return { path, notDriven: true, reason };
+}
+
 class RuntimeRun {
   private readonly mcp = new McpClient();
   private readonly startedAt = Date.now();
@@ -816,16 +1085,24 @@ class RuntimeRun {
 
   private health: unknown = null;
   private version: unknown = null;
+  private installResult: Record<string, unknown> | string | null = null;
   private gpuModeEvidence = "";
   private installEvidence: unknown = null;
   private adapter: Record<string, unknown> = {};
   private canvas: Record<string, number> | null = null;
-  private overview: Diagnostics | null = null;
-  private finalDiagnostics: Diagnostics | null = null;
+  private overview: Diagnostics = { present: false };
+  private finalDiagnostics: Diagnostics = { present: false };
   private overviewSample: FrameSample = EMPTY_SAMPLE;
   private focusSample: FrameSample = EMPTY_SAMPLE;
   private interactionSample: FrameSample = EMPTY_SAMPLE;
   private errors: Record<string, unknown> = {};
+  private renderCostSample: FrameSample = EMPTY_SAMPLE;
+  private orientationBaseline: OrientationRecord = { northUp: null, eastRight: null, projectionYScale: null, observable: false };
+  private zoomMatrix: Record<string, unknown> = { orientationObservable: false, paths: [] as ZoomPathEntry[] };
+  private headingMatrixResult: Record<string, unknown> = { orientationObservable: false, steps: [] as HeadingEntry[] };
+  private dragPan: Record<string, unknown> = { notDriven: true, reason: "the drag pan section did not run" };
+  private lodStress: Record<string, unknown> = { notDriven: true, reason: "the level-of-detail stress section did not run" };
+  private focusZoom: number | null = null;
   private tileHttp: Record<string, unknown> = {};
   private tileApp: Record<string, unknown> | null = null;
   private renderFilesAtStart = 0;
@@ -870,9 +1147,10 @@ class RuntimeRun {
     await this.mcp.raw("navigate", { url: this.target }, 120_000);
     const page = await this.mcp.evaluate<{ url: string; title: string; readyState: string }>("({ url: location.href, title: document.title, readyState: document.readyState })", 60_000);
     log(`page: ${JSON.stringify(page)}`);
-    this.installEvidence = await this.mcp.evaluate<Record<string, unknown> | string>(INSTALL_PROBE, 60_000);
+    this.installResult = await this.mcp.evaluate<Record<string, unknown> | string>(INSTALL_PROBE, 60_000);
+    this.installEvidence = this.installResult;
     log(`page harness: ${JSON.stringify(this.installEvidence)}`);
-    if (typeof this.installEvidence === "string" || this.installEvidence.installed !== true) {
+    if (typeof this.installResult === "string" || this.installResult === null || this.installResult.installed !== true) {
       throw new Error(`the in-page measurement harness did not install: ${JSON.stringify(this.installEvidence)}`);
     }
     await this.waitForScene(180_000);
@@ -966,10 +1244,9 @@ class RuntimeRun {
 
   /* ---------------- small readers ---------------- */
 
-  private async diagnostics(): Promise<Diagnostics | null> {
+  private async diagnostics(): Promise<Diagnostics> {
     const raw = await this.mcp.evaluate<Diagnostics | null>(DIAGNOSTICS_PROBE, 30_000);
-    if (raw === null || raw.present !== true) return null;
-    return raw;
+    return raw === null ? { present: false } : raw;
   }
 
   private async camera(): Promise<CameraState | null> {
@@ -1015,7 +1292,6 @@ class RuntimeRun {
   private async measure(label: string, note: string, drive: boolean): Promise<FrameSample> {
     const cameraBefore = await this.camera();
     const httpBefore = await this.mcp.evaluate<{ total: number }>(TILE_HTTP_PROBE, 30_000);
-    const started = Date.now();
     const raw = await this.mcp.evaluate<{
       ok: boolean;
       reason?: string;
@@ -1057,6 +1333,488 @@ class RuntimeRun {
 
   private async wheel(dy: number, deltaMode: number, label: string): Promise<Record<string, unknown>> {
     return this.mcp.evaluate<Record<string, unknown>>(`(${WHEEL_PROBE})(null, null, ${dy}, ${deltaMode}, ${JSON.stringify(label)})`, 30_000);
+  }
+
+  /* ---------------- new sections ---------------- */
+
+  private async matrixState(): Promise<Record<string, unknown> | null> {
+    const raw = await this.mcp.evaluate<Record<string, unknown> | null>(MATRIX_STATE_PROBE, 30_000);
+    return raw !== null && raw.present === true ? raw : null;
+  }
+
+  private async errorTally(): Promise<ErrorTally> {
+    return this.mcp.evaluate<ErrorTally>(ERROR_TALLY_PROBE, 30_000);
+  }
+
+  private async clearErrorTally(): Promise<boolean> {
+    return this.mcp.evaluate<boolean>(CLEAR_ERROR_TALLY_PROBE, 30_000);
+  }
+
+  private async tileRuntime(): Promise<TileRuntime> {
+    return this.mcp.evaluate<TileRuntime>(TILE_RUNTIME_PROBE, 30_000);
+  }
+
+  private async settleZoom(level: number, tolerance = 0.02, timeoutMs = 20_000): Promise<number | null> {
+    const deadline = Date.now() + timeoutMs;
+    let last: number | null = null;
+    while (Date.now() < deadline) {
+      const raw = await this.matrixState();
+      const zoom = isNumber(raw?.cameraZoom) ? Number(raw?.cameraZoom) : null;
+      if (zoom === null) return null;
+      last = zoom;
+      if (Math.abs(zoom - level) <= tolerance * Math.max(1, Math.abs(level))) return zoom;
+      await sleep(200);
+    }
+    return last;
+  }
+
+  /**
+   * Every zoom input path, from one overview state, with the orientation
+   * attributes read on both sides of the operation. A path that the page
+   * cannot be made to take is recorded as notDriven with its reason, and
+   * a path that is driven but leaves the zoom untouched is a measured
+   * zero, not a missing value.
+   */
+  private async zoomInputMatrix(): Promise<void> {
+    log("=== zoom input matrix ===");
+    const paths: ZoomPathEntry[] = [];
+    this.orientationBaseline = orientationOf(await this.matrixState());
+    for (const [name, count, deltaMode, deltaY, fractionX, fractionY] of [
+      ["pixel-wheel-nocursor", 8, 0, -120, 0.5, 0.5],
+      ["pixel-wheel-cursor-offset", 8, 0, -120, 0.25, 0.3],
+      ["line-wheel", 6, 1, -3, 0.5, 0.5],
+      ["page-wheel", 6, 2, -1, 0.5, 0.5],
+    ] as Array<[string, number, number, number, number, number]>) {
+      paths.push(await this.measureZoomPath(name, "wheel", [deltaMode, deltaY, count, fractionX, fractionY], WHEEL_BURST_PROBE));
+    }
+    paths.push(await this.measureZoomPath("keyboard-zoom-in", "keydown and keyup on window, the target MapControls binds", ["Equal", "=", 3], KEY_BURST_PROBE));
+    paths.push(await this.measureZoomPath("keyboard-zoom-out", "keydown and keyup on window, the target MapControls binds", ["Minus", "-", 3], KEY_BURST_PROBE));
+    paths.push(await this.measureZoomPath("reset", "the reset-view control in MapHud, the stable data-testid selector", [], RESET_VIEW_PROBE));
+    paths.push(await this.measureZoomPath("resize", "the guarded viewport widened and restored, which resizes the canvas and refits the frustum", [], "resize"));
+    paths.push(await this.measureZoomPath("programmatic-focus", "the search result focus path, which the app drives at zoom 80", [], "programmatic-focus"));
+
+    this.zoomMatrix = { orientationObservable: this.orientationBaseline.observable, orientationBaseline: this.orientationBaseline, paths };
+    log(`zoom input matrix: ${JSON.stringify(this.zoomMatrix)}`);
+
+    const driven = paths.filter((entry): entry is ZoomPathRecord => !isNotDriven(entry));
+    const wheelPaths = driven.filter((entry) => entry.path.indexOf("wheel") >= 0);
+    if (wheelPaths.length > 0) {
+      this.verdict(
+        "zoom.wheelPaths",
+        wheelPaths.every((entry) => entry.movedZoom === true) ? "PASS" : "FAIL",
+        "every driven wheel zoom path changed the camera zoom",
+        wheelPaths.map((entry) => `${entry.path} zoom ${String(entry.zoomBefore)} -> ${String(entry.zoomAfter)}`).join("; "),
+        "each wheel path must change the zoom",
+      );
+    }
+    for (const entry of driven) {
+      if (entry.movedZoom !== true) continue;
+      const orientation = entry.orientation as OrientationRecord;
+      if (!orientation.observable) continue;
+      this.judge(
+        `zoom.orientation.${entry.path}`,
+        `a zoom through ${entry.path} keeps the north-up and east-right orientation attributes true`,
+        isTruthyAttribute(orientation.northUp) && isTruthyAttribute(orientation.eastRight),
+        `${entry.path}: ${ORIENTATION_ATTRIBUTE}=${String(orientation.northUp)}, ${EAST_RIGHT_ATTRIBUTE}=${String(orientation.eastRight)}, ${Y_SCALE_ATTRIBUTE}=${String(orientation.projectionYScale)}`,
+        `both attributes ${ORIENTATION_TRUTHY}`,
+      );
+    }
+    if (this.focusZoom !== null) {
+      this.judge("zoom.focusReachesFocusZoom", `activating a search result focuses the camera at zoom ${FOCUS_ZOOM}`, Math.abs(this.focusZoom - FOCUS_ZOOM) < 1, `the focus path settled at zoom ${round(this.focusZoom, 4)}`, `${FOCUS_ZOOM} +/- 1`);
+    } else {
+      this.verdict("zoom.focusReachesFocusZoom", "INCONCLUSIVE", `activating a search result focuses the camera at zoom ${FOCUS_ZOOM}`, "the focus path was not driven: the result list sits below the fold at this viewport and the guarded runtime could not click it", `${FOCUS_ZOOM} +/- 1`);
+    }
+    if (!this.orientationBaseline.observable) {
+      this.verdict("zoom.orientation.observable", "INCONCLUSIVE", "the orientation attributes are published by #scene-diagnostics", `neither ${ORIENTATION_ATTRIBUTE} nor ${EAST_RIGHT_ATTRIBUTE} is present, so the orientation values are null on every path and the zoom deltas stand alone`, `the attributes must be published to judge orientation`);
+    }
+  }
+
+  private async measureZoomPath(
+    name: string,
+    driver: string,
+    args: unknown[],
+    probe: string,
+  ): Promise<ZoomPathRecord | NotDrivenRecord> {
+    const before = await this.matrixState();
+    if (before === null) return describeNotDriven(name, "#scene-diagnostics is absent, so the camera state cannot be read before or after this path");
+    const started = Date.now();
+    let evidence: unknown = null;
+    try {
+      if (probe === RESET_VIEW_PROBE) evidence = await this.mcp.evaluate(RESET_VIEW_PROBE, 30_000);
+      else if (probe === "resize") evidence = await this.mcp.evaluate(RESIZE_PROBE, 30_000);
+      else if (probe === "programmatic-focus") evidence = await this.driveProgrammaticFocus();
+      else evidence = await this.mcp.evaluate(`(${probe})(${args.map((value) => JSON.stringify(value)).join(", ")})`, 60_000);
+    } catch (error) {
+      return describeNotDriven(name, `the dispatch threw before the state could be read: ${String(error).slice(0, 200)}`);
+    }
+    if (evidence === NOT_DRIVEN) return describeNotDriven(name, String((await this.matrixState()) === null ? "the page lost its diagnostics element" : "the focus path left the camera untouched"));
+    const zoomBefore = numericOrNaN(before.cameraZoom);
+    const settled = await this.settleZoom(zoomBefore, 0.02, 8000);
+    const after = await this.matrixState();
+    if (after === null) return describeNotDriven(name, "#scene-diagnostics disappeared while this path was running");
+    const zoomAfter = settled ?? numericOrNaN(after.cameraZoom);
+    const movedZoom = Math.abs(zoomAfter - zoomBefore) > 0.01;
+    const orientation = orientationOf(after);
+    const errorsDuring = await this.errorTally();
+    const record: ZoomPathRecord = {
+      path: name,
+      driver,
+      evidence: evidence === null ? null : (evidence as Record<string, unknown>),
+      zoomBefore,
+      zoomAfter,
+      zoomDelta: round(zoomAfter - zoomBefore, 4),
+      movedZoom,
+      targetXBefore: before.targetX,
+      targetXAfter: after.targetX,
+      targetZBefore: before.targetZ,
+      targetZAfter: after.targetZ,
+      targetFinite: isNumber(after.cameraTargetX) && isNumber(after.cameraTargetZ),
+      orientation,
+      loadedTileCount: numericOrNaN(after.loadedTileCount),
+      drawCalls: numericOrNaN(after.drawCalls),
+      rendererError: after.rendererError === null || after.rendererError === undefined ? null : after.rendererError,
+      errorsDuring,
+      durationMs: Date.now() - started,
+    };
+    log(`zoom path ${name}: ${JSON.stringify(record)}`);
+    this.steps.push({
+      name: `zoom-${name}`,
+      ok: isNumber(after.cameraTargetX) && isNumber(after.cameraTargetZ) && errorsDuring.uncaughtErrors === 0,
+      detail: `zoom ${round(zoomBefore, 4)} -> ${round(zoomAfter, 4)} (${movedZoom ? "moved" : "no change"}), target x ${String(record.targetXBefore)} -> ${String(record.targetXAfter)}, loaded tiles ${String(record.loadedTileCount)}, draw calls ${String(record.drawCalls)}, north-up ${String(orientation.northUp)}, ${String(record.durationMs)} ms`,
+    });
+    return record;
+  }
+
+  /**
+   * The zoom 80 focus path. The app only focuses a result or a picked
+   * feature, and both go through the search field, so this drives the
+   * search result click for the known town and waits for the app to
+   * settle at the focus zoom. A click that never moves the camera is
+   * reported, not retried into a fake measurement.
+   */
+  private async driveProgrammaticFocus(): Promise<unknown> {
+    const typed = await this.mcp.evaluate<boolean>(FOCUS_RESULT_PROBE, 60_000);
+    if (typed !== true) return NOT_DRIVEN;
+    const options = await this.waitFor<{ count: number }>(
+      async () => this.mcp.evaluate<{ count: number }>(SEARCH_OPTIONS_PROBE, 30_000),
+      (value) => value.count > 0,
+      20_000,
+    );
+    if (options === null) return NOT_DRIVEN;
+    const clicked = await this.mcp.evaluate<Record<string, unknown>>(`(${FOCUS_RESULT_CLICK_PROBE})(0)`, 60_000);
+    if (clicked.clicked !== true) return NOT_DRIVEN;
+    const focusZoom = await this.waitFor<number>(
+      async () => {
+        const raw = await this.matrixState();
+        return isNumber(raw?.cameraZoom) ? Number(raw?.cameraZoom) : null;
+      },
+      (value) => Math.abs(value - 80) < 1,
+      20_000,
+    );
+    if (focusZoom === null) return NOT_DRIVEN;
+    this.focusZoom = focusZoom;
+    return { town: TOWN, options: options.count, clicked, focusZoom, expectedFocusZoom: FOCUS_ZOOM };
+  }
+
+  /**
+   * Headings reached with the heading keys, each followed by one
+   * pixel-mode wheel zoom. A zoom must never move the heading, so the
+   * heading is read before and after every zoom.
+   */
+  private async headingMatrix(): Promise<void> {
+    log("=== heading matrix ===");
+    const steps: HeadingEntry[] = [];
+    this.orientationBaseline = orientationOf(await this.matrixState());
+    const targets = [0, -Math.PI / 4, Math.PI / 4, Math.PI / 2];
+    for (const target of targets) {
+      const path = `heading-${Math.round((target * 180) / Math.PI)}deg`;
+      const before = await this.camera();
+      if (before === null) {
+        steps.push(describeNotDriven(path, "the camera state could not be read, so no heading step was driven"));
+        continue;
+      }
+      const turns = Math.round((target - numericOrNaN(before.headingRadians)) / HEADING_STEP);
+      const key = turns < 0 ? ["KeyA", "a"] : ["KeyE", "e"];
+      const evidence = await this.mcp.evaluate(`(${KEY_BURST_PROBE})(${JSON.stringify(key[0])}, ${JSON.stringify(key[1])}, ${Math.abs(turns)})`, 60_000);
+      const reached = await this.waitFor<CameraState>(async () => this.camera(), (value) => Math.abs((numericOrNaN(value.headingRadians) - target) * 180) / Math.PI < 4, 15_000);
+      if (reached === null) {
+        steps.push(describeNotDriven(path, `${Math.abs(turns)} ${String(key[0])} presses did not bring the heading to ${target.toFixed(4)} rad within 15 s: ${JSON.stringify(evidence)}`));
+        continue;
+      }
+      const headingBefore = numericOrNaN(reached.headingRadians);
+      const zoomBefore = numericOrNaN(reached.zoom);
+      await this.mcp.evaluate(`(${WHEEL_BURST_PROBE})(0, -120, 8, 0.5, 0.5)`, 60_000);
+      await sleep(1200);
+      const zoomed = await this.camera();
+      const headingAfter = numericOrNaN(zoomed?.headingRadians);
+      const zoomAfter = numericOrNaN(zoomed?.zoom);
+      const state = await this.matrixState();
+      const entry: HeadingStep = {
+        path,
+        targetRadians: round(target, 4),
+        targetDegrees: Math.round((target * 180) / Math.PI),
+        keyPresses: Math.abs(turns),
+        key: key[0],
+        headingBefore: round(headingBefore, 4),
+        headingAfter: round(headingAfter, 4),
+        headingDelta: round(headingAfter - headingBefore, 6),
+        headingHeld: Math.abs(headingAfter - headingBefore) < 0.01,
+        zoomBefore: round(zoomBefore, 4),
+        zoomAfter: round(zoomAfter, 4),
+        zoomDelta: round(zoomAfter - zoomBefore, 4),
+        orientation: orientationOf(state),
+        loadedTileCount: numericOrNaN(state?.loadedTileCount),
+        drawCalls: numericOrNaN(state?.drawCalls),
+        errorsDuring: await this.errorTally(),
+      };
+      steps.push(entry);
+      log(`heading step ${path}: ${JSON.stringify(entry)}`);
+    }
+    const driven = steps.filter((entry): entry is HeadingStep => !isNotDriven(entry));
+    this.headingMatrixResult = { orientationObservable: this.orientationBaseline.observable, steps };
+    if (driven.length > 0) {
+      this.judge(
+        "heading.zoomHoldsHeading",
+        "a pixel-mode wheel zoom at a rotated heading leaves the heading unchanged",
+        driven.every((entry) => entry.headingHeld === true),
+        driven.map((entry) => `${entry.path} heading ${String(entry.headingBefore)} -> ${String(entry.headingAfter)} with zoom ${String(entry.zoomBefore)} -> ${String(entry.zoomAfter)}`).join("; "),
+        "the heading must not move during a zoom",
+      );
+    }
+    for (const entry of driven) {
+      const orientation = entry.orientation as OrientationRecord;
+      if (!orientation.observable || entry.zoomDelta === 0) continue;
+      this.judge(
+        `heading.orientation.${entry.path}`,
+        `a zoom at ${entry.targetDegrees} degrees keeps the north-up and east-right orientation attributes true`,
+        isTruthyAttribute(orientation.northUp) && isTruthyAttribute(orientation.eastRight),
+        `${entry.path}: ${ORIENTATION_ATTRIBUTE}=${String(orientation.northUp)}, ${EAST_RIGHT_ATTRIBUTE}=${String(orientation.eastRight)}, ${Y_SCALE_ATTRIBUTE}=${String(orientation.projectionYScale)}`,
+        `both attributes ${ORIENTATION_TRUTHY}`,
+      );
+    }
+  }
+
+  /**
+   * The left-drag pan regression. The camera target must stay a finite
+   * pair, the resident tile set must not empty, the draw call count must
+   * not fall to a single call, and no uncaught error may appear. The raw
+   * attribute values are recorded, not only the verdict.
+   */
+  private async dragPanIntegrity(): Promise<void> {
+    log("=== left drag pan integrity ===");
+    this.orientationBaseline = orientationOf(await this.matrixState());
+    await this.mcp.evaluate(RESET_VIEW_PROBE, 30_000);
+    await this.settleZoom(1, 0.05, 20_000);
+    await sleep(1500);
+    const before = await this.matrixState();
+    if (before === null) {
+      this.dragPan = { path: "left-drag", notDriven: true, reason: "#scene-diagnostics is absent, so the camera target cannot be read before or after the drag" };
+      return;
+    }
+    await this.clearErrorTally();
+    const evidence = await this.mcp.evaluate<Record<string, unknown>>(`(${DRAG_PROBE})(0.65, 0.55, 0.32, 0.55, 24)`, 60_000);
+    await sleep(2000);
+    const after = await this.matrixState();
+    if (after === null) {
+      this.dragPan = { path: "left-drag", notDriven: true, reason: "#scene-diagnostics disappeared while the drag was running" };
+      return;
+    }
+    const targetXBefore = before.targetX;
+    const targetXAfter = after.targetX;
+    const targetZBefore = before.targetZ;
+    const targetZAfter = after.targetZ;
+    const finite = isNumber(after.cameraTargetX) && isNumber(after.cameraTargetZ);
+    const tilesHeld = isNumber(after.loadedTileCount) && Number(after.loadedTileCount) > 0;
+    const drawCallsHeld = isNumber(after.drawCalls) && Number(after.drawCalls) > 1;
+    const errors = await this.errorTally();
+    const entry: DragEntry = {
+      path: "left-drag",
+      driver: "a real pointerdown, 24 pointermove steps and a pointerup on the canvas, the sequence OrbitControls reads",
+      evidence,
+      targetXBefore,
+      targetXAfter,
+      targetZBefore,
+      targetZAfter,
+      targetFinite: finite,
+      loadedTileCountBefore: numericOrNaN(before.loadedTileCount),
+      loadedTileCountAfter: numericOrNaN(after.loadedTileCount),
+      drawCallsBefore: numericOrNaN(before.drawCalls),
+      drawCallsAfter: numericOrNaN(after.drawCalls),
+      orientation: orientationOf(after),
+      rendererError: after.rendererError === null || after.rendererError === undefined ? null : after.rendererError,
+      errorsDuring: errors,
+    };
+    this.dragPan = entry;
+    log(`left drag pan: ${JSON.stringify(entry)}`);
+    this.judge("drag.targetFinite", "the camera target stays a finite pair after a left-button drag", finite, `data-camera-target-x ${String(targetXBefore)} -> ${String(targetXAfter)}, data-camera-target-z ${String(targetZBefore)} -> ${String(targetZAfter)}`, "two finite numbers");
+    this.judge("drag.tilesResident", "the resident tile set does not empty after a left-button drag", tilesHeld, `data-loaded-tile-count ${String(entry.loadedTileCountBefore)} -> ${String(entry.loadedTileCountAfter)}`, "> 0");
+    this.judge("drag.drawCallsResident", "the draw call count does not collapse to a single call after a left-button drag", drawCallsHeld, `data-draw-calls ${String(entry.drawCallsBefore)} -> ${String(entry.drawCallsAfter)}`, "> 1");
+    this.judge("drag.noUncaughtError", "a left-button drag raises no uncaught page error", errors.uncaughtErrors === 0 && errors.uncaughtRejections === 0, `${errors.uncaughtErrors} uncaught errors, ${errors.uncaughtRejections} unhandled rejections: ${JSON.stringify(errors.uncaughtSample)}`, "0");
+  }
+
+  /**
+   * Repeated zoom out and zoom in across the LOD thresholds, driven with
+   * the zoom input that actually moves the camera. The verdict is zero
+   * uncaught errors, zero validation errors and no counter past the
+   * cycle count, read from the app tile diagnostics and the diagnostics
+   * element at the end of the run.
+   */
+  private async lodStressRun(): Promise<void> {
+    log("=== lod stress ===");
+    this.orientationBaseline = orientationOf(await this.matrixState());
+    const driver = await this.chooseZoomDriver();
+    if (driver === null) {
+      this.lodStress = { notDriven: true, reason: "no zoom input path moved the camera in the zoom input matrix, so the level-of-detail thresholds cannot be crossed from this harness", cyclesRequested: LOD_STRESS_CYCLES, cyclesRun: 0 };
+      log(`lod stress notDriven: ${String(this.lodStress.reason)}`);
+      return;
+    }
+    await this.mcp.evaluate(RESET_VIEW_PROBE, 30_000);
+    await this.settleZoom(1, 0.05, 20_000);
+    await sleep(1200);
+    await this.clearErrorTally();
+    const before = await this.tileRuntime();
+    const cycles: Array<StressCycle | NotDrivenRecord> = [];
+    let low = 1;
+    let high = KEYBOARD_ZOOM_FACTOR ** ZOOM_KEY_IN_PRESSES;
+    for (let index = 0; index < LOD_STRESS_CYCLES; index += 1) {
+      if (this.overBudget()) {
+        cycles.push(describeNotDriven(`cycle-${index + 1}`, "the run hit its hard stop budget before this cycle"));
+        continue;
+      }
+      const cycleStarted = Date.now();
+      await this.applyZoomDriver(driver, "out", ZOOM_KEY_OUT_PRESSES);
+      const zoomedOut = await this.settleZoom(low, 0.05, 12_000);
+      const quiescentOut = await this.waitForTileQuiescence(20_000);
+      const outState = await this.matrixState();
+      await this.applyZoomDriver(driver, "in", ZOOM_KEY_IN_PRESSES);
+      const zoomedIn = await this.settleZoom(high, 0.05, 20_000);
+      const quiescentIn = await this.waitForTileQuiescence(25_000);
+      const inState = await this.matrixState();
+      const runtime = await this.tileRuntime();
+      const entry: StressCycle = {
+        index: index + 1,
+        zoomTargetLow: round(low, 4),
+        zoomTargetHigh: round(high, 4),
+        zoomAfterOut: zoomedOut,
+        zoomAfterIn: zoomedIn,
+        quiescentOut: quiescentOut.settled,
+        quiescentIn: quiescentIn.settled,
+        loadedTileCountOut: numericOrNaN(outState?.loadedTileCount),
+        loadedTileCountIn: numericOrNaN(inState?.loadedTileCount),
+        drawCallsOut: numericOrNaN(outState?.drawCalls),
+        drawCallsIn: numericOrNaN(inState?.drawCalls),
+        requested: runtime.tile.requested,
+        loaded: runtime.tile.loaded,
+        aborted: runtime.tile.aborted,
+        failed: runtime.tile.failed,
+        evicted: runtime.tile.evicted,
+        retiredPending: runtime.tile.retiredPending,
+        schedulerLod: runtime.scheduler.lod,
+        concurrency: runtime.scheduler.concurrency,
+        cacheResident: runtime.cache.resident,
+        jsHeapUsedBytes: runtime.jsHeapUsedBytes,
+        errorsDuring: await this.errorTally(),
+        durationMs: Date.now() - cycleStarted,
+      };
+      cycles.push(entry);
+      log(`lod stress cycle ${index + 1}: ${JSON.stringify(entry)}`);
+    }
+    const after = await this.tileRuntime();
+    const errors = await this.errorTally();
+    const evictedBefore = isNumber(before.tile.evicted) ? Number(before.tile.evicted) : null;
+    const evictedAfter = isNumber(after.tile.evicted) ? Number(after.tile.evicted) : null;
+    const evictedGrowth = evictedBefore === null || evictedAfter === null ? null : evictedAfter - evictedBefore;
+    const retiredAfter = after.tile.retiredPending;
+    const monotonic = retiredAfter === null || evictedGrowth === null ? null : retiredAfter <= LOD_STRESS_CYCLES && evictedGrowth <= LOD_STRESS_CYCLES;
+    this.lodStress = {
+      driver: driver.name,
+      cyclesRequested: LOD_STRESS_CYCLES,
+      cyclesRun: cycles.filter((entry) => !isNotDriven(entry)).length,
+      zoomLow: round(low, 4),
+      zoomHigh: round(high, 4),
+      cycles,
+      tileBefore: before.tile,
+      tileAfter: after.tile,
+      schedulerBefore: before.scheduler,
+      schedulerAfter: after.scheduler,
+      cacheBefore: before.cache,
+      cacheAfter: after.cache,
+      evictedBefore,
+      evictedAfter,
+      evictedGrowth,
+      retiredPendingAfter: retiredAfter,
+      monotonicWithinCycles: monotonic,
+      errorsDuring: errors,
+      jsHeapUsedBytesBefore: before.jsHeapUsedBytes,
+      jsHeapUsedBytesAfter: after.jsHeapUsedBytes,
+      jsHeapUsedMbBefore: before.jsHeapUsedBytes === null ? null : round(before.jsHeapUsedBytes / 1e6, 1),
+      jsHeapUsedMbAfter: after.jsHeapUsedBytes === null ? null : round(after.jsHeapUsedBytes / 1e6, 1),
+    };
+    log(`lod stress: ${JSON.stringify(this.lodStress)}`);
+    const run = cycles.filter((entry): entry is StressCycle => !isNotDriven(entry));
+    this.judge("stress.noUncaughtErrors", "the level-of-detail stress raises no uncaught page error and no unhandled rejection", errors.uncaughtErrors === 0 && errors.uncaughtRejections === 0, `${errors.uncaughtErrors} uncaught errors, ${errors.uncaughtRejections} unhandled rejections: ${JSON.stringify(errors.uncaughtSample)}`, "0");
+    this.judge("stress.consoleErrors", "the level-of-detail stress emits no console error", errors.consoleErrors === 0, `${errors.consoleErrors}: ${JSON.stringify(errors.consoleErrorSample)}`, "0");
+    this.verdict(
+      "stress.validationErrors",
+      errors.gpuValidationErrors <= THRESHOLDS.gpuValidationErrorsMax ? "PASS" : "FAIL",
+      "the level-of-detail stress raises no uncaptured WebGPU validation error",
+      `${errors.gpuValidationErrors} uncaptured errors: ${JSON.stringify(errors.gpuValidationSample)}`,
+      `<= ${THRESHOLDS.gpuValidationErrorsMax}`,
+    );
+    this.judge(
+      "stress.counterGrowth",
+      "the retired-pending and evicted counters do not grow past the cycle count",
+      monotonic === true,
+      `${run.length} cycles through the ${driver.name} driver, evicted ${String(evictedBefore)} -> ${String(evictedAfter)} (growth ${String(evictedGrowth)}), retired pending at the end ${String(retiredAfter)}`,
+      `<= ${LOD_STRESS_CYCLES} for both`,
+    );
+    this.judge("stress.cyclesRun", "every requested level-of-detail cycle ran", run.length === LOD_STRESS_CYCLES, `${run.length} of ${LOD_STRESS_CYCLES} cycles ran, ${cycles.length - run.length} recorded a reason instead`, `= ${LOD_STRESS_CYCLES}`);
+  }
+
+  /**
+   * The zoom path that moved the camera in the matrix, or null when none
+   * did. The wheel is preferred because it also crosses the LOD range in
+   * one gesture; the keyboard is the fallback.
+   */
+  private async chooseZoomDriver(): Promise<{ name: string; probe: string; presses: number } | null> {
+    const paths = this.zoomMatrix.paths;
+    if (!Array.isArray(paths)) return null;
+    for (const candidate of paths) {
+      if (isNotDriven(candidate)) continue;
+      if (candidate.movedZoom !== true) continue;
+      if (candidate.path === "line-wheel") return { name: "line-wheel", probe: "wheel", presses: 0 };
+      if (candidate.path === "keyboard-zoom-in") return { name: "keyboard-zoom", probe: "key", presses: 0 };
+    }
+    return null;
+  }
+
+  private async applyZoomDriver(driver: { name: string; probe: string }, direction: "in" | "out", presses: number): Promise<unknown> {
+    if (driver.probe === "key") {
+      const key = direction === "in" ? ["Equal", "="] : ["Minus", "-"];
+      return this.mcp.evaluate(`(${KEY_BURST_PROBE})(${JSON.stringify(key[0])}, ${JSON.stringify(key[1])}, ${presses})`, 60_000);
+    }
+    const deltaY = direction === "in" ? -3 : 3;
+    return this.mcp.evaluate(`(${WHEEL_BURST_PROBE})(1, ${deltaY}, ${presses}, 0.5, 0.5)`, 60_000);
+  }
+
+  /**
+   * Frame cost under continuous navigation, in the same shape as the
+   * other summarise() outputs so a before and after run diffs key-wise.
+   */
+  private async renderCost(): Promise<void> {
+    log("=== render cost under continuous navigation ===");
+    this.renderCostSample = await this.measure("render-cost", "a real input dispatched on every animation frame, so every recorded frame is one the renderer actually produced", true);
+    const before = await this.tileRuntime();
+    const state = await this.matrixState();
+    const after = await this.tileRuntime();
+    this.judge("renderCost.resident", "the continuously navigated frame sample holds a resident tile set", isNumber(state?.loadedTileCount) && Number(state?.loadedTileCount) > 0, `data-loaded-tile-count ${String(state?.loadedTileCount ?? null)}, data-draw-calls ${String(state?.drawCalls ?? null)}, batch-count ${String(state?.batchCount ?? null)}`, "> 0 loaded tiles");
+    this.verdict(
+      "renderCost.heap",
+      this.renderCostSample.heapUsed === null ? "INCONCLUSIVE" : "PASS",
+      "the render cost sample reports the JS heap before and after the window",
+      this.renderCostSample.heapUsed === null ? "performance.memory is not exposed in this build" : `${String(summarise("render-cost", this.renderCostSample).jsHeapUsedMb)} MB used after the window, ${before.jsHeapUsedBytes === null ? null : round(before.jsHeapUsedBytes / 1e6, 1)} MB before the tile reads and ${after.jsHeapUsedBytes === null ? null : round(after.jsHeapUsedBytes / 1e6, 1)} MB after`,
+      "performance.memory or a stated reason",
+    );
   }
 
   /* ---------------- screenshots ---------------- */
@@ -1137,7 +1895,6 @@ class RuntimeRun {
       this.judge("scene.canvas", "the WebGPU canvas is present at the viewport origin", Number(this.canvas.cssWidth) === VIEWPORT.w && Number(this.canvas.cssHeight) === VIEWPORT.h && Number(this.canvas.cssLeft) === 0 && Number(this.canvas.cssTop) === 0, `css ${String(this.canvas.cssWidth)}x${String(this.canvas.cssHeight)} at ${String(this.canvas.cssLeft)},${String(this.canvas.cssTop)}`, `1440x900 at 0,0`);
       this.judge("scene.canvasBacking", "the canvas backing store equals the CSS box times devicePixelRatio", Math.abs(Number(this.canvas.backingWidth) - Number(this.canvas.cssWidth) * dpr) <= 1 && Math.abs(Number(this.canvas.backingHeight) - Number(this.canvas.cssHeight) * dpr) <= 1, `backing ${String(this.canvas.backingWidth)}x${String(this.canvas.backingHeight)} for css ${String(this.canvas.cssWidth)}x${String(this.canvas.cssHeight)} at dpr ${dpr} (${backing} pixels)`, "within 1 px of css * dpr");
     }
-    const perKind = null;
     this.verdict(
       "scene.perKindCounters",
       "the per-kind feature counters in #scene-diagnostics are reported as an observation, not a pass",
@@ -1396,6 +2153,16 @@ class RuntimeRun {
       this.steps.push({ name: "right-click-context-menu", ok: false, detail: `${attempts.length} candidate points tried, none produced a feature context menu: ${JSON.stringify(attempts)}` });
     }
 
+    log("=== orientation baseline ===");
+    this.orientationBaseline = orientationOf(await this.matrixState());
+    log(`orientation baseline: ${JSON.stringify(this.orientationBaseline)}`);
+
+    await this.zoomInputMatrix();
+    await this.headingMatrix();
+    await this.dragPanIntegrity();
+    await this.lodStressRun();
+    await this.renderCost();
+
     log("=== final accounting ===");
     this.finalDiagnostics = await this.diagnostics();
     this.finalCamera = await this.camera();
@@ -1422,6 +2189,7 @@ class RuntimeRun {
   }
 
   private summary(): Record<string, unknown> {
+    const diag: Diagnostics = this.finalDiagnostics;
     return {
       tool: "scripts/chrome/verify-runtime.ts",
       wave: "wave5",
@@ -1440,19 +2208,19 @@ class RuntimeRun {
       adapter: this.adapter,
       canvas: this.canvas,
       renderer: {
-        status: (this.finalDiagnostics ?? {})["data-renderer-status"] ?? null,
-        backend: (this.finalDiagnostics ?? {})["data-backend"] ?? null,
-        rendererError: (this.finalDiagnostics ?? {})["data-renderer-error"] ?? null,
-        loadedTileCount: Number((this.finalDiagnostics ?? {})["data-loaded-tile-count"] ?? "0"),
-        loadedFeatureCount: Number((this.finalDiagnostics ?? {})["data-loaded-feature-count"] ?? "0"),
-        drawCalls: Number((this.finalDiagnostics ?? {})["data-draw-calls"] ?? "0"),
+        status: diag["data-renderer-status"] ?? null,
+        backend: diag["data-backend"] ?? null,
+        rendererError: diag["data-renderer-error"] ?? null,
+        loadedTileCount: Number(diag["data-loaded-tile-count"] ?? "0"),
+        loadedFeatureCount: Number(diag["data-loaded-feature-count"] ?? "0"),
+        drawCalls: Number(diag["data-draw-calls"] ?? "0"),
         perKind: {
-          buildings: Number((this.finalDiagnostics ?? {})["data-building-count"] ?? "0"),
-          roads: Number((this.finalDiagnostics ?? {})["data-road-count"] ?? "0"),
-          water: Number((this.finalDiagnostics ?? {})["data-water-count"] ?? "0"),
-          landuse: Number((this.finalDiagnostics ?? {})["data-landuse-count"] ?? "0"),
-          businesses: Number((this.finalDiagnostics ?? {})["data-business-count"] ?? "0"),
-          pois: Number((this.finalDiagnostics ?? {})["data-poi-count"] ?? "0"),
+          buildings: Number(diag["data-building-count"] ?? "0"),
+          roads: Number(diag["data-road-count"] ?? "0"),
+          water: Number(diag["data-water-count"] ?? "0"),
+          landuse: Number(diag["data-landuse-count"] ?? "0"),
+          businesses: Number(diag["data-business-count"] ?? "0"),
+          pois: Number(diag["data-poi-count"] ?? "0"),
         },
         camera: this.finalCamera,
       },
@@ -1461,7 +2229,19 @@ class RuntimeRun {
         overview: summarise("overview", this.overviewSample),
         searchFocus: summarise("search-focus", this.focusSample),
         interaction: summarise("interaction", this.interactionSample),
+        renderCost: summarise("render-cost", this.renderCostSample),
       },
+      orientation: {
+        baseline: this.orientationBaseline,
+        observable: this.orientationBaseline.observable,
+        northUpAttribute: ORIENTATION_ATTRIBUTE,
+        eastRightAttribute: EAST_RIGHT_ATTRIBUTE,
+        yScaleAttribute: Y_SCALE_ATTRIBUTE,
+      },
+      zoomInputMatrix: this.zoomMatrix,
+      headingMatrix: this.headingMatrixResult,
+      dragPanIntegrity: this.dragPan,
+      lodStress: this.lodStress,
       tiles: {
         http: this.tileHttp,
         app: this.tileApp,
