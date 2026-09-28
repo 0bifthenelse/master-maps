@@ -40,10 +40,14 @@ Every accepted merge retains unique source references. Losing scalar values crea
 
 ## Stable IDs
 
-A durable source identifier is preferred. Canonical IDs include the source family and source identifier, for example `ign-bdtopo:building/<cleabs>`, `osm-bulk:way/<id>`, `ban:<id>`, and `sirene:<siret>`. A deterministic content hash is used only when no durable identifier exists. Tile fragments append `@<tile-id>` to the fragment identity while retaining the canonical stable ID as the parent identity.
+A durable source identifier is preferred. Canonical IDs include the source family and source identifier, for example `ign-bdtopo:building/<cleabs>`, `osm-bulk:<id>`, `ban:<id>`, and `sirene:<siret>`. A deterministic content hash is used only when no durable identifier exists. Tile fragments append `@<tile-id>` to the fragment identity while retaining the canonical stable ID as the parent identity.
+
+The source manifest marks the cadastre acquisitions with `mergedIntoCanonicalData: false`, so cadastre records stay out of the canonical store. The cadastre parity record in `data/qa/cadastre-parity.json` is the independent comparison for building outlines.
 
 ## Evidence and limits
 
 The current generated volume is authoritative only for the acquisition recorded in `data/manifests/sources.json` and `data/generated/manifest.json`. Optional sources can be unavailable without implying zero data. The coverage report and spatial QA report are the evidence for feature counts, tile budgets, source failures, CRS residuals, and scene-input checks.
+
+The evidence does not fully account the store. `data/qa/source-reconciliation-audit.json` records an unattributed residual of 941 659 records, and `data/qa/validation-report.json` matches no kind between the generated store and the coverage manifest. Treat both as open residuals rather than as a reconciled total.
 
 Google geometry, tiles, imagery, and bulk Places data are not used as map sources. OpenStreetMap is the external visual comparison reference, not a redistributed dependency.

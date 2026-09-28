@@ -40,10 +40,13 @@ The refresh fails when required acquisition or generation data is absent. Option
 - `data/manifests/coverage.json` records feature counts, source counts, and measured tile budgets.
 - `data/generated/manifest.json` records territory, CRS, render origin, LOD levels, and local tile bounds.
 - `data/generated/tile-manifest.json` records each tile, feature count, fragment IDs, and payload bytes.
-- `data/generated/tile-metrics.json` records maximum, median, and p95 payload bytes by LOD.
+- `data/generated/tile-metrics.json` records maximum, median, and p95 payload bytes by LOD, split between the render payload and the metadata sidecar.
 - `data/search/index.json` records canonical searchable feature IDs, focus coordinates, and detailed tile IDs.
 - `data/qa/spatial-report.json` records distributed samples, worst errors, offending IDs, source statistics, and render preparation counts.
+- `data/qa/validation-report.json` records the parsed feature and tile totals, the issues found, and the reconciliation against the coverage manifest.
 - `data/qa/scene-geometry-debug.json` exports bounded Three.js geometry snapshots from the scene builders.
+
+The reports in `data/qa` are written by standalone scripts, not by `npm run data:refresh`: `scripts/data/qa-coverage-report.ts`, `scripts/data/qa-stratified.ts`, `scripts/data/reconcile-audit.ts`, `scripts/data/reconcile-sources.ts`, and `scripts/data/parity-osm.ts`. Only `qa-spatial.ts` runs inside the refresh.
 
 ## Spatial QA thresholds
 
@@ -59,6 +62,6 @@ All served LOD tiles stay below the 2 MiB payload ceiling. LOD0 targets about 1 
 
 ## Browser roles
 
-Moli provides browser navigation, DOM inspection, request counts, search, pan, zoom, reset, keyboard, and OpenStreetMap navigation through its official CDP server skill. Moli does not prove hardware WebGPU pixels.
+`scripts/moli/run-e2e.ts` provides browser navigation, DOM inspection, request counts, search, pan, zoom, reset, keyboard, and OpenStreetMap navigation. It does not prove hardware WebGPU pixels.
 
 Installed Chrome provides the visual oracle. `run-verification.ts` checks the real adapter, renderer initialization, draw calls, visible feature counts, console errors, page errors, and screenshots. `compare-osm.ts` captures Master Maps and current OpenStreetMap at matching WGS84 locations and equivalent ground spans.

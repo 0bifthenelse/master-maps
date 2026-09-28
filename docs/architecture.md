@@ -38,7 +38,11 @@ Roads use separate tunnel, normal, and bridge strata. Strata render in determini
 
 LOD0 keeps source-faithful detail. LOD1 removes small buildings, minor paths, and subpixel points, then simplifies surviving geometry with a two metre tolerance. LOD2 keeps the boundary, major roads, primary hydrography, important land use, and settlement or landmark labels with a 25 metre tolerance. LOD0 geometry is never replaced by generalized geometry.
 
-Every served tile stays below the two MiB payload ceiling. LOD0 targets about one MiB and adaptively subdivides dense tiles. The build writes per-LOD maximum, median, and p95 byte metrics.
+Every served tile stays below the two MiB payload ceiling. LOD0 targets about one MiB and adaptively subdivides dense tiles. The build writes per-LOD maximum, median, and p95 byte metrics, split between the render payload and the metadata sidecar.
+
+## Render tile format
+
+`src/lib/render/codec.ts` owns the MMT1 container: a 12-byte prefix holding the `0x4d4d5431` magic and a format version, a JSON header, and one contiguous payload slab. `planLayer()` validates that indices are a multiple of three, that ranges cover every index contiguously, and that each range records its index start, index count, and metadata index. The worker transfers one `ArrayBuffer`; the main thread rebuilds typed-array views over the slab without copying it. See `src/lib/render/buildRenderTile.ts` and `src/lib/render/sceneFromDecoded.ts`.
 
 ## Client streaming
 
@@ -46,9 +50,12 @@ The client loads the manifest and search index first. Initial streaming selects 
 
 In-flight requests live in a separate map from loaded tiles. A changed desired key aborts only stale requests. The previous working set stays visible until one replacement tile arrives. The client then prunes tiles outside the new working set. Search loads its detailed target tile directly and focuses through local geometry.
 
+GPU resources are per tile and per layer. `src/lib/render/tileGpuCache.ts` evicts in least-recently-used order once the byte budget is exceeded, and `src/components/map/CityScene.tsx` owns the scene groups. A geometry disposal is queued rather than run inline: the cache holds the entry, and the scene releases it from an animation frame once no group still references it.
+
 ## API surface
 
 - `GET /api/map/manifest` returns a Zod-validated dataset manifest with LOD and tile metadata.
+- `GET /api/map/render/{tileId}` returns one MMT1 render tile with its metadata sidecar.
 - `GET /api/map/tile/{tileId}` returns a Zod-validated `TileData` envelope.
 - `GET /api/map/search?q={query}` returns Zod-validated canonical search records.
 
@@ -56,6 +63,6 @@ The routes read only the configured generated data root. Tile identifiers reject
 
 ## Verification
 
-Moli provides CDP browser navigation, DOM inspection, request observation, search, pan, zoom, and OpenStreetMap navigation. Moli is not the pixel oracle for WebGPU.
+`scripts/moli/run-e2e.ts` drives browser navigation, DOM inspection, request observation, search, pan, zoom, and OpenStreetMap navigation. It is not the pixel oracle for WebGPU.
 
-`scripts/chrome/run-verification.ts` launches installed Chrome with the real GPU path, verifies `navigator.gpu`, initializes `WebGPURenderer`, checks draw and visible feature counts, and captures screenshots. It never disables GPU or uses a WebGL fallback.
+`scripts/chrome/run-verification.ts` launches installed Chrome with the real GPU path, verifies `navigator.gpu`, initializes `WebGPURenderer`, checks draw and visible feature counts, and captures screenshots. It never disables GPU or uses a WebGL fallback. Its last recorded result is `data/qa/runtime-verification.json`.
