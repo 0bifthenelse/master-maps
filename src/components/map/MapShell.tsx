@@ -511,7 +511,7 @@ export default function MapShell() {
     setDetailError(null);
     loadTileMeta(selectedFeature.tileId, controller.signal)
       .then((tile) => {
-        const record = tile.features.find((feature) => feature.stableId === selectedFeature.stableId);
+        const record = tile.features.find((feature) => feature.stableId === selectedFeature.stableId || feature.fragmentId === selectedFeature.stableId);
         if (record === undefined) {
           setDetailError("Détail introuvable");
           return;

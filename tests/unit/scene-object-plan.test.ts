@@ -16,6 +16,7 @@ import {
   buildMergedBatchBuffers,
   buildMergedBatchGeometry,
   chunkKeyFor,
+  mergedPickAnchor,
   planTileObjects,
   resolveMergedIndexPick,
   resolveMergedPointPick,
@@ -211,7 +212,7 @@ describe("scene object plan", () => {
         expect(hit!.tileId).toBe(contributor.tileId);
         expect(hit!.layerId).toBe(layerId);
         expect(hit!.faceIndex).toBe(coveringRangeRow(ranges, face));
-        expect(hit!.stableId).toBe(pickStableId(getTileCacheEntry(contributor.tileId)!, layerId, hit!.faceIndex));
+        expect(hit!.stableId).toBe(pickStableId(getTileCacheEntry(contributor.tileId)!, layerId, face));
       }
       expect(resolveMergedIndexPick(filled, filledGeometry, contributor.indexCount)).toBeNull();
     }
@@ -328,5 +329,105 @@ describe("scene object plan", () => {
       }
       expect(resolveMergedIndexPick(plan, geometry, geometry.getIndex()!.count)).toBeNull();
     }
+  });
+});
+
+describe("merged pick anchors", () => {
+  const SURFACE_TILES = ["l2_0_0", "l2_1_0"] as const;
+
+  function mergedPlan(layerId: RenderLayerId) {
+    const sources = sourcesFor(SURFACE_TILES, [layerId]);
+    const plan = planTileObjects(sources, NO_HIDDEN_LAYERS)[0]!;
+    return { sources, plan, geometry: buildMergedBatchGeometry(plan, geometryFor(sources, plan)) };
+  }
+
+  function ownerOf(plan: SceneObjectPlan, hitIndex: number, anchor: "index" | "vertex") {
+    const owner = plan.contributors.find((contributor) => hitIndex >= (anchor === "index" ? contributor.indexOffset : contributor.vertexOffset)
+      && hitIndex < (anchor === "index" ? contributor.indexOffset + contributor.indexCount : contributor.vertexOffset + contributor.vertexCount));
+    if (owner === undefined) throw new Error(`no contributor owns merged ${anchor} ${hitIndex}`);
+    return owner;
+  }
+
+  it("resolves every triangle of a merged surface batch from the face index a mesh reports", () => {
+    const layerId: RenderLayerId = "buildings";
+    const { sources, plan, geometry } = mergedPlan(layerId);
+    expect(plan.objectKind).toBe("mesh");
+    expect(plan.contributors).toHaveLength(SURFACE_TILES.length);
+    const triangleCount = geometry.getIndex()!.count / 3;
+    expect(triangleCount).toBeGreaterThan(0);
+
+    for (let triangle = 0; triangle < triangleCount; triangle += 1) {
+      const hitIndex = mergedPickAnchor("mesh", { faceIndex: triangle })!;
+      expect(hitIndex).toBe(triangle * 3);
+      const hit = resolveMergedIndexPick(plan, geometry, hitIndex);
+      expect(hit, `merged triangle ${triangle} is unresolvable`).not.toBeNull();
+      const owner = ownerOf(plan, hitIndex, "index");
+      expect(hit!.tileId).toBe(owner.tileId);
+      const sourceIndex = hitIndex - owner.indexOffset;
+      const ranges = sourceLayer(sources, owner.tileId, layerId).geometry.getAttribute("featureRange");
+      expect(hit!.faceIndex).toBe(coveringRangeRow(ranges, sourceIndex));
+      expect(hit!.stableId).toBe(pickStableId(getTileCacheEntry(owner.tileId)!, layerId, sourceIndex));
+      expect(hit!.stableId).toBe(stableIdFor(layerId, hit!.faceIndex));
+    }
+  });
+
+  it("resolves a hairline batch from the even index slots a lineSegments reports", () => {
+    const layerId: RenderLayerId = "boundary";
+    const { sources, plan, geometry } = mergedPlan(layerId);
+    expect(plan.objectKind).toBe("lineSegments");
+    const indexCount = geometry.getIndex()!.count;
+    expect(indexCount % 2).toBe(0);
+
+    for (let slot = 0; slot < indexCount - 1; slot += 2) {
+      const hitIndex = mergedPickAnchor("lineSegments", { index: slot })!;
+      expect(hitIndex).toBe(slot);
+      const hit = resolveMergedIndexPick(plan, geometry, hitIndex);
+      expect(hit, `merged segment ${slot} is unresolvable`).not.toBeNull();
+      const owner = ownerOf(plan, hitIndex, "index");
+      expect(hit!.tileId).toBe(owner.tileId);
+      const ranges = sourceLayer(sources, owner.tileId, layerId).geometry.getAttribute("featureRange");
+      expect(hit!.faceIndex).toBe(coveringRangeRow(ranges, hitIndex - owner.indexOffset));
+      expect(hit!.stableId).toBe(stableIdFor(layerId, hit!.faceIndex));
+    }
+  });
+
+  it("resolves a point batch from the vertex index a points object reports", () => {
+    const layerId: RenderLayerId = "poi";
+    const { sources, plan, geometry } = mergedPlan(layerId);
+    expect(plan.objectKind).toBe("points");
+    expect(plan.pickIndexKind).toBe("vertex");
+    expect(geometry.getIndex()).toBeNull();
+    const vertexTotal = plan.contributors.reduce((total, contributor) => total + contributor.vertexCount, 0);
+    expect(vertexTotal).toBeGreaterThan(0);
+
+    for (let vertex = 0; vertex < vertexTotal; vertex += 1) {
+      const hitIndex = mergedPickAnchor("points", { index: vertex })!;
+      expect(hitIndex).toBe(vertex);
+      const hit = resolveMergedPointPick(plan, hitIndex);
+      expect(hit, `merged poi vertex ${vertex} is unresolvable`).not.toBeNull();
+      const owner = ownerOf(plan, hitIndex, "vertex");
+      expect(hit!.tileId).toBe(owner.tileId);
+      expect(hit!.vertexIndex).toBe(vertex - owner.vertexOffset);
+      expect(hit!.stableId).toBe(stableIdFor(layerId, hit!.vertexIndex));
+    }
+  });
+
+  it("returns null for an anchor the merged buffers do not cover", () => {
+    const { plan, geometry } = mergedPlan("buildings");
+    const indexCount = geometry.getIndex()!.count;
+    expect(resolveMergedIndexPick(plan, geometry, -1)).toBeNull();
+    expect(resolveMergedIndexPick(plan, geometry, indexCount)).toBeNull();
+    expect(resolveMergedIndexPick(plan, geometry, Number.NaN)).toBeNull();
+    expect(resolveMergedIndexPick(plan, geometry, 1.5)).toBeNull();
+    expect(mergedPickAnchor("mesh", { faceIndex: indexCount / 3 })).toBe(indexCount);
+
+    const pointPlan = mergedPlan("poi");
+    const vertexTotal = pointPlan.plan.contributors.reduce((total, contributor) => total + contributor.vertexCount, 0);
+    expect(resolveMergedPointPick(pointPlan.plan, -1)).toBeNull();
+    expect(resolveMergedPointPick(pointPlan.plan, vertexTotal)).toBeNull();
+
+    expect(mergedPickAnchor("mesh", {})).toBeNull();
+    expect(mergedPickAnchor("lineSegments", { faceIndex: 0 })).toBeNull();
+    expect(mergedPickAnchor("points", { faceIndex: 0 })).toBeNull();
   });
 });

@@ -1,15 +1,21 @@
 import { BufferAttribute, BufferGeometry } from "three";
-import { tileLayerGeometry } from "@/lib/render/tileGpuCache";
+import { getTileCacheEntry, tileLayerGeometry } from "@/lib/render/tileGpuCache";
 import type { RenderLayerId } from "@/lib/render/codec";
 import { LAYER_OBJECT_KINDS, ORDERED_RENDER_LAYER_IDS } from "@/lib/render/sceneFromDecoded";
-import { getTileCacheEntry, pickStableId } from "@/lib/render/tileGpuCache";
 
 export type BatchObjectKind = (typeof LAYER_OBJECT_KINDS)[RenderLayerId];
 
 /** A point object is drawn from its vertex buffer, every other kind from its index buffer. */
 export type PickIndexKind = "vertex" | "index";
 
+/** The addressable fields one three.js raycast reports, each present for one object kind only. */
+export interface RaycastAnchor {
+  index?: number | null;
+  faceIndex?: number | null;
+}
+
 const POSITION_COMPONENTS = 3;
+const INDICES_PER_TRIANGLE = 3;
 const RANGE_COMPONENTS = 3;
 const TILE_GRID_ID = /^l(\d+)_(-?\d+)_(-?\d+)/;
 const WHOLE_MAP_CHUNK = "whole-map";
@@ -103,6 +109,13 @@ export function layerHidden(layerId: RenderLayerId, layers: Record<string, boole
   if (layerId === "place") return layers.places === false;
   if (layerId === "boundary") return layers.boundary === false;
   return false;
+}
+
+/** The merged index-buffer slot, or vertex for a point batch, that a raycast points at. */
+export function mergedPickAnchor(objectKind: BatchObjectKind, anchor: RaycastAnchor): number | null {
+  if (objectKind === "points" || objectKind === "lineSegments") return anchor.index ?? null;
+  // A mesh reports a triangle ordinal, while every merged range counts index-buffer entries.
+  return anchor.faceIndex == null ? null : anchor.faceIndex * INDICES_PER_TRIANGLE;
 }
 
 /** Layers merge when they share a material instance, an object kind and an attribute layout. */
@@ -239,52 +252,54 @@ export function buildMergedBatchGeometry(plan: SceneObjectPlan, sources: Readonl
   return geometry;
 }
 
-function mergedRangeRow(geometry: BufferGeometry, contributor: BatchContributor, faceIndex: number): number {
+/** Range starts are absolute in the merged index buffer, so the probe is absolute too. */
+function mergedRangeRow(geometry: BufferGeometry, contributor: BatchContributor, hitIndex: number): number {
   const ranges = geometry.getAttribute("featureRange") as BufferAttribute | undefined;
   if (ranges === undefined) return -1;
   for (let row = contributor.rangeOffset; row < contributor.rangeOffset + contributor.rangeCount; row += 1) {
     const start = ranges.getX(row);
-    if (faceIndex >= start && faceIndex < start + ranges.getY(row)) return row;
+    if (hitIndex >= start && hitIndex < start + ranges.getY(row)) return row;
   }
   return -1;
 }
 
 /**
  * The stableId of a source feature, resolved through the untouched geometry
- * the tile cache still owns. Merged copies stay self-describing, and no
- * assumption is made about how the cache indexes its stableId list.
+ * the tile cache still owns. A point layer is addressed by vertex, every
+ * other layer by an index-buffer slot, which is the unit the codec's feature
+ * ranges and pickStableId both count in.
  */
-function sourceStableId(tileId: string, layerId: RenderLayerId, faceIndex: number, isPointLayer: boolean): string | undefined {
+function sourceStableId(tileId: string, layerId: RenderLayerId, sourceIndex: number, isPointLayer: boolean): string | undefined {
   const geometry = tileLayerGeometry(tileId, layerId);
   if (geometry === undefined) return undefined;
   const entry = getTileCacheEntry(tileId);
   if (entry === undefined) return undefined;
-  if (isPointLayer) {
-    const ranges = geometry.getAttribute("featureRange") as BufferAttribute | undefined;
-    if (ranges === undefined || faceIndex >= ranges.count) return undefined;
-    return entry.stableIds[ranges.getZ(faceIndex)];
-  }
   const ranges = geometry.getAttribute("featureRange") as BufferAttribute | undefined;
   if (ranges === undefined) return undefined;
+  if (isPointLayer) {
+    if (sourceIndex >= ranges.count) return undefined;
+    return entry.stableIds[ranges.getZ(sourceIndex)];
+  }
   for (let row = 0; row < ranges.count; row += 1) {
     const start = ranges.getX(row);
-    if (faceIndex >= start && faceIndex < start + ranges.getY(row)) return entry.stableIds[ranges.getZ(row)];
+    if (sourceIndex >= start && sourceIndex < start + ranges.getY(row)) return entry.stableIds[ranges.getZ(row)];
   }
-  return pickStableId(entry, layerId, faceIndex);
+  return undefined;
 }
 
 /**
  * Translate a raycast hit on a merged indexed buffer. A mesh reports the
- * triangle it pierced and a lineSegments reports the even index of the
- * segment it pierced, so both are positions in the merged index buffer and
- * both land inside the source feature range that owns them.
+ * triangle it pierced, a lineSegments reports the even index of the segment
+ * it pierced, so both arrive here already as positions in the merged index
+ * buffer and both must land inside the source feature range owning them.
  */
 export function resolveMergedIndexPick(plan: SceneObjectPlan, geometry: BufferGeometry, hitIndex: number): MergedIndexPick | null {
-  if (!Number.isFinite(hitIndex)) return null;
+  if (!Number.isInteger(hitIndex) || hitIndex < 0) return null;
+  if (hitIndex >= (geometry.getIndex()?.count ?? 0)) return null;
   const contributor = contributorFor(plan.contributors, hitIndex, "index");
   if (contributor === undefined) return null;
-  const faceIndex = hitIndex - contributor.indexOffset;
-  const row = mergedRangeRow(geometry, contributor, faceIndex);
+  const sourceIndex = hitIndex - contributor.indexOffset;
+  const row = mergedRangeRow(geometry, contributor, hitIndex);
   if (row < 0) return null;
   return {
     tileId: contributor.tileId,
@@ -292,13 +307,15 @@ export function resolveMergedIndexPick(plan: SceneObjectPlan, geometry: BufferGe
     isPointLayer: contributor.isPointLayer,
     hitIndex,
     faceIndex: row - contributor.rangeOffset,
-    stableId: sourceStableId(contributor.tileId, contributor.layerId, row - contributor.rangeOffset, contributor.isPointLayer),
+    stableId: sourceStableId(contributor.tileId, contributor.layerId, sourceIndex, contributor.isPointLayer),
   };
 }
 
 /** Translate a raycast hit on a merged point buffer back to its source vertex. */
 export function resolveMergedPointPick(plan: SceneObjectPlan, hitIndex: number): MergedPointPick | null {
-  if (!Number.isFinite(hitIndex)) return null;
+  if (!Number.isInteger(hitIndex) || hitIndex < 0) return null;
+  const vertexTotal = plan.contributors.reduce((total, contributor) => total + contributor.vertexCount, 0);
+  if (hitIndex >= vertexTotal) return null;
   const contributor = contributorFor(plan.contributors, hitIndex, "vertex");
   if (contributor === undefined) return null;
   const vertexIndex = hitIndex - contributor.vertexOffset;

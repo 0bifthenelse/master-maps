@@ -27,6 +27,7 @@ import type { RenderLayerId } from "@/lib/render/codec";
 import {
   buildBatches,
   hasPosition,
+  mergedPickAnchor,
   planTileObjects,
   resolveMergedIndexPick,
   resolveMergedPointPick,
@@ -138,17 +139,21 @@ interface BatchNodeProps {
 }
 
 function BatchNode({ batch, onPick, onContextMenu }: BatchNodeProps) {
-  const resolveHit = (hitIndex: number): MergedIndexPick | MergedPointPick | null => batch.pickIndexKind === "vertex"
-    ? resolveMergedPointPick(batch, hitIndex)
-    : resolveMergedIndexPick(batch, batch.geometry, hitIndex);
+  const resolveHit = (event: ThreeEvent<MouseEvent>): MergedIndexPick | MergedPointPick | null => {
+    const hitIndex = mergedPickAnchor(batch.objectKind, event);
+    if (hitIndex === null) return null;
+    return batch.pickIndexKind === "vertex"
+      ? resolveMergedPointPick(batch, hitIndex)
+      : resolveMergedIndexPick(batch, batch.geometry, hitIndex);
+  };
   const handleClick = (event: ThreeEvent<MouseEvent>): void => {
     event.stopPropagation();
-    const hit = resolveHit(event.index ?? -1);
+    const hit = resolveHit(event);
     if (hit === null || hit.stableId === undefined) return;
     onPick(hit.tileId, hit.stableId);
   };
   const handleContextMenu = (event: ThreeEvent<MouseEvent>): void => {
-    const hit = resolveHit(event.index ?? -1);
+    const hit = resolveHit(event);
     if (hit === null || hit.stableId === undefined) return;
     event.stopPropagation();
     const native = event.nativeEvent;
