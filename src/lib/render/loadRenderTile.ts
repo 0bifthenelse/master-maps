@@ -5,6 +5,8 @@ import { disposeTileWorkerPool, getTileWorkerPool, type QueueStats } from './wor
 
 export const DEFAULT_RENDER_TILE_CACHE_BYTES = 256 * 1024 * 1024;
 
+const CACHE_KEY_SEPARATOR = '\u0000';
+
 export interface RenderTileCacheStats {
   entries: number;
   byteSize: number;
@@ -29,10 +31,20 @@ let hits = 0;
 let misses = 0;
 let evictions = 0;
 let currentGeneration = 0;
+let datasetVersion: string | undefined;
 
 export function configureRenderTileCache(options: { maxBytes?: number }): void {
   if (options.maxBytes !== undefined) maxCacheBytes = Math.max(1, options.maxBytes);
   evictToBudget();
+}
+
+/* A version bump retires every tile decoded from another dataset: both the cache and the in-flight deduplication are keyed on the version and are dropped when it changes. */
+export function configureRenderTileDatasetVersion(version: string | undefined): void {
+  if (version === datasetVersion) return;
+  datasetVersion = version;
+  cache.clear();
+  inFlight.clear();
+  cacheByteSize = 0;
 }
 
 export function getRenderTileCacheStats(): RenderTileCacheStats {
@@ -95,6 +107,12 @@ function evictToBudget(): void {
   }
 }
 
+export function renderTileRequestUrl(tileId: string, version: string | undefined): string {
+  const path = `/api/map/render/${encodeURIComponent(tileId)}`;
+  if (version === undefined || version.length === 0) return path;
+  return `${path}?v=${encodeURIComponent(version)}`;
+}
+
 function isAbortError(error: unknown): boolean {
   return typeof error === 'object' && error !== null && 'name' in error && error.name === 'AbortError';
 }
@@ -102,7 +120,7 @@ function isAbortError(error: unknown): boolean {
 async function fetchRenderTile(tileId: string, signal: AbortSignal | undefined): Promise<ArrayBuffer> {
   let response: Response;
   try {
-    response = await fetch(`/api/map/render/${encodeURIComponent(tileId)}`, { signal });
+    response = await fetch(renderTileRequestUrl(tileId, datasetVersion), { signal });
   } catch (error) {
     if (isAbortError(error)) throw error;
     throw new Error(`loadRenderTile: fetch failed for ${tileId}: ${error instanceof Error ? error.message : String(error)}`);
@@ -118,14 +136,16 @@ export async function loadRenderTile(tileId: string, signal?: AbortSignal): Prom
   if (!/^[a-zA-Z0-9_-]+$/.test(tileId) || tileId.includes('..')) {
     throw new Error(`loadRenderTile: invalid tileId "${tileId}"`);
   }
-  const cached = cache.get(tileId);
+  const version = datasetVersion;
+  const key = `${version ?? ''}${CACHE_KEY_SEPARATOR}${tileId}`;
+  const cached = cache.get(key);
   if (cached !== undefined) {
-    cache.delete(tileId);
-    cache.set(tileId, cached);
+    cache.delete(key);
+    cache.set(key, cached);
     hits += 1;
     return cached.tile;
   }
-  const pending = inFlight.get(tileId);
+  const pending = inFlight.get(key);
   if (pending !== undefined && signal?.aborted !== true) {
     hits += 1;
     return pending;
@@ -136,17 +156,19 @@ export async function loadRenderTile(tileId: string, signal?: AbortSignal): Prom
      stale before its bytes have even arrived, which cancelled most of a
      department load. */
   const request = fetchRenderTile(tileId, signal).then((buffer) => getTileWorkerPool().decode(tileId, buffer, currentGeneration));
-  inFlight.set(tileId, request);
+  inFlight.set(key, request);
   try {
     const tile = await request;
-    const byteSize = measuredTileBytes(tile);
-    cache.delete(tileId);
-    cache.set(tileId, { tile, byteSize });
-    cacheByteSize += byteSize;
-    evictToBudget();
+    if (version === datasetVersion) {
+      const byteSize = measuredTileBytes(tile);
+      cache.delete(key);
+      cache.set(key, { tile, byteSize });
+      cacheByteSize += byteSize;
+      evictToBudget();
+    }
     return tile;
   } finally {
-    if (inFlight.get(tileId) === request) inFlight.delete(tileId);
+    if (inFlight.get(key) === request) inFlight.delete(key);
   }
 }
 
