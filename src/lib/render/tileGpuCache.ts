@@ -124,6 +124,10 @@ function evictToBudget(): void {
     if (oldest.done) return;
     const [tileId, entry] = oldest.value;
     store.tiles.delete(tileId);
+    /* The decoded registry is the consumer-visible copy of the same tile, so
+       an entry dropped by the budget must leave it too; otherwise every slab
+       ever loaded stays strongly referenced and the budget bounds nothing. */
+    residentDecodedTiles.delete(tileId);
     store.byteSize -= entry.byteSize;
     recordEviction(tileId);
     retireEntry(entry);
@@ -248,9 +252,9 @@ export function putDecodedTile(tile: DecodedRenderTile): TileCacheEntry {
     }
     firstStableId += layerFeatures;
   }
-  if (layers.size === 0) {
-    throw new TileGpuCacheError(`tile ${view.tileId} produced no renderable layer geometry`);
-  }
+  /* A tile whose only layers are empty still gets an entry: an empty tile is a
+     legitimate answer for a region with no renderable feature, and treating it
+     as an error made the client retry it on every plan change. */
   const entry: TileCacheEntry = {
     tileId: view.tileId,
     lod: view.lod,

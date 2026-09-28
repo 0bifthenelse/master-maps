@@ -347,13 +347,21 @@ function planRetain(
   const retain = required.filter((entry) => resident.has(entry.tileId)).map((entry) => entry.tileId);
   const covers: string[] = [];
   const visibleFallback: string[] = [];
+  /* A finer resident tile is kept only while no tile of the selected level has
+     arrived at all, which is the blank-frame the coarse-until-ready rule
+     exists to prevent. Once the selected level is mounting, keeping every
+     finer tile that merely intersects the view accumulates a whole extra
+     working set per zoom round trip instead of replacing one level with the
+     next. */
+  const selectedLevelMounted = required.some((entry) => resident.has(entry.tileId));
+  const fallbackAllowed = required.length === 0 || !selectedLevelMounted;
   for (const entries of index.byLod) {
     for (const entry of entries) {
       if (!resident.has(entry.tileId) || requiredIds.has(entry.tileId)) continue;
       if (quad !== null && !tileIntersectsQuad(entry.bounds, quad)) continue;
       if (missing.some((target) => entry.lod > target.lod && contains(entry.bounds, target.bounds))) {
         covers.push(entry.tileId);
-      } else if (requireAll || missing.length > 0) {
+      } else if (fallbackAllowed) {
         visibleFallback.push(entry.tileId);
       }
     }

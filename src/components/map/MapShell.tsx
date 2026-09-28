@@ -296,38 +296,52 @@ export default function MapShell() {
   }, [runSearch, searchQuery]);
 
   useEffect(() => () => searchAbortRef.current?.abort(), []);
+  const evictStaleTiles = useCallback((): void => {
+    const plan = planRef.current;
+    if (plan === null) return;
+    const mount = new Set(plan.retain);
+    const staleIds: string[] = [];
+    for (const tileId of tileStateRef.current.slots.keys()) {
+      if (!mount.has(tileId) && !pinnedIdsRef.current.has(tileId)) staleIds.push(tileId);
+    }
+    if (staleIds.length === 0) return;
+    const diagnostics = tileRuntimeDiagnostics();
+    for (const tileId of staleIds) {
+      evictTile(tileId);
+      diagnostics.evicted.push(tileId);
+      if (diagnostics.evicted.length > TILE_EVICTION_DIAGNOSTIC_LIMIT) {
+        diagnostics.evicted.splice(0, diagnostics.evicted.length - TILE_EVICTION_DIAGNOSTIC_LIMIT);
+      }
+    }
+    applyTileState((previous) => {
+      const slots = new Map(previous.slots);
+      for (const tileId of staleIds) slots.delete(tileId);
+      return { slots, renderTileIds: [...slots.keys()].sort(), version: previous.version + 1 };
+    });
+  }, [applyTileState]);
+
+  /* Eviction is driven by the resident set, not by a plan change: returning to
+     a plan the app already published leaves the plan key untouched, so an
+     eviction owned by that effect would never run and stale finer tiles would
+     accumulate across every zoom round trip. */
   useEffect(() => {
     const plan = planRef.current;
     if (plan === null || !manifest) return;
-    const mount = new Set(plan.retain);
+    const mounted = plan.retain.filter(
+      (tileId) => tileStateRef.current.slots.has(tileId) && hasTileCacheEntry(tileId),
+    ).length;
+    if (mounted === plan.retain.length) evictStaleTiles();
+  }, [tileState, manifest, evictStaleTiles]);
+
+  useEffect(() => {
+    const plan = planRef.current;
+    if (plan === null || !manifest) return;
     const wanted = new Set([...plan.required, ...plan.prefetch]);
     for (const [tileId, controller] of inFlightRef.current) {
       if (wanted.has(tileId)) continue;
       controller.abort();
       inFlightRef.current.delete(tileId);
     }
-    const evictStaleTiles = (): void => {
-      const staleIds: string[] = [];
-      for (const tileId of tileStateRef.current.slots.keys()) {
-        if (!mount.has(tileId) && !pinnedIdsRef.current.has(tileId)) staleIds.push(tileId);
-      }
-      if (staleIds.length === 0) return;
-      const diagnostics = tileRuntimeDiagnostics();
-      for (const tileId of staleIds) {
-        evictTile(tileId);
-        diagnostics.evicted.push(tileId);
-        if (diagnostics.evicted.length > TILE_EVICTION_DIAGNOSTIC_LIMIT) {
-          diagnostics.evicted.splice(0, diagnostics.evicted.length - TILE_EVICTION_DIAGNOSTIC_LIMIT);
-        }
-      }
-      applyTileState((previous) => {
-        const slots = new Map(previous.slots);
-        for (const tileId of staleIds) slots.delete(tileId);
-        return { slots, renderTileIds: [...slots.keys()].sort(), version: previous.version + 1 };
-      });
-    };
-    const mountedCount = plan.retain.filter((tileId) => tileStateRef.current.slots.has(tileId) && hasTileCacheEntry(tileId)).length;
-    if (mount.size > 0 && mountedCount === mount.size) evictStaleTiles();
     const pending = [...plan.required, ...plan.prefetch].filter(
       (tileId) => !tileStateRef.current.slots.has(tileId) && !inFlightRef.current.has(tileId),
     );
