@@ -15,12 +15,24 @@ import { DatasetManifestSchema, type DatasetManifest } from "@/lib/data/schema";
 import { SearchHitSchema, SEARCH_MIN_QUERY_LENGTH, type SearchHit } from "@/lib/data/searchTypes";
 import { loadTileMeta } from "@/lib/data/loadTile";
 import type { SceneFeature } from "./CityScene";
-import { loadRenderTile, nextRenderTileGeneration } from "@/lib/render/loadRenderTile";
+import { loadRenderTile, configureRenderTileDatasetVersion } from "@/lib/render/loadRenderTile";
 import { evictTile, hasTileCacheEntry, putDecodedTile, resetTileGpuCache, getResidentDecodedTile } from "@/lib/render/tileGpuCache";
 import type { DecodedRenderTile } from "@/lib/render/codec";
 import { resolvePickedFeatureByStableId, type PickedFeature } from "@/lib/scene/highlight";
 import FeatureContextMenu, { attributeLabel, type FeatureContextMenuDetail } from "@/components/map/FeatureContextMenu";
 import FeatureHighlightLayer from "@/components/map/FeatureHighlightLayer";
+import {
+  MIN_CONCURRENCY,
+  createTileIndex,
+  isUsableViewport,
+  nextConcurrency,
+  planTiles,
+  resolveLod,
+  worldMetresPerPixel,
+  type SchedulerViewport,
+  type TileIndex,
+  type TilePlan,
+} from "./tileScheduler";
 
 const WebGPUCityCanvas = dynamic(() => import("@/components/map/WebGPUCityCanvas"), { ssr: false, loading: () => null });
 const CityScene = dynamic(() => import("@/components/map/CityScene"), { ssr: false, loading: () => null });
@@ -40,10 +52,21 @@ interface TileRuntimeDiagnostics {
   evicted: string[];
   reasons: Record<string, number>;
 }
+interface SchedulerDiagnostics {
+  lod: number;
+  concurrency: number;
+  sampleEvent: "fast" | "slow" | "steady";
+  planRequired: number;
+  planRetain: number;
+  planPrefetch: number;
+  resident: number;
+  indexCells: number;
+}
 
 declare global {
   interface Window {
     __masterMapsTileDiagnostics?: TileRuntimeDiagnostics;
+    __masterMapsSchedulerDiagnostics?: SchedulerDiagnostics;
   }
 }
 
@@ -57,9 +80,10 @@ function tileRuntimeDiagnostics(): TileRuntimeDiagnostics {
 
 const EMPTY_SCENE_FEATURES: SceneFeature[] = [];
 
-const TILE_LOAD_CONCURRENCY = 24;
 const TILE_EVICTION_DIAGNOSTIC_LIMIT = 512;
 const DATASET_BOUNDARY_TILE_ID = "boundary";
+const REQUIRED_HALO_METRES = 512;
+const STALE_SWAP_TIMEOUT_MS = 15000;
 const DEFAULT_LAYERS: LayerState = { ...BASE_LAYERS, commercialAudit: false };
 const LS_THEME_KEY = "map-theme";
 
@@ -75,42 +99,6 @@ function manifestBounds(manifest: DatasetManifest): [number, number, number, num
   ], tiles[0]!.bounds);
 }
 
-function lodForSpan(span: number): 0 | 1 | 2 {
-  if (span <= 12_000) return 0;
-  if (span <= 60_000) return 1;
-  return 2;
-}
-
-function enclosingBounds(viewport: ViewportSnapshot | null, bounds: [number, number, number, number]): [number, number, number, number] {
-  const target = viewport?.target ?? [(bounds[0] + bounds[2]) / 2, (bounds[1] + bounds[3]) / 2];
-  const zoom = Math.max(viewport?.zoom ?? 1, 1e-6);
-  const halfWidth = (viewport?.width ?? bounds[2] - bounds[0]) / zoom / 2;
-  const halfHeight = (viewport?.height ?? bounds[3] - bounds[1]) / zoom / 2;
-  const heading = viewport?.headingRadians ?? 0;
-  const cosine = Math.abs(Math.cos(heading));
-  const sine = Math.abs(Math.sin(heading));
-  const halfX = cosine * halfWidth + sine * halfHeight;
-  const halfZ = sine * halfWidth + cosine * halfHeight;
-  return [target[0] - halfX, target[1] - halfZ, target[0] + halfX, target[1] + halfZ];
-}
-
-function visibleTileIds(manifest: DatasetManifest, viewport: ViewportSnapshot | null): string[] {
-  const entries = manifest.tiles ?? [];
-  if (entries.length === 0) return [];
-  const datasetBounds = manifestBounds(manifest);
-  if (viewport === null) {
-    const lod = lodForSpan(Math.max(datasetBounds[2] - datasetBounds[0], datasetBounds[3] - datasetBounds[1]));
-    return entries.filter((entry) => entry.lod === lod).map((entry) => entry.tileId).sort();
-  }
-  const view = enclosingBounds(viewport, datasetBounds);
-  const span = Math.max(view[2] - view[0], view[3] - view[1]);
-  const lod = lodForSpan(span);
-  const candidates = entries.filter((entry) => entry.lod === lod);
-  const tileSize = candidates[0]?.bounds[2] !== undefined ? candidates[0].bounds[2] - candidates[0].bounds[0] : span;
-  const margin = tileSize;
-  const expanded: [number, number, number, number] = [view[0] - margin, view[1] - margin, view[2] + margin, view[3] + margin];
-  return candidates.filter((entry) => entry.bounds[0] <= expanded[2] && entry.bounds[2] >= expanded[0] && entry.bounds[1] <= expanded[3] && entry.bounds[3] >= expanded[1]).map((entry) => entry.tileId).sort();
-}
 
 type TileStateUpdate = (state: TileState) => TileState;
 
@@ -152,7 +140,7 @@ export default function MapShell() {
   const [datasetBoundaryReady, setDatasetBoundaryReady] = useState(false);
   const [searchHits, setSearchHits] = useState<SearchHit[]>([]);
   const [searchPending, setSearchPending] = useState(false);
-  const [desiredKey, setDesiredKey] = useState("");
+  const [planVersion, setPlanVersion] = useState(0);
   const [searchQuery, setSearchQuery] = useState("");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -160,13 +148,16 @@ export default function MapShell() {
   const [mobileInspectorOpen, setMobileInspectorOpen] = useState(false);
   const tileStateRef = useRef<TileState>(EMPTY_TILE_STATE);
   const inFlightRef = useRef<Map<string, AbortController>>(new Map());
-  const desiredIdsRef = useRef<string[]>([]);
-  const desiredGenerationRef = useRef(0);
   const viewportRef = useRef<ViewportSnapshot | null>(null);
-  const desiredKeyRef = useRef("");
+  const currentLodRef = useRef(0);
+  const planRef = useRef<TilePlan | null>(null);
+  const planKeyRef = useRef("");
+  const concurrencyRef = useRef(MIN_CONCURRENCY);
+  const pinnedIdsRef = useRef<Set<string>>(new Set());
   const searchAbortRef = useRef<AbortController | null>(null);
   const searchGenerationRef = useRef(0);
-  const showTileFailureRef = useRef(false);
+  const tileIndex = useMemo(() => createTileIndex(manifest?.tiles ?? []), [manifest]);
+  const datasetBounds = useMemo(() => manifest === null ? null : manifestBounds(manifest), [manifest]);
 
   const applyTileState = useCallback((update: TileStateUpdate): void => {
     setTileState((previous) => {
@@ -176,19 +167,58 @@ export default function MapShell() {
     });
   }, []);
 
-  const syncDesiredTiles = useCallback((source: DatasetManifest, snapshot: ViewportSnapshot | null): void => {
-    const ids = visibleTileIds(source, snapshot);
-    desiredIdsRef.current = ids;
-    const key = ids.join("|");
-    if (key === desiredKeyRef.current) return;
-    desiredKeyRef.current = key;
-    setDesiredKey(key);
+  const tileIndexRef = useRef<TileIndex>(createTileIndex([]));
+  const datasetBoundsRef = useRef<[number, number, number, number] | null>(null);
+
+  const publishPlan = useCallback((plan: TilePlan, canvas: { width: number; height: number } | null): void => {
+    planRef.current = plan;
+    const key = `${plan.lod}|${canvas?.width ?? 0}x${canvas?.height ?? 0}|${plan.required.join(",")}|${plan.prefetch.join(",")}`;
+    window.__masterMapsSchedulerDiagnostics = {
+      lod: plan.lod,
+      concurrency: concurrencyRef.current,
+      sampleEvent: "steady",
+      planRequired: plan.required.length,
+      planRetain: plan.retain.length,
+      planPrefetch: plan.prefetch.length,
+      resident: tileStateRef.current.slots.size,
+      indexCells: tileIndexRef.current.cells.length,
+    };
+    if (key === planKeyRef.current) return;
+    planKeyRef.current = key;
+    setPlanVersion((value) => value + 1);
   }, []);
+
+  const syncPlan = useCallback((snapshot: ViewportSnapshot | null, canvas: { width: number; height: number } | null): void => {
+    const bounds = datasetBoundsRef.current;
+    if (bounds === null) return;
+    const schedulerViewport: SchedulerViewport | null = snapshot === null ? null : {
+      target: snapshot.target,
+      zoom: snapshot.zoom,
+      frustumWidth: snapshot.width,
+      frustumHeight: snapshot.height,
+      headingRadians: snapshot.headingRadians,
+    };
+    if (schedulerViewport !== null && isUsableViewport(schedulerViewport)) {
+      currentLodRef.current = resolveLod(
+        worldMetresPerPixel(schedulerViewport, canvas?.width ?? 1, canvas?.height ?? 1),
+        currentLodRef.current,
+      );
+    }
+    publishPlan(planTiles({
+      viewport: schedulerViewport,
+      currentLod: currentLodRef.current,
+      resident: new Set(tileStateRef.current.slots.keys()),
+      index: tileIndexRef.current,
+      bounds,
+      halo: REQUIRED_HALO_METRES,
+    }), canvas);
+  }, [publishPlan]);
 
   const handleViewportChange = useCallback((snapshot: ViewportSnapshot): void => {
     viewportRef.current = snapshot;
-    if (manifest) syncDesiredTiles(manifest, snapshot);
-  }, [manifest, syncDesiredTiles]);
+    const canvas = document.getElementById("map-canvas-host");
+    syncPlan(snapshot, canvas === null ? null : { width: canvas.clientWidth, height: canvas.clientHeight });
+  }, [syncPlan]);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -200,6 +230,13 @@ export default function MapShell() {
   }, [theme]);
 
   useEffect(() => {
+    if (manifest === null) return;
+    tileIndexRef.current = tileIndex;
+    datasetBoundsRef.current = datasetBounds;
+    syncPlan(viewportRef.current, null);
+  }, [manifest, tileIndex, datasetBounds, syncPlan]);
+
+  useEffect(() => {
     const controller = new AbortController();
     const loadMetadata = async (): Promise<void> => {
       try {
@@ -207,8 +244,9 @@ export default function MapShell() {
         const manifestResponse = await fetch("/api/map/manifest", { signal: controller.signal, headers: { Accept: "application/json" } });
         if (!manifestResponse.ok) throw new Error(`Manifest load failed: ${manifestResponse.status}`);
         const parsedManifest = DatasetManifestSchema.parse(await manifestResponse.json() as unknown);
+        configureRenderTileDatasetVersion(parsedManifest.datasetVersion);
         setManifest(parsedManifest);
-        syncDesiredTiles(parsedManifest, viewportRef.current);
+        syncPlan(viewportRef.current, null);
         setWebGpuStatus(typeof navigator !== "undefined" && navigator.gpu ? "supported" : "unsupported");
         setLoading(false);
       } catch (cause) {
@@ -219,7 +257,7 @@ export default function MapShell() {
     };
     void loadMetadata();
     return () => controller.abort();
-  }, [syncDesiredTiles]);
+  }, [syncPlan]);
 
   const runSearch = useCallback(async (query: string): Promise<void> => {
     searchGenerationRef.current += 1;
@@ -258,36 +296,20 @@ export default function MapShell() {
   }, [runSearch, searchQuery]);
 
   useEffect(() => () => searchAbortRef.current?.abort(), []);
-
   useEffect(() => {
-    if (!manifest) return;
-    const desiredIds = desiredIdsRef.current;
-    const desired = new Set(desiredIds);
-    const generation = desiredGenerationRef.current + 1;
-    desiredGenerationRef.current = generation;
-    nextRenderTileGeneration();
-    let swapped = false;
-    let swapTimer: number | null = null;
+    const plan = planRef.current;
+    if (plan === null || !manifest) return;
+    const mount = new Set(plan.retain);
+    const wanted = new Set([...plan.required, ...plan.prefetch]);
     for (const [tileId, controller] of inFlightRef.current) {
-      if (desired.has(tileId)) continue;
+      if (wanted.has(tileId)) continue;
       controller.abort();
       inFlightRef.current.delete(tileId);
     }
-    const swapStaleTiles = (force = false): void => {
-      if (swapped || desiredGenerationRef.current !== generation) return;
-      const allDesiredResident = desiredIds.every(
-        (tileId) => tileStateRef.current.slots.has(tileId) && hasTileCacheEntry(tileId),
-      );
-      const hasGenerationRequests = desiredIds.some((tileId) => inFlightRef.current.has(tileId));
-      if (!force && !allDesiredResident && hasGenerationRequests) return;
-      swapped = true;
-      if (swapTimer !== null) {
-        window.clearTimeout(swapTimer);
-        swapTimer = null;
-      }
+    const evictStaleTiles = (): void => {
       const staleIds: string[] = [];
       for (const tileId of tileStateRef.current.slots.keys()) {
-        if (!desired.has(tileId)) staleIds.push(tileId);
+        if (!mount.has(tileId) && !pinnedIdsRef.current.has(tileId)) staleIds.push(tileId);
       }
       if (staleIds.length === 0) return;
       const diagnostics = tileRuntimeDiagnostics();
@@ -304,19 +326,25 @@ export default function MapShell() {
         return { slots, renderTileIds: [...slots.keys()].sort(), version: previous.version + 1 };
       });
     };
-    swapTimer = window.setTimeout(() => swapStaleTiles(true), 2500);
-    const pending = desiredIds.filter(
+    const mountedCount = plan.retain.filter((tileId) => tileStateRef.current.slots.has(tileId) && hasTileCacheEntry(tileId)).length;
+    if (mount.size > 0 && mountedCount === mount.size) evictStaleTiles();
+    const pending = [...plan.required, ...plan.prefetch].filter(
       (tileId) => !tileStateRef.current.slots.has(tileId) && !inFlightRef.current.has(tileId),
     );
+    if (pending.length === 0) return;
+    const safetyTimer = window.setTimeout(evictStaleTiles, STALE_SWAP_TIMEOUT_MS);
     let cursor = 0;
     const loadOne = async (tileId: string): Promise<void> => {
       const controller = new AbortController();
       inFlightRef.current.set(tileId, controller);
       tileRuntimeDiagnostics().requested.push(tileId);
-      const current = (): boolean => desiredGenerationRef.current === generation && desiredIdsRef.current.includes(tileId);
+      const startedAt = performance.now();
+      const live = (): boolean => wanted.has(tileId) && !controller.signal.aborted;
       try {
         const decoded = await loadRenderTile(tileId, controller.signal);
-        if (!current()) {
+        const decision = nextConcurrency(concurrencyRef.current, performance.now() - startedAt);
+        concurrencyRef.current = decision.concurrency;
+        if (!live()) {
           tileRuntimeDiagnostics().aborted.push(tileId);
           return;
         }
@@ -328,11 +356,10 @@ export default function MapShell() {
           tileRuntimeDiagnostics().aborted.push(tileId);
           return;
         }
-        if (!current()) {
+        if (!live()) {
           tileRuntimeDiagnostics().aborted.push(tileId);
           return;
         }
-        showTileFailureRef.current = true;
         tileRuntimeDiagnostics().failed.push(tileId);
         const reason = (cause instanceof Error ? `${cause.name}: ${cause.message}` : String(cause)).slice(0, 150);
         const bucket = tileRuntimeDiagnostics().reasons;
@@ -343,17 +370,20 @@ export default function MapShell() {
       }
     };
     const loadWorker = async (): Promise<void> => {
-      while (cursor < pending.length && desiredGenerationRef.current === generation) {
-        const tileId = pending[cursor++]!;
-        await loadOne(tileId);
+      while (cursor < pending.length) {
+        await loadOne(pending[cursor++]!);
       }
     };
-    const workers = Array.from({ length: Math.min(TILE_LOAD_CONCURRENCY, pending.length) }, () => loadWorker());
-    void Promise.all(workers).then(() => swapStaleTiles());
-    return () => {
-      if (swapTimer !== null) window.clearTimeout(swapTimer);
-    };
-  }, [manifest, desiredKey]);
+    const workers = Array.from({ length: Math.min(concurrencyRef.current, pending.length) }, () => loadWorker());
+    void Promise.all(workers).then(() => {
+      window.clearTimeout(safetyTimer);
+      const canvas = document.getElementById("map-canvas-host");
+      syncPlan(viewportRef.current, canvas === null ? null : { width: canvas.clientWidth, height: canvas.clientHeight });
+    });
+    return () => window.clearTimeout(safetyTimer);
+  }, [manifest, planVersion, applyTileState, syncPlan]);
+
+
 
   /* The department outline is a dataset-level artifact, not a per-tile
      fragment. It is decoded once through the worker pool and mounted as a
@@ -393,6 +423,7 @@ export default function MapShell() {
 
   const handleSearchResultSelect = useCallback(async (hit: SearchHit): Promise<void> => {
     let pick: PickedFeature | null = null;
+    pinnedIdsRef.current.add(hit.tileId);
     for (const slot of tileStateRef.current.slots.values()) {
       pick = resolvePickedFeatureByStableId(slot, hit.featureId);
       if (pick !== null) break;
@@ -538,7 +569,7 @@ export default function MapShell() {
     <div className="map-shell" data-theme={theme}>
       {loading ? <div className="map-shell__loading" style={{ position: "absolute", inset: 0, zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center" }}><LoadingState /></div> : null}
       {hasCriticalError && !loading ? <div className="map-shell__error"><h2>Impossible de charger la carte</h2><p>{error}</p><code>npm run data:refresh</code></div> : null}
-      <div className="map-shell__canvas">
+      <div className="map-shell__canvas" id="map-canvas-host">
         {!hasCriticalError && manifest && webGpuStatus === "supported" ? (
           <WebGPUCityCanvas bounds={manifestBounds(manifest)} cameraFocus={cameraFocus} cameraReset={cameraReset} onCameraMoved={handleCameraMoved} onViewportChange={handleViewportChange}>
             <CityScene features={EMPTY_SCENE_FEATURES} layers={layers} tileIds={sceneTileIds} onPick={handleRenderPick} onContextMenu={handleContextMenu} />
