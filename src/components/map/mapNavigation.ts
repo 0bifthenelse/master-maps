@@ -4,8 +4,10 @@ export const PAN_KEY_FRACTION = 0.12;
 export const PAN_MIN_STEP = 25;
 export const PAN_MAX_STEP = 400;
 export const ZOOM_KEY_FACTOR = 1.25;
+export const WHEEL_ZOOM_SPEED = 0.5;
 export const MIN_HEADING = -Math.PI;
 export const MAX_HEADING = Math.PI;
+export const HEADING_EPSILON = 1e-4;
 
 export interface KeyPan {
   /** Screen-space pan direction, +x right and +y up in NDC. */
@@ -54,6 +56,37 @@ export function worldPanFor(
   };
 }
 
+export interface CursorMapPoint {
+  x: number;
+  z: number;
+}
+
+export function supplementaryWheelScale(deltaY: number, deltaMode: number, zoomSpeed: number): number {
+  if (!Number.isFinite(deltaY) || !Number.isFinite(zoomSpeed) || zoomSpeed < 0) return 1;
+  const notches = deltaMode === 1 ? deltaY / 3 : deltaMode === 2 ? deltaY : 0;
+  if (notches === 0) return 1;
+  const clamped = Math.max(-3, Math.min(3, notches));
+  return Math.pow(0.95, -clamped * zoomSpeed);
+}
+
+export function writeCursorMapPoint(
+  point: CursorMapPoint,
+  ndcX: number,
+  ndcY: number,
+  targetX: number,
+  targetZ: number,
+  halfWidth: number,
+  halfHeight: number,
+  heading: number,
+): void {
+  const cosine = Math.cos(heading);
+  const sine = Math.sin(heading);
+  const screenX = ndcX * halfWidth;
+  const screenZ = ndcY * halfHeight;
+  point.x = targetX + cosine * screenX + sine * screenZ;
+  point.z = targetZ - sine * screenX + cosine * screenZ;
+}
+
 export function zoomDirectionFor(event: KeyboardEvent): number {
   if (event.altKey || event.ctrlKey || event.metaKey) return 0;
   if (event.code in KEY_ZOOMS) return KEY_ZOOMS[event.code] ?? 0;
@@ -84,6 +117,33 @@ export function clampZoom(zoom: number, minZoom: number, maxZoom: number): numbe
 export function normalizeHeading(heading: number): number {
   const wrapped = ((heading + Math.PI) % (Math.PI * 2) + Math.PI * 2) % (Math.PI * 2) - Math.PI;
   return Math.min(MAX_HEADING, Math.max(MIN_HEADING, wrapped));
+}
+
+export function headingsMatch(current: number, desired: number): boolean {
+  return Math.abs(normalizeHeading(current - desired)) <= HEADING_EPSILON;
+}
+export const TOUCH_PINCH_TOLERANCE = 0.03;
+export const TOUCH_TWIST_THRESHOLD = Math.PI / 36;
+
+export function touchHeadingForGesture(
+  startHeading: number,
+  startDistance: number,
+  currentDistance: number,
+  startAngle: number,
+  currentAngle: number,
+): number | null {
+  if (
+    !Number.isFinite(startHeading)
+    || !Number.isFinite(startDistance)
+    || !Number.isFinite(currentDistance)
+    || !Number.isFinite(startAngle)
+    || !Number.isFinite(currentAngle)
+    || startDistance <= 0
+  ) return null;
+  if (Math.abs(currentDistance / startDistance - 1) > TOUCH_PINCH_TOLERANCE) return null;
+  const twist = normalizeHeading(currentAngle - startAngle);
+  if (Math.abs(twist) < TOUCH_TWIST_THRESHOLD) return null;
+  return normalizeHeading(startHeading + twist);
 }
 
 export function acceptsMapKey(event: KeyboardEvent): boolean {

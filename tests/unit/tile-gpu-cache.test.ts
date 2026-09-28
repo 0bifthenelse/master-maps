@@ -10,10 +10,12 @@ import {
   DEFAULT_GPU_CACHE_BYTES,
   evictTile,
   getTileCacheEntry,
+  hasPendingTileGpuDisposals,
   getTileGpuCacheStats,
   hasTileCacheEntry,
   pickStableId,
   putDecodedTile,
+  releasePendingTileGpuDisposals,
   resetTileGpuCache,
   retainTiles,
   tileLayerIds,
@@ -69,6 +71,7 @@ function decode(input: RenderTileInput) {
 }
 
 afterEach(() => {
+  vi.unstubAllGlobals();
   resetTileGpuCache();
 });
 
@@ -142,6 +145,30 @@ describe("tile GPU cache", () => {
     expect(entry.slab.byteLength).toBe(0);
     expect(hasTileCacheEntry("l0_evict")).toBe(false);
     expect(getTileGpuCacheStats().byteSize).toBe(0);
+    disposeSpy.mockRestore();
+  });
+
+  it("keeps an evicted geometry until its mounted group leaves the scene", () => {
+    vi.stubGlobal("window", {});
+    const entry = putDecodedTile(decode(syntheticTile("l0_deferred", 0, 0)));
+    const geometry = entry.layers.get("buildings")!.geometry;
+    const disposeSpy = vi.spyOn(geometry, "dispose");
+    expect(evictTile("l0_deferred")).toBe(true);
+    expect(getTileGpuCacheStats().entries).toBe(0);
+    expect(getTileGpuCacheStats().geometryCount).toBe(0);
+    expect(getTileGpuCacheStats().byteSize).toBe(0);
+    expect(entry.slab.byteLength).toBeGreaterThan(0);
+    expect(disposeSpy).not.toHaveBeenCalled();
+    expect(hasPendingTileGpuDisposals()).toBe(true);
+    releasePendingTileGpuDisposals([{ entry }]);
+    expect(disposeSpy).not.toHaveBeenCalled();
+    expect(entry.slab.byteLength).toBeGreaterThan(0);
+    releasePendingTileGpuDisposals();
+    expect(disposeSpy).toHaveBeenCalledTimes(1);
+    expect(getTileGpuCacheStats().disposedGeometries).toBe(2);
+    expect(getTileGpuCacheStats().byteSize).toBe(0);
+    expect(entry.slab.byteLength).toBe(0);
+    expect(hasPendingTileGpuDisposals()).toBe(false);
     disposeSpy.mockRestore();
   });
 

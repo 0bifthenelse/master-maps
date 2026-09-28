@@ -6,7 +6,12 @@ import {
   deduplicateStreaming,
   deduplicateAllInMemory,
   deduplicateFeatures,
+  decodeSpoolRecord,
+  encodeSpoolRecord,
+  featureRecords,
   DEDUP_TEMP_ROOT,
+  DEDUP_INPUT_SIDECARS,
+  DEDUP_PRESERVED_SIDECARS,
   type DedupAccounting,
   DEDUP_REACH_CELLS,
 } from "../../scripts/data/deduplicate";
@@ -330,6 +335,29 @@ describe("retirement horizon reaches every candidate the merge predicate can acc
     expect(streamed).toHaveLength(1);
     expect(streamed[0]?.sourceRefs).toHaveLength(1);
   });
+
+  it("merges a dx plus one partner into a feature whose retirement horizon lands exactly on that partner cell", async () => {
+    const wide = feature("building", "osm:way/340", "osm", square(0, 105, 260, 125), { x: 0, z: 105 });
+    const partner = feature("building", "ign-bdtopo:building/340", "IGN BD TOPO", square(1, 106, 259, 124), { x: 0, z: 105 });
+    expect(Math.floor(105 / 100)).toBe(1);
+    expect(Math.floor(260 / 100)).toBe(2);
+    expect(wide.localGeometry && "coordinates" in wide.localGeometry).toBe(true);
+    const streamed = await expectEquivalent([wide, partner]);
+    expect(streamed).toHaveLength(1);
+    expect(streamed[0]?.stableId).toBe("ign-bdtopo:building/340");
+    expect(streamed[0]?.sourceRefs.map((ref) => ref.source).sort()).toEqual(["IGN BD TOPO", "osm"]);
+  });
+
+  it("merges a cross band partner pair that lands exactly on the retirement horizon", async () => {
+    const south = feature("building", "osm:way/350", "osm", square(0, 402, 20, 420), { x: 0, z: 410 });
+    const north = feature("building", "ign-bdtopo:building/350", "IGN BD TOPO", square(0, 401, 20, 419), { x: 0, z: 410 });
+    const decoy = feature("building", "osm-bulk:way/350", "osm-bulk", square(900, 200, 920, 220), { x: 900, z: 200 });
+    expect(Math.floor(410 / 100)).toBe(4);
+    expect(Math.floor(410 / 400)).toBe(1);
+    const streamed = await expectEquivalent([south, north, decoy]);
+    expect(streamed).toHaveLength(2);
+    expect(streamed.map((item) => item.stableId).sort()).toEqual(["ign-bdtopo:building/350", "osm-bulk:way/350"]);
+  });
 });
 
 describe("chunked output contract", () => {
@@ -392,5 +420,169 @@ describe("temporary band directory lifecycle", () => {
     await deduplicateStreaming(input, output, createDedupAccounting());
     const after = (await fs.readdir(DEDUP_TEMP_ROOT)).filter((name) => name.startsWith("master-maps-dedup-"));
     expect(after).toEqual(before);
+  });
+});
+
+describe("spool round trip is byte exact", () => {
+  const quote = String.fromCharCode(34);
+  const newline = String.fromCharCode(10);
+  const carriageReturn = String.fromCharCode(13);
+  const hostileValue = JSON.stringify({
+    stableId: "poi:hostile",
+    kind: "poi",
+    nested: { a: { b: [{ c: quote + "}]" + quote }], d: quote + "]" + quote }, e: quote + "{" + quote + "quoted" + quote + ": " + quote + "value" + quote + "}" + quote },
+    multiline: "first line" + newline + "second line" + carriageReturn + newline + "third line",
+    big: "x".repeat(200 * 1024),
+  });
+  const hostile = hostileValue;
+  const expectedNested = JSON.parse(hostile).nested;
+  const expectedMultiline = "first line" + newline + "second line" + carriageReturn + newline + "third line";
+
+  it("recovers a record with escaped quotes, nested braces, an embedded newline and a 200 kB body", () => {
+    const decoded = decodeSpoolRecord(encodeSpoolRecord(7, -3, 41, hostile));
+    expect(decoded.v).toBe(7);
+    expect(decoded.x).toBe(-3);
+    expect(decoded.z).toBe(41);
+    expect(decoded.j).toBe(hostile);
+    const parsed = JSON.parse(decoded.j) as Record<string, unknown>;
+    expect(parsed.nested).toEqual(expectedNested);
+    expect(parsed.multiline).toBe(expectedMultiline);
+    expect((parsed.big as string).length).toBe(200 * 1024);
+  });
+
+  it("stays on one physical line so a band file reader cannot split a record", () => {
+    const line = encodeSpoolRecord(7, -3, 41, hostile);
+    expect(line).not.toContain("\n");
+    expect(line).not.toContain("\r");
+  });
+
+  it("carries a hostile record through the whole scan and back out intact", async () => {
+    const input = path.join(root, "hostile-in");
+    const output = path.join(root, "hostile-out");
+    await fs.mkdir(input);
+    await fs.mkdir(output);
+    const plain = feature("poi", "poi:plain", "osm", { type: "Point", coordinates: [1, 1] }, { x: 1, z: 1, poiType: "amenity" });
+    const hostileFeature = MapFeatureSchema.parse({ ...plain, stableId: "poi:hostile", name: 'quote " and } and ] and {\nnewline\r\nhere', displayName: "a".repeat(200 * 1024) });
+    await fs.writeFile(path.join(input, "poi.json"), `[\n${JSON.stringify(hostileFeature)},\n${JSON.stringify(plain)}\n]\n`, "utf8");
+    await deduplicateStreaming(input, output, createDedupAccounting());
+    const streamed = await readOutput(output);
+    expect(streamed).toHaveLength(2);
+    const found = streamed.find((item) => item.stableId === "poi:hostile");
+    expect(found?.displayName).toBe("a".repeat(200 * 1024));
+    expect(found?.name).toBe('quote " and } and ] and {\nnewline\r\nhere');
+  });
+});
+
+describe("featureRecords yields exactly one top level object per record", () => {
+  const compact = (features: MapFeature[]): string => `[\n${features.map((item) => `${JSON.stringify(item)},\n`).join("")}]\n`;
+
+  it("reads the pipeline chunk layout one record per line", async () => {
+    const file = path.join(root, "compact.json");
+    const features = [
+      feature("building", "osm:way/1", "osm", square(0, 0, 10, 10), centred(0, 0, 10, 10)),
+      feature("building", "osm:way/2", "osm", square(20, 0, 30, 10), centred(20, 0, 30, 10)),
+    ];
+    await fs.writeFile(file, compact(features), "utf8");
+    const records: string[] = [];
+    for await (const raw of featureRecords(file)) records.push(raw);
+    expect(records).toEqual(features.map((item) => JSON.stringify(item)));
+  });
+
+  it("reads a single line array of many records without concatenating or dropping any", async () => {
+    const file = path.join(root, "one-line.json");
+    const features = Array.from({ length: 5 }, (_value, index) =>
+      feature("poi", `poi:${index}`, "osm", { type: "Point", coordinates: [index, index] }, { x: index, z: index, poiType: "amenity" })
+    );
+    await fs.writeFile(file, JSON.stringify(features), "utf8");
+    const records: string[] = [];
+    for await (const raw of featureRecords(file)) records.push(raw);
+    expect(records).toEqual(features.map((item) => JSON.stringify(item)));
+  });
+
+  it("joins a record that spans several lines and keeps the following record separate", async () => {
+    const file = path.join(root, "multiline.json");
+    const first = feature("building", "osm:way/10", "osm", square(0, 0, 10, 10), centred(0, 0, 10, 10));
+    const second = feature("building", "osm:way/11", "osm", square(20, 0, 30, 10), centred(20, 0, 30, 10));
+    const firstRaw = JSON.stringify(first);
+    const secondRaw = JSON.stringify(second);
+    const cut = firstRaw.indexOf('"geometry"');
+    const body = `[\n${firstRaw.slice(0, cut)}\n${firstRaw.slice(cut)},\n${secondRaw}\n]\n`;
+    expect(JSON.parse(`[${firstRaw.slice(0, cut)}\n${firstRaw.slice(cut)}]`)).toHaveLength(1);
+    await fs.writeFile(file, body, "utf8");
+    const records: string[] = [];
+    for await (const raw of featureRecords(file)) records.push(raw);
+    expect(records.map((raw) => JSON.parse(raw))).toEqual([first, second]);
+  });
+
+  it("joins a pretty printed record whose braces and escaped quotes cross the read buffer boundary", async () => {
+    const file = path.join(root, "pretty.json");
+    const big = feature("road", "osm:way/12", "osm", { type: "LineString", coordinates: Array.from({ length: 6000 }, (_value, index) => [index * 0.5, index * 0.25]) }, { x: 0, z: 0, name: 'Rue "des" {Chromes} } et \\\\ bras' });
+    const next = feature("road", "osm:way/13", "osm", { type: "LineString", coordinates: [[0, 0], [5, 5]] }, { x: 0, z: 0 });
+    await fs.writeFile(file, `[\n${JSON.stringify(big, null, 2)},\n${JSON.stringify(next, null, 2)}\n]\n`, "utf8");
+    const records: string[] = [];
+    for await (const raw of featureRecords(file)) records.push(raw);
+    expect(records).toHaveLength(2);
+    expect(JSON.parse(records[0]!).stableId).toBe("osm:way/12");
+    expect(JSON.parse(records[1]!).stableId).toBe("osm:way/13");
+  });
+
+  it("refuses a file whose leading bytes are neither an array nor an object", async () => {
+    const file = path.join(root, "garbage.json");
+    await fs.writeFile(file, "not json at all\n{\n\"stableId\":\"poi:1\"\n}\n", "utf8");
+    const read = async (): Promise<string[]> => {
+      const records: string[] = [];
+      for await (const raw of featureRecords(file)) records.push(raw);
+      return records;
+    };
+    await expect(read()).rejects.toThrow(/unexpected JSON before a record/);
+  });
+
+  it("refuses two records glued together with no separator", async () => {
+    const file = path.join(root, "glued.json");
+    await fs.writeFile(file, `[\n{"stableId":"poi:1","kind":"poi"}{"stableId":"poi:2","kind":"poi"}\n]\n`, "utf8");
+    const read = async (): Promise<string[]> => {
+      const records: string[] = [];
+      for await (const raw of featureRecords(file)) records.push(raw);
+      return records;
+    };
+    await expect(read()).rejects.toThrow(/two JSON records with no separator/);
+  });
+
+  it("never feeds a normalisation counters sidecar to the scan", async () => {
+    expect(DEDUP_INPUT_SIDECARS.has("osm-normalization.json")).toBe(true);
+    expect(DEDUP_PRESERVED_SIDECARS.has("osm-normalization.json")).toBe(true);
+    const store = path.join(root, "sidecar-store");
+    await fs.mkdir(store);
+    const sidecarBody = `${JSON.stringify({ inputTotal: 261798, keptTotal: 123186, keptByKind: { poi: 19344 } }, null, 2)}\n`;
+    await fs.writeFile(path.join(store, "osm-normalization.json"), sidecarBody, "utf8");
+    await fs.writeFile(
+      path.join(store, "poi.json"),
+      `[\n${JSON.stringify(feature("poi", "poi:1", "osm", { type: "Point", coordinates: [1, 1] }, { x: 1, z: 1, poiType: "amenity" }))}\n]\n`,
+      "utf8"
+    );
+    const stats = await deduplicateStreaming(store, store, createDedupAccounting());
+    expect(stats.input).toBe(1);
+    expect(await readOutput(store)).toHaveLength(1);
+    expect(await fs.readFile(path.join(store, "osm-normalization.json"), "utf8")).toBe(sidecarBody);
+  });
+
+  it("rejects a truncated trailing record instead of yielding it", async () => {
+    const file = path.join(root, "truncated.json");
+    const first = feature("poi", "poi:1", "osm", { type: "Point", coordinates: [1, 1] }, { x: 1, z: 1, poiType: "amenity" });
+    await fs.writeFile(file, `[\n${JSON.stringify(first)},\n{"stableId":"poi:2","kind":"poi"\n`, "utf8");
+    const read = async (): Promise<string[]> => {
+      const records: string[] = [];
+      for await (const raw of featureRecords(file)) records.push(raw);
+      return records;
+    };
+    await expect(read()).rejects.toThrow(/truncated JSON record/);
+  });
+
+  it("reads an empty array as zero records", async () => {
+    const file = path.join(root, "empty.json");
+    await fs.writeFile(file, "[\n]\n", "utf8");
+    const records: string[] = [];
+    for await (const raw of featureRecords(file)) records.push(raw);
+    expect(records).toEqual([]);
   });
 });

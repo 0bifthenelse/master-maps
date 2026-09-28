@@ -16,7 +16,7 @@ import { SearchHitSchema, SEARCH_MIN_QUERY_LENGTH, type SearchHit } from "@/lib/
 import { loadTileMeta } from "@/lib/data/loadTile";
 import type { SceneFeature } from "./CityScene";
 import { loadRenderTile, nextRenderTileGeneration } from "@/lib/render/loadRenderTile";
-import { evictTile, putDecodedTile, resetTileGpuCache, getResidentDecodedTile } from "@/lib/render/tileGpuCache";
+import { evictTile, hasTileCacheEntry, putDecodedTile, resetTileGpuCache, getResidentDecodedTile } from "@/lib/render/tileGpuCache";
 import type { DecodedRenderTile } from "@/lib/render/codec";
 import { resolvePickedFeatureByStableId, type PickedFeature } from "@/lib/scene/highlight";
 import FeatureContextMenu, { attributeLabel, type FeatureContextMenuDetail } from "@/components/map/FeatureContextMenu";
@@ -37,6 +37,7 @@ interface TileRuntimeDiagnostics {
   aborted: string[];
   failed: string[];
   loaded: string[];
+  evicted: string[];
   reasons: Record<string, number>;
 }
 
@@ -48,7 +49,7 @@ declare global {
 
 function tileRuntimeDiagnostics(): TileRuntimeDiagnostics {
   if (!window.__masterMapsTileDiagnostics) {
-    window.__masterMapsTileDiagnostics = { requested: [], aborted: [], failed: [], loaded: [], reasons: {} };
+    window.__masterMapsTileDiagnostics = { requested: [], aborted: [], failed: [], loaded: [], evicted: [], reasons: {} };
   }
   return window.__masterMapsTileDiagnostics;
 }
@@ -57,6 +58,7 @@ function tileRuntimeDiagnostics(): TileRuntimeDiagnostics {
 const EMPTY_SCENE_FEATURES: SceneFeature[] = [];
 
 const TILE_LOAD_CONCURRENCY = 24;
+const TILE_EVICTION_DIAGNOSTIC_LIMIT = 512;
 const DATASET_BOUNDARY_TILE_ID = "boundary";
 const DEFAULT_LAYERS: LayerState = { ...BASE_LAYERS, commercialAudit: false };
 const LS_THEME_KEY = "map-theme";
@@ -120,11 +122,6 @@ function mergeTileSlot(state: TileState, decoded: DecodedRenderTile): TileState 
   return { slots, renderTileIds, version: state.version + 1 };
 }
 
-function dropTileSlot(state: TileState, tileId: string): TileState {
-  const slots = new Map(state.slots);
-  slots.delete(tileId);
-  return { slots, renderTileIds: state.renderTileIds.filter((id) => id !== tileId), version: state.version + 1 };
-}
 
 interface TileState {
   slots: Map<string, DecodedRenderTile>;
@@ -264,22 +261,51 @@ export default function MapShell() {
 
   useEffect(() => {
     if (!manifest) return;
-    const desired = new Set(desiredIdsRef.current);
+    const desiredIds = desiredIdsRef.current;
+    const desired = new Set(desiredIds);
     const generation = desiredGenerationRef.current + 1;
     desiredGenerationRef.current = generation;
     nextRenderTileGeneration();
+    let swapped = false;
+    let swapTimer: number | null = null;
     for (const [tileId, controller] of inFlightRef.current) {
       if (desired.has(tileId)) continue;
       controller.abort();
       inFlightRef.current.delete(tileId);
     }
-    for (const tileId of tileStateRef.current.slots.keys()) {
-      if (desired.has(tileId)) continue;
-      evictTile(tileId);
-      tileRuntimeDiagnostics().aborted.push(tileId);
-      applyTileState((previous) => dropTileSlot(previous, tileId));
-    }
-    const pending = desiredIdsRef.current.filter(
+    const swapStaleTiles = (force = false): void => {
+      if (swapped || desiredGenerationRef.current !== generation) return;
+      const allDesiredResident = desiredIds.every(
+        (tileId) => tileStateRef.current.slots.has(tileId) && hasTileCacheEntry(tileId),
+      );
+      const hasGenerationRequests = desiredIds.some((tileId) => inFlightRef.current.has(tileId));
+      if (!force && !allDesiredResident && hasGenerationRequests) return;
+      swapped = true;
+      if (swapTimer !== null) {
+        window.clearTimeout(swapTimer);
+        swapTimer = null;
+      }
+      const staleIds: string[] = [];
+      for (const tileId of tileStateRef.current.slots.keys()) {
+        if (!desired.has(tileId)) staleIds.push(tileId);
+      }
+      if (staleIds.length === 0) return;
+      const diagnostics = tileRuntimeDiagnostics();
+      for (const tileId of staleIds) {
+        evictTile(tileId);
+        diagnostics.evicted.push(tileId);
+        if (diagnostics.evicted.length > TILE_EVICTION_DIAGNOSTIC_LIMIT) {
+          diagnostics.evicted.splice(0, diagnostics.evicted.length - TILE_EVICTION_DIAGNOSTIC_LIMIT);
+        }
+      }
+      applyTileState((previous) => {
+        const slots = new Map(previous.slots);
+        for (const tileId of staleIds) slots.delete(tileId);
+        return { slots, renderTileIds: [...slots.keys()].sort(), version: previous.version + 1 };
+      });
+    };
+    swapTimer = window.setTimeout(() => swapStaleTiles(true), 2500);
+    const pending = desiredIds.filter(
       (tileId) => !tileStateRef.current.slots.has(tileId) && !inFlightRef.current.has(tileId),
     );
     let cursor = 0;
@@ -322,7 +348,11 @@ export default function MapShell() {
         await loadOne(tileId);
       }
     };
-    void Promise.all(Array.from({ length: Math.min(TILE_LOAD_CONCURRENCY, pending.length) }, () => loadWorker()));
+    const workers = Array.from({ length: Math.min(TILE_LOAD_CONCURRENCY, pending.length) }, () => loadWorker());
+    void Promise.all(workers).then(() => swapStaleTiles());
+    return () => {
+      if (swapTimer !== null) window.clearTimeout(swapTimer);
+    };
   }, [manifest, desiredKey]);
 
   /* The department outline is a dataset-level artifact, not a per-tile

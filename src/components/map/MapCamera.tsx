@@ -4,7 +4,13 @@ import { useThree, useFrame } from '@react-three/fiber';
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef } from 'react';
 import * as THREE from 'three';
 import type { MapControls as MapControlsImpl } from 'three-stdlib';
-import { normalizeHeading } from './mapNavigation';
+import {
+  HEADING_EPSILON,
+  headingsMatch,
+  normalizeHeading,
+  touchHeadingForGesture,
+  TOUCH_PINCH_TOLERANCE,
+} from './mapNavigation';
 
 /* ------------------------------------------------------------------ */
 /*  Public API                                                         */
@@ -70,7 +76,14 @@ const CAMERA_TOP_DOWN_PITCH = -Math.PI / 2;
 const ROTATION_SENSITIVITY = 0.005;
 const TARGET_EPSILON = 0.01;
 const ZOOM_EPSILON = 0.01;
-const HEADING_EPSILON = 1e-4;
+function applyCameraHeading(camera: THREE.OrthographicCamera, heading: number): void {
+  if (
+    headingsMatch(camera.rotation.z, heading)
+    && Math.abs(camera.rotation.x - CAMERA_TOP_DOWN_PITCH) <= HEADING_EPSILON
+    && Math.abs(camera.rotation.y) <= HEADING_EPSILON
+  ) return;
+  camera.rotation.set(CAMERA_TOP_DOWN_PITCH, 0, heading);
+}
 
 /** Three's right-handed top-down basis maps +Z to screen down at zero roll.
  * Flip only NDC-Y in the orthographic projection so +X remains screen-right
@@ -167,7 +180,7 @@ export const MapCamera = forwardRef<CameraHandle, MapCameraProps>(
         const heading = headingRef.current;
         camera.up.set(0, 1, 0);
         camera.position.set(targetX, cameraHeight, targetZ);
-        camera.rotation.set(CAMERA_TOP_DOWN_PITCH, 0, heading);
+        applyCameraHeading(camera, heading);
         camera.updateMatrixWorld();
 
         const controls = get().controls as MapControlsImpl | null;
@@ -175,7 +188,7 @@ export const MapCamera = forwardRef<CameraHandle, MapCameraProps>(
           controls.target.set(targetX, 0, targetZ);
           controls.update();
           camera.position.set(targetX, cameraHeight, targetZ);
-          camera.rotation.set(CAMERA_TOP_DOWN_PITCH, 0, heading);
+          applyCameraHeading(camera, heading);
           camera.updateMatrixWorld();
         }
       },
@@ -203,7 +216,7 @@ export const MapCamera = forwardRef<CameraHandle, MapCameraProps>(
       if (heading === headingRef.current) return;
       headingRef.current = heading;
       desiredHeading.current = heading;
-      camera.rotation.set(CAMERA_TOP_DOWN_PITCH, 0, heading);
+      applyCameraHeading(camera, heading);
       camera.updateMatrixWorld();
       activityRef.current?.();
       invalidate();
@@ -253,8 +266,36 @@ export const MapCamera = forwardRef<CameraHandle, MapCameraProps>(
       let startX = 0;
       let startHeading = 0;
       let activePointerId: number | null = null;
+      let firstTouchId: number | null = null;
+      let secondTouchId: number | null = null;
+      let firstTouchX = 0;
+      let firstTouchY = 0;
+      let secondTouchX = 0;
+      let secondTouchY = 0;
+      let touchStartDistance = 0;
+      let touchStartAngle = 0;
+      let touchStartHeading = 0;
+      let touchPinching = false;
 
       const onPointerDown = (e: PointerEvent) => {
+        if (e.pointerType === 'touch') {
+          if (firstTouchId === null) {
+            firstTouchId = e.pointerId;
+            firstTouchX = e.clientX;
+            firstTouchY = e.clientY;
+          } else if (secondTouchId === null && e.pointerId !== firstTouchId) {
+            secondTouchId = e.pointerId;
+            secondTouchX = e.clientX;
+            secondTouchY = e.clientY;
+            const dx = secondTouchX - firstTouchX;
+            const dy = secondTouchY - firstTouchY;
+            touchStartDistance = Math.hypot(dx, dy);
+            touchStartAngle = Math.atan2(dy, dx);
+            touchStartHeading = headingRef.current;
+            touchPinching = false;
+          }
+          return;
+        }
         if (e.pointerType !== 'mouse' || e.button !== 2) return;
         isRotating = true;
         startX = e.clientX;
@@ -265,14 +306,73 @@ export const MapCamera = forwardRef<CameraHandle, MapCameraProps>(
         } catch {}
         e.preventDefault();
       };
-
       const onPointerMove = (e: PointerEvent) => {
+        if (e.pointerType === 'touch') {
+          if (e.pointerId === firstTouchId) {
+            firstTouchX = e.clientX;
+            firstTouchY = e.clientY;
+          } else if (e.pointerId === secondTouchId) {
+            secondTouchX = e.clientX;
+            secondTouchY = e.clientY;
+          } else {
+            return;
+          }
+          if (secondTouchId !== null && touchStartDistance > 0) {
+            const dx = secondTouchX - firstTouchX;
+            const dy = secondTouchY - firstTouchY;
+            const distance = Math.hypot(dx, dy);
+            if (Math.abs(distance / touchStartDistance - 1) > TOUCH_PINCH_TOLERANCE) {
+              touchPinching = true;
+            }
+          }
+          return;
+        }
         if (!isRotating) return;
         if (activePointerId !== null && e.pointerId !== activePointerId) return;
         commitHeading(startHeading + (e.clientX - startX) * ROTATION_SENSITIVITY);
       };
+      const finishTouch = (e: PointerEvent, applyTwist: boolean): void => {
+        if (e.pointerId !== firstTouchId && e.pointerId !== secondTouchId) return;
+        if (e.pointerId === firstTouchId) {
+          firstTouchX = e.clientX;
+          firstTouchY = e.clientY;
+        } else {
+          secondTouchX = e.clientX;
+          secondTouchY = e.clientY;
+        }
+        if (secondTouchId !== null && applyTwist && !touchPinching) {
+          const dx = secondTouchX - firstTouchX;
+          const dy = secondTouchY - firstTouchY;
+          const heading = touchHeadingForGesture(
+            touchStartHeading,
+            touchStartDistance,
+            Math.hypot(dx, dy),
+            touchStartAngle,
+            Math.atan2(dy, dx),
+          );
+          if (heading !== null) commitHeading(heading);
+        }
+        if (e.pointerId === firstTouchId) {
+          if (secondTouchId !== null) {
+            firstTouchId = secondTouchId;
+            firstTouchX = secondTouchX;
+            firstTouchY = secondTouchY;
+            secondTouchId = null;
+          } else {
+            firstTouchId = null;
+          }
+        } else {
+          secondTouchId = null;
+        }
+        touchStartDistance = 0;
+        touchPinching = false;
+      };
 
       const endRotation = (e: PointerEvent) => {
+        if (e.pointerType === 'touch') {
+          finishTouch(e, e.type === 'pointerup');
+          return;
+        }
         if (!isRotating) return;
         if (activePointerId !== null && e.pointerId !== activePointerId) return;
         isRotating = false;
@@ -281,6 +381,7 @@ export const MapCamera = forwardRef<CameraHandle, MapCameraProps>(
           canvas.releasePointerCapture(e.pointerId);
         } catch {}
       };
+
 
       const onContextMenu = (e: MouseEvent) => {
         if (document.documentElement.dataset.featureContextOpen !== 'true') return;
@@ -366,11 +467,18 @@ export const MapCamera = forwardRef<CameraHandle, MapCameraProps>(
     }, [invalidate, minZoom, maxZoom]);
 
     const doCancel = useCallback(() => {
-      if (!animating.current) return;
+      const camera = cameraRef.current;
+      if (!animating.current || !camera) return;
+      const controls = get().controls as MapControlsImpl | null;
+      desiredTarget.current.set(
+        controls?.target.x ?? camera.position.x,
+        0,
+        controls?.target.z ?? camera.position.z,
+      );
       animating.current = false;
       desiredHeading.current = headingRef.current;
-      desiredZoom.current = cameraRef.current?.zoom ?? desiredZoom.current;
-    }, []);
+      desiredZoom.current = camera.zoom;
+    }, [get]);
 
     /* --- Animation loop --- */
 
@@ -420,26 +528,21 @@ export const MapCamera = forwardRef<CameraHandle, MapCameraProps>(
           moving = true;
         }
 
-        const hDelta = normalizeHeading(desiredHeading.current) - headingRef.current;
+        const hDelta = normalizeHeading(desiredHeading.current - headingRef.current);
         if (Math.abs(hDelta) > HEADING_EPSILON) {
           const next = normalizeHeading(headingRef.current + hDelta * blend);
-          headingRef.current = next;
-          moving = true;
+          if (next !== headingRef.current) {
+            headingRef.current = next;
+            applyCameraHeading(camera, next);
+            moving = true;
+          }
         } else if (headingRef.current !== desiredHeading.current) {
           headingRef.current = normalizeHeading(desiredHeading.current);
+          applyCameraHeading(camera, headingRef.current);
         }
-
         if (!moving) animating.current = false;
       }
 
-      /* OrbitControls re-aims the camera at its target on every update, and
-         a pure lookAt leaves a roll whenever the two are not exactly
-         vertical. The heading is authoritative here, so the orientation is
-         re-asserted every frame instead of only while animating. */
-      if (camera.rotation.z !== headingRef.current) {
-        camera.rotation.set(CAMERA_TOP_DOWN_PITCH, 0, headingRef.current);
-        moving = true;
-      }
       camera.updateMatrixWorld();
 
       /* Keep the controls inside the zoom range even for wheel and pinch. */

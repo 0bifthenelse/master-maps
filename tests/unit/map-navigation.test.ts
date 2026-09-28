@@ -4,13 +4,21 @@ import {
   PAN_MAX_STEP,
   PAN_MIN_STEP,
   ZOOM_KEY_FACTOR,
+  WHEEL_ZOOM_SPEED,
+  HEADING_EPSILON,
   acceptsMapKey,
   clampZoom,
   headingForKey,
   normalizeHeading,
+  headingsMatch,
+  TOUCH_PINCH_TOLERANCE,
+  TOUCH_TWIST_THRESHOLD,
+  touchHeadingForGesture,
   panStepFor,
   worldPanFor,
   zoomDirectionFor,
+  supplementaryWheelScale,
+  writeCursorMapPoint,
   KEY_PANS,
 } from "@/components/map/mapNavigation";
 import type { KeyPan } from "@/components/map/mapNavigation";
@@ -142,6 +150,58 @@ describe("zoom range", () => {
     expect(clampZoom(1 * ZOOM_KEY_FACTOR, 1, 4000)).toBeCloseTo(1.25, 9);
   });
 });
+describe("supplementary wheel scale", () => {
+  it("normalizes one line or page notch to one wheel ratio", () => {
+    const scale = Math.pow(0.95, WHEEL_ZOOM_SPEED);
+    expect(supplementaryWheelScale(-3, 1, WHEEL_ZOOM_SPEED)).toBeCloseTo(scale, 12);
+    expect(supplementaryWheelScale(-1, 2, WHEEL_ZOOM_SPEED)).toBeCloseTo(scale, 12);
+    expect(supplementaryWheelScale(3, 1, WHEEL_ZOOM_SPEED)).toBeCloseTo(1 / scale, 12);
+    expect(supplementaryWheelScale(1, 2, WHEEL_ZOOM_SPEED)).toBeCloseTo(1 / scale, 12);
+  });
+
+  it("bounds large wheel deltas to three notches", () => {
+    expect(supplementaryWheelScale(-100, 2, WHEEL_ZOOM_SPEED)).toBeCloseTo(
+      Math.pow(0.95, 3 * WHEEL_ZOOM_SPEED),
+      12,
+    );
+    expect(supplementaryWheelScale(Number.NaN, 1, WHEEL_ZOOM_SPEED)).toBe(1);
+  });
+
+  it("ignores pixel-mode deltas reserved for OrbitControls", () => {
+    expect(supplementaryWheelScale(-100, 0, WHEEL_ZOOM_SPEED)).toBe(1);
+  });
+});
+
+describe("cursor world anchor", () => {
+  it("keeps the projected map point fixed when the target offsets for zoom", () => {
+    const before = { x: 0, z: 0 };
+    const after = { x: 0, z: 0 };
+    const ndcX = -0.6;
+    const ndcY = 0.4;
+    const targetX = -100;
+    const targetZ = 80;
+    const halfWidth = 900;
+    const halfHeight = 500;
+    const heading = Math.PI / 5;
+    const scale = supplementaryWheelScale(-3, 1, WHEEL_ZOOM_SPEED);
+    writeCursorMapPoint(before, ndcX, ndcY, targetX, targetZ, halfWidth, halfHeight, heading);
+    writeCursorMapPoint(after, ndcX, ndcY, targetX, targetZ, halfWidth * scale, halfHeight * scale, heading);
+    const nextTargetX = targetX + before.x - after.x;
+    const nextTargetZ = targetZ + before.z - after.z;
+    writeCursorMapPoint(
+      after,
+      ndcX,
+      ndcY,
+      nextTargetX,
+      nextTargetZ,
+      halfWidth * scale,
+      halfHeight * scale,
+      heading,
+    );
+    expect(after.x).toBeCloseTo(before.x, 10);
+    expect(after.z).toBeCloseTo(before.z, 10);
+  });
+});
 
 describe("heading normalisation", () => {
   it("keeps a right drag inside plus or minus half a turn", () => {
@@ -150,6 +210,20 @@ describe("heading normalisation", () => {
     expect(normalizeHeading(2 * Math.PI)).toBeCloseTo(0, 9);
     expect(normalizeHeading(3 * Math.PI)).toBeCloseTo(-Math.PI, 9);
     expect(normalizeHeading(-3 * Math.PI)).toBeCloseTo(-Math.PI, 9);
+  });
+});
+
+describe("heading alignment", () => {
+  it("compares headings across the wrap boundary within tolerance", () => {
+    expect(headingsMatch(Math.PI - 1e-5, -Math.PI + 1e-5)).toBe(true);
+    expect(headingsMatch(0, HEADING_EPSILON * 2)).toBe(false);
+  });
+});
+describe("two-touch heading gesture", () => {
+  it("uses a twist only when the pinch scale stays within tolerance", () => {
+    expect(touchHeadingForGesture(0.3, 100, 102, 0, 0.2)).toBeCloseTo(0.5, 9);
+    expect(touchHeadingForGesture(0.3, 100, 105, 0, 0.2)).toBeNull();
+    expect(touchHeadingForGesture(0.3, 100, 100, 0, TOUCH_TWIST_THRESHOLD / 2)).toBeNull();
   });
 });
 

@@ -70,6 +70,7 @@ function createStore(maxBytes: number): CacheStore {
 }
 
 let store = createStore(DEFAULT_GPU_CACHE_BYTES);
+const pendingDisposals: TileCacheEntry[] = [];
 
 export class TileGpuCacheError extends Error {
   constructor(message: string) {
@@ -91,7 +92,7 @@ function collectStableIds(view: DecodedTileView, tile: DecodedRenderTile): strin
   return stableIds;
 }
 
-function disposeEntry(entry: TileCacheEntry): void {
+function releaseEntry(entry: TileCacheEntry): void {
   for (const layer of entry.layers.values()) {
     layer.geometry.dispose();
     store.disposedGeometries += 1;
@@ -99,6 +100,38 @@ function disposeEntry(entry: TileCacheEntry): void {
   entry.layers.clear();
   entry.stableIds.length = 0;
   entry.slab = EMPTY_SLAB;
+}
+
+export function hasPendingTileGpuDisposals(): boolean {
+  return pendingDisposals.length > 0;
+}
+
+export function releasePendingTileGpuDisposals(
+  mountedGroups: readonly { entry: TileCacheEntry }[] | null = null,
+): void {
+  for (let index = pendingDisposals.length - 1; index >= 0; index -= 1) {
+    const entry = pendingDisposals[index]!;
+    let isMounted = false;
+    if (mountedGroups !== null) {
+      for (const group of mountedGroups) {
+        if (group.entry === entry) {
+          isMounted = true;
+          break;
+        }
+      }
+    }
+    if (isMounted) continue;
+    pendingDisposals.splice(index, 1);
+    releaseEntry(entry);
+  }
+}
+
+function disposeEntry(entry: TileCacheEntry): void {
+  if (typeof window === "undefined") {
+    releaseEntry(entry);
+    return;
+  }
+  pendingDisposals.push(entry);
 }
 
 function recordEviction(tileId: string): void {
@@ -262,6 +295,7 @@ export function clearTileGpuCache(): void {
 
 export function resetTileGpuCache(maxBytes: number = DEFAULT_GPU_CACHE_BYTES): void {
   clearTileGpuCache();
+  releasePendingTileGpuDisposals();
   store = createStore(maxBytes);
 }
 

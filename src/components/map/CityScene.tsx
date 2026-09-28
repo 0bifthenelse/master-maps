@@ -1,7 +1,8 @@
 "use client";
 
-import { useEffect, useMemo } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef } from "react";
 import type { ReactNode } from "react";
+import { useFrame } from "@react-three/fiber";
 import type { ThreeEvent } from "@react-three/fiber";
 import type { BufferGeometry, Material } from "three";
 import {
@@ -24,8 +25,10 @@ import { buildLanduse } from "@/lib/scene/buildLanduse";
 import buildPois from "@/lib/scene/buildPois";
 import {
   getTileCacheEntry,
+  hasPendingTileGpuDisposals,
   pickStableId,
   type TileCacheEntry,
+  releasePendingTileGpuDisposals,
   type TileLayerEntry,
 } from "@/lib/render/tileGpuCache";
 import { ORDERED_RENDER_LAYER_IDS } from "@/lib/render/sceneFromDecoded";
@@ -282,6 +285,28 @@ export default function CityScene({ features, layers, tileIds, onPick, onContext
     }
     return resolved;
   }, [tileIds]);
+  const tileGroupsRef = useRef(tileGroups);
+  const releaseFrameRef = useRef<number | null>(null);
+
+  useLayoutEffect(() => {
+    tileGroupsRef.current = tileGroups;
+  }, [tileGroups]);
+
+  useFrame(() => {
+    if (releaseFrameRef.current !== null || !hasPendingTileGpuDisposals()) return;
+    releaseFrameRef.current = window.requestAnimationFrame(() => {
+      releaseFrameRef.current = null;
+      releasePendingTileGpuDisposals(tileGroupsRef.current);
+    });
+  });
+
+  useEffect(() => {
+    return () => {
+      if (releaseFrameRef.current !== null) window.cancelAnimationFrame(releaseFrameRef.current);
+      releaseFrameRef.current = null;
+      releasePendingTileGpuDisposals();
+    };
+  }, []);
 
   const boundaryFeatures = useMemo(
     () => (tileGroups === null ? features.filter(isBoundaryFeature) : []),

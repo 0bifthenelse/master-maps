@@ -12,6 +12,8 @@ import {
   worldPanFor,
   zoomDirectionFor,
   KEY_PANS,
+  supplementaryWheelScale,
+  writeCursorMapPoint,
 } from './mapNavigation';
 
 /* ------------------------------------------------------------------ */
@@ -75,7 +77,7 @@ export interface MapControlsProps {
   /** Callback when camera changes */
   onChange?: () => void;
 }
-const MIN_ZOOM = 0.01;
+const MIN_ZOOM = 1;
 const TERRITORY_MARGIN = 0.1;
 
 export const MapControls = forwardRef<ControlsHandle, MapControlsProps>(
@@ -100,6 +102,7 @@ export const MapControls = forwardRef<ControlsHandle, MapControlsProps>(
     const { get, invalidate, size } = useThree();
     const cameraRef = useRef(camera);
     cameraRef.current = camera;
+    const wheelAnchors = useRef({ before: { x: 0, z: 0 }, after: { x: 0, z: 0 } });
 
     const readHeading = useCallback((): number => {
       const current = get().camera as unknown as OrthographicCamera;
@@ -107,34 +110,64 @@ export const MapControls = forwardRef<ControlsHandle, MapControlsProps>(
       return 0;
     }, [get]);
 
-    const readZoom = useCallback((): number => {
-      const current = get().camera as unknown as OrthographicCamera;
-      if (current && current.isOrthographicCamera) return current.zoom;
-      return 1;
-    }, [get]);
-
-    /* Wheel deltas are expressed in pixels, so the same notch moved twice as
-       fast on a 120 Hz display as on a 60 Hz one. One wheel notch is 100 px
-       of delta; a step of that size is mapped to one keyboard zoom step so a
-       notch and a key press move the map by the same amount. */
     useEffect(() => {
       const controls = controlsRef.current;
       if (!controls) return;
       const onWheel = (event: WheelEvent): void => {
+        cameraRef.current?.cancelInterpolation();
         if (event.deltaMode === 0) return;
         event.preventDefault();
-        const notches = event.deltaY * (event.deltaMode === 1 ? 16 : 400);
-        const clamped = Math.max(-3, Math.min(3, notches / 100));
-        const current = readZoom();
-        if (clamped === 0 || current <= 0) return;
-        controls.setScale(Math.pow(keyboardZoomFactor, clamped));
-        controls.update();
+        event.stopImmediatePropagation();
+        const scale = supplementaryWheelScale(event.deltaY, event.deltaMode, controls.zoomSpeed);
+        if (scale === 1) return;
+        const camera = get().camera as unknown as OrthographicCamera;
+        if (!camera || camera.isOrthographicCamera !== true || camera.zoom <= 0) return;
+        const canvas = controls.domElement;
+        if (!canvas) return;
+        const rect = canvas.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) return;
+        const ndcX = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+        const ndcY = 1 - ((event.clientY - rect.top) / rect.height) * 2;
+        const halfWidth = Math.abs(camera.right - camera.left) / (2 * camera.zoom);
+        const halfHeight = Math.abs(camera.top - camera.bottom) / (2 * camera.zoom);
+        const heading = readHeading();
+        const anchors = wheelAnchors.current;
+        writeCursorMapPoint(
+          anchors.before,
+          ndcX,
+          ndcY,
+          controls.target.x,
+          controls.target.z,
+          halfWidth,
+          halfHeight,
+          heading,
+        );
+        controls.setScale(scale);
+        writeCursorMapPoint(
+          anchors.after,
+          ndcX,
+          ndcY,
+          controls.target.x,
+          controls.target.z,
+          Math.abs(camera.right - camera.left) / (2 * camera.zoom),
+          Math.abs(camera.top - camera.bottom) / (2 * camera.zoom),
+          heading,
+        );
+        const deltaX = anchors.before.x - anchors.after.x;
+        const deltaZ = anchors.before.z - anchors.after.z;
+        controls.target.x += deltaX;
+        controls.target.z += deltaZ;
+        camera.position.x += deltaX;
+        camera.position.z += deltaZ;
+        camera.updateMatrixWorld();
+        invalidate();
       };
       const canvas = controls.domElement ?? null;
       if (!canvas) return;
       canvas.addEventListener('wheel', onWheel, { passive: false, capture: true });
       return () => canvas.removeEventListener('wheel', onWheel, { capture: true } as EventListenerOptions);
-    }, [readZoom, keyboardZoomFactor]);
+    }, [get, invalidate, readHeading]);
+
 
     /* A damping pan keeps moving after the last pointer event, and a demand
        rendered Canvas only draws the frames it has been asked for. The

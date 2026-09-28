@@ -13,7 +13,6 @@ import {
 } from "./exclusion-report";
 import { wgs84ToRender } from "../../src/lib/geo/crs";
 import * as os from "node:os";
-import { createInterface } from "node:readline";
 import { createReadStream } from "node:fs";
 import readline from "node:readline";
 
@@ -505,6 +504,7 @@ export const DEDUP_INPUT_SIDECARS = new Set([
   "osm-manifest.json",
   "auch-osm-manifest.json",
   "osm-bulk-manifest.json",
+  "osm-normalization.json",
   "relation-issues.json",
   "normalization-issues.json",
 ]);
@@ -517,6 +517,7 @@ export const DEDUP_PRESERVED_SIDECARS = new Set([
   "osm-manifest.json",
   "auch-osm-manifest.json",
   "osm-bulk-manifest.json",
+  "osm-normalization.json",
   "relation-issues.json",
   "normalization-issues.json",
 ]);
@@ -649,38 +650,71 @@ class ChunkSink {
   }
 }
 
-async function* featureRecords(file: string): AsyncGenerator<string> {
-  const lines = createInterface({ input: createReadStream(file, { encoding: "utf8" }), crlfDelay: Number.POSITIVE_INFINITY });
-  let pending = "";
-  for await (const line of lines) {
-    const trimmed = line.trim().replace(/,$/, "");
-    if (trimmed === "" || trimmed === "[" || trimmed === "]") continue;
-    const candidate = pending.length === 0 ? trimmed : `${pending}${trimmed}`;
-    if (!candidate.startsWith("{")) {
-      pending = "";
+function scanCompactJson(text: string, from: number): number {
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let index = from; index < text.length; index += 1) {
+    const character = text[index]!;
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (character === "\\") escaped = true;
+      else if (character === '"') inString = false;
       continue;
     }
-    try {
-      JSON.parse(candidate);
-    } catch {
-      if (candidate.length > 0 && !isCompleteJson(candidate)) {
-        pending = candidate;
-        continue;
-      }
+    if (character === '"') inString = true;
+    else if (character === "{" || character === "[") depth += 1;
+    else if (character === "}" || character === "]") {
+      depth -= 1;
+      if (depth === 0) return index + 1;
+      if (depth < 0) return -1;
     }
-    pending = "";
-    yield candidate;
   }
-  if (pending.length > 0) yield pending;
+  return -1;
 }
 
-function isCompleteJson(text: string): boolean {
+function isCompleteJsonObject(text: string): boolean {
+  if (text.charCodeAt(0) !== 123) return false;
+  if (scanCompactJson(text, 0) !== text.length) return false;
   try {
-    JSON.parse(text);
-    return true;
+    const value: unknown = JSON.parse(text);
+    return value !== null && typeof value === "object" && !Array.isArray(value);
   } catch {
     return false;
   }
+}
+
+export async function* featureRecords(file: string): AsyncGenerator<string> {
+  const stream = createReadStream(file, { encoding: "utf8", highWaterMark: 1 << 22 });
+  let pending = "";
+  for await (const piece of stream) {
+    let buffer = pending.length === 0 ? (piece as string) : pending + (piece as string);
+    pending = "";
+    for (;;) {
+      const start = buffer.indexOf("{");
+      if (start < 0) {
+        if (!/^[[\],\s]*$/.test(buffer)) throw new Error(`unexpected JSON before a record in ${file}: ${buffer.slice(0, 80)}`);
+        buffer = "";
+        break;
+      }
+      if (start > 0 && !/^[[\],\s]*$/.test(buffer.slice(0, start))) {
+        throw new Error(`unexpected JSON before a record in ${file}: ${buffer.slice(0, 80)}`);
+      }
+      const stop = scanCompactJson(buffer, start);
+      if (stop < 0) {
+        pending = buffer.slice(start);
+        break;
+      }
+      const record = buffer.slice(start, stop);
+      if (!isCompleteJsonObject(record)) throw new Error(`unparseable JSON record in ${file}: ${record.slice(0, 80)}`);
+      buffer = buffer.slice(stop);
+      if (buffer.length > 0 && !/^[[\],\s]/.test(buffer)) {
+        throw new Error(`two JSON records with no separator in ${file}: ${buffer.slice(0, 80)}`);
+      }
+      yield record;
+    }
+  }
+  if (pending.trim().length > 0) throw new Error(`truncated JSON record at end of ${file}: ${pending.slice(0, 80)}`);
 }
 
 async function* textLines(file: string): AsyncGenerator<string> {
@@ -698,6 +732,26 @@ async function* textLines(file: string): AsyncGenerator<string> {
     pending = pending.slice(start);
   }
   if (pending.length > 0) yield pending;
+}
+
+export function encodeSpoolRecord(order: number, cellX: number, cellZ: number, raw: string): string {
+  return JSON.stringify({ v: order, x: cellX, z: cellZ, j: raw }).replace(/[\r\n]/g, " ");
+}
+
+export interface SpoolRecord {
+  readonly v: number;
+  readonly x: number;
+  readonly z: number;
+  readonly j: string;
+}
+
+export function decodeSpoolRecord(line: string): SpoolRecord {
+  const value = JSON.parse(line) as Partial<SpoolRecord> | null;
+  if (value === null || typeof value !== "object") throw new Error(`malformed spool record: ${line.slice(0, 80)}`);
+  if (typeof value.v !== "number" || typeof value.x !== "number" || typeof value.z !== "number" || typeof value.j !== "string") {
+    throw new Error(`malformed spool record: ${line.slice(0, 80)}`);
+  }
+  return { v: value.v, x: value.x, z: value.z, j: value.j };
 }
 
 export async function deduplicateStreaming(
@@ -740,7 +794,7 @@ async function runScan(
         const identity = feature.stableId;
         if (cell === null) {
           reachById.set(identity, Number.MAX_SAFE_INTEGER);
-          await spool.append(Number.MAX_SAFE_INTEGER, `${raw}\n`);
+          await spool.append(Number.MAX_SAFE_INTEGER, `${encodeSpoolRecord(0, 0, 0, raw)}\n`);
           continue;
         }
         if (cell[0] < minCellX) minCellX = cell[0];
@@ -749,7 +803,7 @@ async function runScan(
         if (cell[1] > maxCellZ) maxCellZ = cell[1];
         const known = reachById.get(identity);
         if (known === undefined || cell[1] > known) reachById.set(identity, cell[1]);
-        await spool.append(Math.floor(cell[1] / SCAN_BAND_CELLS), `${total}\t${cell[0]}\t${cell[1]}\t${raw}\n`);
+        await spool.append(Math.floor(cell[1] / SCAN_BAND_CELLS), `${encodeSpoolRecord(total, cell[0], cell[1], raw)}\n`);
       }
     }
   } finally {
@@ -943,20 +997,8 @@ async function runScan(
     const records: { order: number; cellX: number; cellZ: number; raw: string; anchored: boolean }[] = [];
     for await (const line of textLines(path.join(workDir, name))) {
       if (line.length === 0) continue;
-      if (line[0] === "{") {
-        records.push({ order: 0, cellX: 0, cellZ: 0, raw: line, anchored: false });
-        continue;
-      }
-      const first = line.indexOf("\t");
-      const second = line.indexOf("\t", first + 1);
-      const third = line.indexOf("\t", second + 1);
-      records.push({
-        order: Number(line.slice(0, first)),
-        cellX: Number(line.slice(first + 1, second)),
-        cellZ: Number(line.slice(second + 1, third)),
-        raw: line.slice(third + 1),
-        anchored: true,
-      });
+      const decoded = decodeSpoolRecord(line);
+      records.push({ order: decoded.v, cellX: decoded.x, cellZ: decoded.z, raw: decoded.j, anchored: decoded.v > 0 });
     }
     records.sort((first, second) => {
       if (first.anchored !== second.anchored) return first.anchored ? -1 : 1;
