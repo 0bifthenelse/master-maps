@@ -141,7 +141,7 @@ describe("TileMetaFeatureSchema", () => {
 });
 
 describe("GET /api/map/tile/[tileId] meta sidecar", () => {
-  it("serves the geometry-stripped envelope with the gzip encoding header", async () => {
+  it("serves the geometry-stripped envelope as plain JSON", async () => {
     const { geometry, localGeometry, sourceGeometry, ...meta } = CANONICAL_FEATURES[0]!;
     void geometry;
     void localGeometry;
@@ -149,7 +149,10 @@ describe("GET /api/map/tile/[tileId] meta sidecar", () => {
     await writeMetaFixture("l0_0_0", [meta], 4096);
     const response = await GET(tileRequest("l0_0_0"), tileParams("l0_0_0"));
     expect(response.status).toBe(200);
-    expect(response.headers.get("content-encoding")).toBe("gzip");
+    /* The fixture is stored gzipped but the sidecar is decompressed before it
+       is serialized, so the body must not be labelled gzip: a gzip header over
+       plain JSON makes the browser reject the response. */
+    expect(response.headers.get("content-encoding")).toBeNull();
     expect(response.headers.get("content-type")).toBe("application/json");
     const body = (await response.json()) as unknown;
     const parsed = TileMetaDataSchema.parse(body);

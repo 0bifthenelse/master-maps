@@ -129,7 +129,6 @@ export async function GET(
   const metaPath = join(dataRoot, "generated", "meta", `${tileId}.json.gz`);
   const legacyPath = join(dataRoot, "generated", "tiles", `${tileId}.json`);
   let tilePath = metaPath;
-  let gzipped = true;
   let version: string;
   try {
     const metaStats = await stat(metaPath);
@@ -138,7 +137,6 @@ export async function GET(
   } catch (metaError) {
     if (!isMissing(metaError)) throw metaError;
     tilePath = legacyPath;
-    gzipped = false;
     try {
       const legacyStats = await stat(legacyPath);
       if (legacyStats.size > MAX_TILE_SIZE) return NextResponse.json({ error: "TILE_TOO_LARGE", size: legacyStats.size, limit: MAX_TILE_SIZE }, { status: 413 });
@@ -158,7 +156,8 @@ export async function GET(
       Vary: "Accept-Encoding",
     };
     if (request.headers.get("if-none-match") === version) return new NextResponse(null, { status: 304, headers });
-    if (gzipped) headers["Content-Encoding"] = "gzip";
+    /* The cached entry is the DECOMPRESSED tile, so the body is plain JSON and
+       declaring gzip here makes the browser fail to decode it. */
     return new NextResponse(JSON.stringify(data), { status: 200, headers });
   } catch (error) {
     if (isMissing(error) || isUnindexed(error)) return unavailable();
