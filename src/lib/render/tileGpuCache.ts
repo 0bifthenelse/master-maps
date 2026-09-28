@@ -1,13 +1,3 @@
-/**
- * @file Per-tile GPU resource cache.
- *
- * Owns one BufferGeometry per (tileId, layerId) pair plus the stable
- * featureId -> canonical stableId mapping used for picking. Entries are
- * evicted in least-recently-used order once the byte budget is exceeded;
- * eviction disposes the geometries and drops the payload slab reference so
- * the decoded buffers can be collected. Adding or evicting one tile never
- * touches another tile's geometries.
- */
 import type { BufferGeometry } from 'three';
 import type { DecodedRenderTile, RenderLayerId } from './codec';
 import {
@@ -41,6 +31,12 @@ export interface TileCacheEntry {
   layers: Map<RenderLayerId, TileLayerEntry>;
   /** Canonical stableId per feature, ordered by layer then by range. */
   stableIds: string[];
+  /** Holder tokens (scene groups or tiles) still rendering this entry. */
+  references: number;
+  /** Committed frames elapsed since this entry was retired. */
+  framesWaiting: number;
+  /** True once evicted or replaced, so it is only ever torn down once. */
+  isRetired: boolean;
 }
 
 export interface TileGpuCacheStats {
@@ -51,6 +47,8 @@ export interface TileGpuCacheStats {
   evictions: number;
   disposedGeometries: number;
   lastEvicted: string[];
+  mounted: number;
+  retiredPending: number;
 }
 
 interface CacheStore {
@@ -64,13 +62,15 @@ interface CacheStore {
 
 const EMPTY_SLAB = new ArrayBuffer(0);
 const RECENT_EVICTION_LOG = 32;
+const SCENE_HOLDER = "scene";
 
 function createStore(maxBytes: number): CacheStore {
   return { tiles: new Map(), byteSize: 0, maxBytes, evictions: 0, disposedGeometries: 0, lastEvicted: [] };
 }
 
 let store = createStore(DEFAULT_GPU_CACHE_BYTES);
-const pendingDisposals: TileCacheEntry[] = [];
+const retiredEntries = new Set<TileCacheEntry>();
+const mountedHolders = new Map<string, Map<string, TileCacheEntry | undefined>>();
 
 export class TileGpuCacheError extends Error {
   constructor(message: string) {
@@ -92,7 +92,7 @@ function collectStableIds(view: DecodedTileView, tile: DecodedRenderTile): strin
   return stableIds;
 }
 
-function releaseEntry(entry: TileCacheEntry): void {
+function teardownEntry(entry: TileCacheEntry): void {
   for (const layer of entry.layers.values()) {
     layer.geometry.dispose();
     store.disposedGeometries += 1;
@@ -100,38 +100,14 @@ function releaseEntry(entry: TileCacheEntry): void {
   entry.layers.clear();
   entry.stableIds.length = 0;
   entry.slab = EMPTY_SLAB;
+  retiredEntries.delete(entry);
 }
 
-export function hasPendingTileGpuDisposals(): boolean {
-  return pendingDisposals.length > 0;
-}
-
-export function releasePendingTileGpuDisposals(
-  mountedGroups: readonly { entry: TileCacheEntry }[] | null = null,
-): void {
-  for (let index = pendingDisposals.length - 1; index >= 0; index -= 1) {
-    const entry = pendingDisposals[index]!;
-    let isMounted = false;
-    if (mountedGroups !== null) {
-      for (const group of mountedGroups) {
-        if (group.entry === entry) {
-          isMounted = true;
-          break;
-        }
-      }
-    }
-    if (isMounted) continue;
-    pendingDisposals.splice(index, 1);
-    releaseEntry(entry);
-  }
-}
-
-function disposeEntry(entry: TileCacheEntry): void {
-  if (typeof window === "undefined") {
-    releaseEntry(entry);
-    return;
-  }
-  pendingDisposals.push(entry);
+function retireEntry(entry: TileCacheEntry): void {
+  if (entry.isRetired) return;
+  entry.isRetired = true;
+  entry.framesWaiting = 0;
+  retiredEntries.add(entry);
 }
 
 function recordEviction(tileId: string): void {
@@ -150,7 +126,81 @@ function evictToBudget(): void {
     store.tiles.delete(tileId);
     store.byteSize -= entry.byteSize;
     recordEviction(tileId);
-    disposeEntry(entry);
+    retireEntry(entry);
+  }
+}
+
+function acquireHolder(tileId: string, token: string): void {
+  let holders = mountedHolders.get(tileId);
+  if (holders === undefined) {
+    holders = new Map();
+    mountedHolders.set(tileId, holders);
+  } else if (holders.has(token)) {
+    return;
+  }
+  const entry = store.tiles.get(tileId);
+  if (entry !== undefined) {
+    entry.references += 1;
+    entry.framesWaiting = 0;
+  }
+  holders.set(token, entry);
+}
+
+function releaseHolder(tileId: string, token: string): void {
+  const holders = mountedHolders.get(tileId);
+  if (holders === undefined || !holders.has(token)) {
+    throw new TileGpuCacheError(`tile ${tileId} released for holder ${token} that never acquired it`);
+  }
+  const entry = holders.get(token);
+  holders.delete(token);
+  if (holders.size === 0) mountedHolders.delete(tileId);
+  if (entry === undefined) return;
+  if (entry.references === 0) {
+    throw new TileGpuCacheError(`tile ${tileId} reference count is already zero for holder ${token}`);
+  }
+  entry.references -= 1;
+}
+
+/**
+ * Take a holder reference on a tile, idempotent per holder token so a repeated
+ * acquire cannot inflate the count and a double release is rejected instead
+ * of driving it negative.
+ */
+export function acquireTileHolder(tileId: string, token: string = SCENE_HOLDER): void {
+  acquireHolder(tileId, token);
+}
+
+/** Give back a holder reference; the geometry is freed only by the last release. */
+export function releaseTileHolder(tileId: string, token: string = SCENE_HOLDER): void {
+  releaseHolder(tileId, token);
+}
+
+/**
+ * Declare the tiles the scene currently renders. A mounted tile is never
+ * disposed whatever the LRU budget does to the store. A tile leaving the set
+ * restarts its retirement countdown, so it is torn down on the first
+ * committed frame after this call, never by a timer.
+ */
+export function syncMountedTiles(tileIds: Iterable<string>): void {
+  const next = new Set(tileIds);
+  for (const tileId of next) {
+    if (mountedHolders.get(tileId)?.has(SCENE_HOLDER) !== true) acquireHolder(tileId, SCENE_HOLDER);
+  }
+  for (const tileId of [...mountedHolders.keys()]) {
+    if (!next.has(tileId)) releaseHolder(tileId, SCENE_HOLDER);
+  }
+}
+
+/**
+ * Advance every retirement countdown by one committed frame. A retired entry
+ * whose last holder is gone is torn down at the earliest one committed frame
+ * after that release, which is after the frame that drew it was submitted.
+ */
+export function markFrameCommitted(): void {
+  for (const entry of [...retiredEntries]) {
+    if (entry.references > 0) continue;
+    entry.framesWaiting += 1;
+    if (entry.framesWaiting >= 1) teardownEntry(entry);
   }
 }
 
@@ -170,14 +220,12 @@ export function getTileGpuCacheStats(): TileGpuCacheStats {
     evictions: store.evictions,
     disposedGeometries: store.disposedGeometries,
     lastEvicted: [...store.lastEvicted],
+    mounted: mountedHolders.size,
+    retiredPending: retiredEntries.size,
   };
 }
 
-/**
- * Install a decoded tile as GPU-ready geometry, one BufferGeometry per
- * (tileId, layerId). The payload slab stays referenced by the entry so
- * every geometry attribute keeps a live view of it.
- */
+/** Install a decoded tile as GPU-ready geometry, one BufferGeometry per (tileId, layerId). */
 export function putDecodedTile(tile: DecodedRenderTile): TileCacheEntry {
   const view = viewDecodedTile(tile);
   const stableIds = collectStableIds(view, tile);
@@ -207,19 +255,28 @@ export function putDecodedTile(tile: DecodedRenderTile): TileCacheEntry {
     tileId: view.tileId,
     lod: view.lod,
     slab: view.payload,
-    /* One shared slab, charged once in full: the per-layer geometries are
-       views over those same bytes, so summing view lengths would double
-       count them. byteSize therefore tracks the real retained size, which is
-       what the 512MB budget has to bound. */
+    /* One shared slab charged once in full: the per-layer geometries are views
+       over those same bytes, so summing view lengths would double count them. */
     byteSize: view.payload.byteLength,
     layers,
     stableIds,
+    references: 0,
+    framesWaiting: 0,
+    isRetired: false,
   };
   const previous = store.tiles.get(entry.tileId);
   if (previous !== undefined) {
     store.tiles.delete(entry.tileId);
     store.byteSize -= previous.byteSize;
-    disposeEntry(previous);
+    retireEntry(previous);
+  }
+  const holders = mountedHolders.get(entry.tileId);
+  if (holders !== undefined) {
+    for (const [token, holder] of holders) {
+      if (holder !== undefined && holder.references > 0) holder.references -= 1;
+      entry.references += 1;
+      holders.set(token, entry);
+    }
   }
   residentDecodedTiles.set(entry.tileId, tile);
   store.tiles.set(entry.tileId, entry);
@@ -228,12 +285,9 @@ export function putDecodedTile(tile: DecodedRenderTile): TileCacheEntry {
   return entry;
 }
 
-/* Registry of the decoded tiles backing the cache, keyed by tileId in the
-   same LRU order as the cache itself, so iterating it is iterating in render
-   order. The value is the very object putDecodedTile received: it is
-   zero-copy (its payload is the same slab the geometries view), so holding
-   it costs no extra bytes, and it is a superset of what consumers need
-   (meta, header.bounds, and per-layer descriptors to read featureRanges). */
+/* Registry of the decoded tiles backing the cache, kept in the same LRU order
+   as the cache itself; the value is the zero-copy tile whose payload is the
+   slab the geometries view, so holding it costs no extra bytes. */
 const residentDecodedTiles = new Map<string, DecodedRenderTile>();
 
 export function getResidentDecodedTile(tileId: string): DecodedRenderTile | undefined {
@@ -257,10 +311,7 @@ export function hasTileCacheEntry(tileId: string): boolean {
   return store.tiles.has(tileId);
 }
 
-/**
- * Remove one tile from the cache and dispose its geometries. Tiles the
- * scene still needs must be re-installed from their decoded tile.
- */
+/** Drop one tile from the cache; its geometry retires only once nothing holds it. */
 export function evictTile(tileId: string): boolean {
   const entry = store.tiles.get(tileId);
   if (entry === undefined) return false;
@@ -268,7 +319,7 @@ export function evictTile(tileId: string): boolean {
   residentDecodedTiles.delete(tileId);
   store.byteSize -= entry.byteSize;
   recordEviction(tileId);
-  disposeEntry(entry);
+  retireEntry(entry);
   return true;
 }
 
@@ -284,7 +335,7 @@ export function retainTiles(tileIds: Iterable<string>): string[] {
 }
 
 export function clearTileGpuCache(): void {
-  for (const entry of store.tiles.values()) disposeEntry(entry);
+  for (const entry of store.tiles.values()) retireEntry(entry);
   store.tiles.clear();
   residentDecodedTiles.clear();
   store.byteSize = 0;
@@ -295,22 +346,13 @@ export function clearTileGpuCache(): void {
 
 export function resetTileGpuCache(maxBytes: number = DEFAULT_GPU_CACHE_BYTES): void {
   clearTileGpuCache();
-  releasePendingTileGpuDisposals();
+  for (const entry of [...retiredEntries]) teardownEntry(entry);
+  mountedHolders.clear();
   store = createStore(maxBytes);
 }
 
-/**
- * Resolve the stableId of a picked feature. Each layer stores its
- * featureRanges as [indexStart, indexCount, metaIndex] triples, so the
- * canonical stableId comes from the meta index of the range covering the
- * picked triangle index.
- *
- * metaIndex is absolute into the tile-wide meta array, and stableIds is built
- * by walking the layers in order with a cursor, so entry.stableIds already
- * carries that same absolute ordering. Adding the layer's firstStableId on top
- * of it double-offset every pick on a layer that is not the first to emit a
- * feature, which is why the index is used on its own here.
- */
+/* entry.stableIds already carries the absolute meta order buildRenderTile
+   emits, so the range triple's meta index is used on its own. */
 export function pickStableId(entry: TileCacheEntry, layerId: string, faceIndex: number): string | undefined {
   const layer = entry.layers.get(layerId as RenderLayerId);
   if (layer === undefined) return undefined;
@@ -326,14 +368,8 @@ export function pickStableId(entry: TileCacheEntry, layerId: string, faceIndex: 
   return undefined;
 }
 
-/**
- * Resolve a point-layer pick. A point feature owns exactly one vertex and a
- * zero-length range, so a face-index scan can never match it: the raycast
- * reports the vertex index instead, which addresses the range triple
- * directly. The guard rejects a tile whose point ranges do not map one
- * strictly increasing meta entry per feature, which is the only shape a
- * point layer can legitimately have.
- */
+/* A point feature owns one vertex and a zero-length range, so the raycast
+   reports the vertex index, which addresses the range triple directly. */
 function pickPointStableId(entry: TileCacheEntry, layer: TileLayerEntry, vertexIndex: number): string | undefined {
   if (vertexIndex < 0 || vertexIndex >= layer.featureCount) return undefined;
   const ranges = layer.geometry.getAttribute('featureRange');
