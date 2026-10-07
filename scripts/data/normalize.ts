@@ -7,6 +7,7 @@ import {
   type AddressFeature,
   type BoundaryFeature,
   type BusinessFeature,
+  type PoiFeature,
   type FeatureKind,
   type Geometry,
   type MapFeature,
@@ -35,7 +36,9 @@ import {
 } from "./osmRelations";
 import { ADOPTED_LAYERS } from "./bdtopoLayers";
 import { createBoundaryIndex, type BoundaryIndex } from "./boundaryIndex";
-import { normalizeBdtopo } from "./normalizeBdtopo";
+import { normalizeBdtopo, settlementAnchors } from "./normalizeBdtopo";
+import { categoryForNaf, categoryForOsmTags, nafIsPlace } from "../../src/lib/data/categories";
+import { conflateBusinesses } from "./conflate";
 import {
   emptyOsmNormalizeReport,
   normalizeOsmBulkFeature,
@@ -1324,8 +1327,8 @@ async function normalizeAddressesInto(source: AddressSourceInput, boundary: Boun
       const longitude = numberValue(record.lon);
       const latitude = numberValue(record.lat);
       if (longitude === undefined || latitude === undefined || !boundaryIndex.contains([longitude, latitude])) continue;
-      const housenumber = text(record.numero) ?? "";
-      const street = text(record.streetName ?? record.street) ?? "unknown street";
+      const housenumber = [text(record.numero), text(record.repetition)].filter((part) => part !== undefined).join(" ");
+      const street = text(record.streetName ?? record.street) ?? text(record.localityName) ?? "unknown street";
       const postcode = text(record.postalCode) ?? "";
       const city = text(record.city) ?? GERS_TERRITORY.name;
       const banId = text(record.banId);
@@ -1407,6 +1410,9 @@ function sireneBusiness(raw: Record<string, unknown>, factory: BusinessSourceFac
   const latitude = numberValue(coordinateRecord.lat);
   const businessName = cleanString(raw.tradingName) ?? cleanString(raw.legalName);
   if (longitude === undefined || latitude === undefined || !businessName) throw new Error("SIRENE record has no coordinate and name");
+  const nafCode = cleanString(raw.nafCode);
+  if (!nafIsPlace(nafCode)) throw new Error("SIRENE record describes a legal vehicle, not a place");
+  if (cleanString(raw.administrativeStatus) !== undefined && cleanString(raw.administrativeStatus) !== "A") throw new Error("SIRENE establishment is closed");
   const siret = cleanString(raw.siret);
   const stableId = siret ? `business:siret/${siret}` : buildStableId("business", businessName, cleanString(raw.address) ?? "", [longitude, latitude]);
   const local = wgs84ToRender([longitude, latitude]);
@@ -1420,9 +1426,9 @@ function sireneBusiness(raw: Record<string, unknown>, factory: BusinessSourceFac
     siren: cleanString(raw.siren),
     businessName,
     legalName: cleanString(raw.legalName),
-    brand: cleanString(raw.tradingName),
-    category: cleanString(raw.nafLabel),
-    nafCode: cleanString(raw.nafCode),
+    brand: cleanString(raw.signName),
+    category: categoryForNaf(nafCode) ?? cleanString(raw.nafLabel),
+    nafCode,
     nafLabel: cleanString(raw.nafLabel),
     name: businessName,
     address: cleanString(raw.address),
@@ -1463,7 +1469,7 @@ function osmBusiness(element: Record<string, unknown>, factory: BusinessSourceFa
     businessName,
     name: businessName,
     brand: cleanString(tags.brand),
-    category: cleanString(tags.shop) ?? cleanString(tags.office) ?? cleanString(tags.craft) ?? cleanString(tags.amenity),
+    category: categoryForOsmTags(tags) ?? cleanString(tags.shop) ?? cleanString(tags.office) ?? cleanString(tags.craft) ?? cleanString(tags.amenity),
     address: [cleanString(tags["addr:housenumber"]), cleanString(tags["addr:street"]), cleanString(tags["addr:postcode"])].filter((value): value is string => value !== undefined).join(", ") || undefined,
     phone: cleanString(tags.phone) ?? cleanString(tags["contact:phone"]),
     website: cleanString(tags.website) ?? cleanString(tags["contact:website"]),
@@ -1721,6 +1727,24 @@ export async function normalizeAll(rawDir?: string, outDir?: string, scope?: Nor
   logPhase(`osm overpass ${osmResult.features.length}`, rss);
 
   const bdtopoBoundaryRings = boundaries.map((polygon) => polygon.coordinates);
+  const chefLieuAnchors = new Map<string, Coordinate>();
+  for (const filePath of sources.bdtopoFiles.filter((file) => path.basename(file) === "bdtopo-settlements.geojson")) {
+    const stream = streamFeatureCollection(filePath);
+    try {
+      let batch: Record<string, unknown>[] = [];
+      for await (const feature of stream) {
+        batch.push(feature);
+        if (batch.length >= FEATURE_BATCH_SIZE) {
+          settlementAnchors(batch, chefLieuAnchors);
+          batch = [];
+        }
+      }
+      settlementAnchors(batch, chefLieuAnchors);
+    } finally {
+      stream.close();
+    }
+  }
+  logPhase(`bdtopo chef-lieu anchors ${chefLieuAnchors.size}`, rss);
   for (const filePath of sources.bdtopoFiles) {
     const sourceLayer = path.basename(filePath);
     let produced = 0;
@@ -1730,7 +1754,7 @@ export async function normalizeAll(rawDir?: string, outDir?: string, scope?: Nor
       for await (const feature of stream) {
         batch.push({ ...feature, sourceLayer });
         if (batch.length < FEATURE_BATCH_SIZE) continue;
-        for (const item of normalizeBdtopo(batch, bdtopoBoundaryRings, { edition: bdtopoEdition })) accept(item);
+        for (const item of normalizeBdtopo(batch, bdtopoBoundaryRings, { edition: bdtopoEdition, chefLieuAnchors })) accept(item);
         produced += batch.length;
         batch = [];
       }
@@ -1738,17 +1762,23 @@ export async function normalizeAll(rawDir?: string, outDir?: string, scope?: Nor
       stream.close();
     }
     if (batch.length > 0) {
-      for (const item of normalizeBdtopo(batch, bdtopoBoundaryRings, { edition: bdtopoEdition })) accept(item);
+      for (const item of normalizeBdtopo(batch, bdtopoBoundaryRings, { edition: bdtopoEdition, chefLieuAnchors })) accept(item);
       produced += batch.length;
     }
     logPhase(`bdtopo ${sourceLayer} ${produced}`, rss);
   }
 
+  const heldOsmPois: PoiFeature[] = [];
   const extractObjectIds = sources.osmExtractFile === null ? null : await collectOsmObjectIds(sources.osmExtractFile);
   if (sources.osmBulkFile !== null) {
     const bulk = streamOsmBulk(sources.osmBulkFile, { polygons: boundaries, index: boundaryIndex });
     for await (const feature of bulk) {
       if (extractObjectIds !== null && canonicalOsmObjectIds(feature.sourceId).some((id) => extractObjectIds.has(id))) continue;
+      /* Named OSM places wait for the SIRENE pass so a shop known to both is merged, not doubled. */
+      if (feature.kind === "poi" && feature.name !== undefined) {
+        heldOsmPois.push(feature);
+        continue;
+      }
       accept(feature);
     }
     await fs.writeFile(path.join(destinationDir, "osm-normalization.json"), normalizeOsmBulkReport(bulk.report), "utf8");
@@ -1764,8 +1794,11 @@ export async function normalizeAll(rawDir?: string, outDir?: string, scope?: Nor
   await normalizeAddressesInto({ file: sources.addressFile, license: sources.addressLicense }, boundary, accept as (feature: AddressFeature) => void);
   logPhase("addresses", rss);
 
-  for (const feature of await normalizeBusinesses({ file: sources.businessFile, header: sources.businessHeader, osm: sources.businessesOsm, web: sources.businessesWeb }, boundary)) accept(feature);
-  logPhase("businesses", rss);
+  const conflated = conflateBusinesses(heldOsmPois, await normalizeBusinesses({ file: sources.businessFile, header: sources.businessHeader, osm: sources.businessesOsm, web: sources.businessesWeb }, boundary));
+  for (const feature of conflated.pois) accept(feature);
+  for (const feature of conflated.businesses) accept(feature);
+  heldOsmPois.length = 0;
+  logPhase(`businesses ${conflated.businesses.length}, merged with OSM ${conflated.merged}, OSM-only places ${conflated.pois.length}`, rss);
 
   for (const feature of normalizeIgn(sources.ign, boundary)) accept(feature);
 

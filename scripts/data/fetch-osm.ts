@@ -384,7 +384,24 @@ function parseBoundaryRecord(raw: unknown): ParsedBoundaryRecord | null {
   return null;
 }
 const execFileAsync = promisify(execFile);
+/* The OpenStreetMap France extract is cut to the department itself (about 50 MB,
+   rebuilt daily), so it is tried first; the regional Geofabrik extract remains the
+   fallback when that mirror is unreachable. */
+const OSM_GERS_URL = "https://download.openstreetmap.fr/extracts/europe/france/midi_pyrenees/gers-latest.osm.pbf";
 const OSM_BULK_URL = "https://download.geofabrik.de/europe/france/midi-pyrenees-latest.osm.pbf";
+
+async function acquireOsmExtract(forceRefresh: boolean): Promise<{ outcome: AcquisitionOutcome; pbfPath: string; resource: string; source: string }> {
+  const gersPath = path.join(RAW_DIR, "gers-latest.osm.pbf");
+  try {
+    const outcome = await acquireFile({ url: OSM_GERS_URL, destination: gersPath, forceRefresh, headers: { Accept: "application/octet-stream" } });
+    return { outcome, pbfPath: gersPath, resource: OSM_GERS_URL, source: "OpenStreetMap contributors via OpenStreetMap France" };
+  } catch (error) {
+    console.warn(`Gers OSM extract unavailable (${error instanceof Error ? error.message : String(error)}); falling back to Geofabrik`);
+  }
+  const regionalPath = path.join(RAW_DIR, "midi-pyrenees-latest.osm.pbf");
+  const outcome = await acquireFile({ url: OSM_BULK_URL, destination: regionalPath, forceRefresh, headers: { Accept: "application/octet-stream" } });
+  return { outcome, pbfPath: regionalPath, resource: OSM_BULK_URL, source: "OpenStreetMap contributors via Geofabrik" };
+}
 
 async function hashFile(filePath: string): Promise<string> {
   const hash = crypto.createHash("sha256");
@@ -515,16 +532,18 @@ const OSM_BULK_AREA_TAGS = ["highway", "railway", "public_transport", "place", "
 const OSM_BULK_TAG_EXPRESSIONS: string[] = [
   ...OSM_BULK_AREA_TAGS.flatMap((tag) => [`w/${tag}`, `r/${tag}`]),
   ...OSM_BULK_POINT_TAGS.map((tag) => `n/${tag}`),
+  "n/leisure",
+  "n/sport",
+  "n/natural=peak,spring,cave_entrance,viewpoint",
 ];
 
 async function fetchBulkOsm(forceRefresh: boolean): Promise<void> {
-  const pbfPath = path.join(RAW_DIR, "midi-pyrenees-latest.osm.pbf");
   const boundaryPath = path.join(RAW_DIR, "gers-boundary.geojson");
   const extractPath = path.join(RAW_DIR, "gers-osm.osm.pbf");
   const filteredPath = path.join(RAW_DIR, "gers-osm-enrichment.osm.pbf");
   const geojsonPath = path.join(RAW_DIR, "osm-bulk.geojson");
   const manifestPath = path.join(INTERMEDIATE_DIR, "osm-bulk-manifest.json");
-  const outcome = await acquireFile({ url: OSM_BULK_URL, destination: pbfPath, forceRefresh, headers: { Accept: "application/octet-stream" } });
+  const { outcome, pbfPath, resource, source } = await acquireOsmExtract(forceRefresh);
   const sourceSha256 = outcome.sha256;
   const boundarySha256 = await hashFile(boundaryPath);
   const previous = await readReuseManifest(manifestPath);
@@ -538,14 +557,16 @@ async function fetchBulkOsm(forceRefresh: boolean): Promise<void> {
     "tags-filter", extractPath, "-o", filteredPath, "--overwrite",
     ...OSM_BULK_TAG_EXPRESSIONS,
   ], { maxBuffer: 2 * 1024 * 1024 });
+  /* Export the tag-filtered file: the unfiltered extract also carries every
+     untagged vertex way and every building already supplied by BD TOPO. */
   await execFileAsync("osmium", [
-    "export", extractPath, "-o", geojsonPath, "--overwrite",
+    "export", filteredPath, "-o", geojsonPath, "--overwrite",
     "--add-unique-id", "type_id",
     "--geometry-types", "point,linestring,polygon",
   ], { maxBuffer: 2 * 1024 * 1024 });
   const geojson = JSON.parse(await readFile(geojsonPath, "utf8")) as { features?: unknown[] };
   if (!Array.isArray(geojson.features) || geojson.features.length === 0) {
-    throw new Error("Geofabrik extract produced no features inside the Gers boundary");
+    throw new Error("OSM extract produced no features inside the Gers boundary");
   }
   const outputs: OsmBulkOutput[] = [
     { file: extractPath, sha256: await hashFile(extractPath), recordCount: await osmiumObjectCount(extractPath) },
@@ -553,8 +574,8 @@ async function fetchBulkOsm(forceRefresh: boolean): Promise<void> {
     { file: geojsonPath, sha256: await hashFile(geojsonPath), recordCount: geojson.features.length },
   ];
   await writeFile(manifestPath, JSON.stringify({
-    source: "OpenStreetMap contributors via Geofabrik",
-    resource: OSM_BULK_URL,
+    source,
+    resource,
     acquiredAt: new Date().toISOString(),
     license: "ODbL-1.0",
     crs: "EPSG:4326",

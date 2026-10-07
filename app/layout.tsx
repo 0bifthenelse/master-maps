@@ -1,20 +1,39 @@
-import type { Metadata } from "next";
+import type { Metadata, Viewport } from "next";
+import { IBM_Plex_Mono, Rajdhani } from "next/font/google";
 import "./globals.css";
 
+const mono = IBM_Plex_Mono({
+  subsets: ["latin", "latin-ext"],
+  weight: ["400", "500", "600", "700"],
+  variable: "--font-mono",
+  display: "swap",
+});
+
+const display = Rajdhani({
+  subsets: ["latin", "latin-ext"],
+  weight: ["500", "600", "700"],
+  variable: "--font-display",
+  display: "swap",
+});
+
 export const metadata: Metadata = {
-  title: "Auch - Carte interactive",
+  title: "Master Maps — Gers",
   description:
-    "Carte interactive 2D d'Auch, Gers, avec recherche, sélection et couches thématiques basée sur des sources ouvertes.",
-  viewport: "width=device-width, initial-scale=1",
+    "An interactive 3D map of the Gers department (France): every commune, street, address, building, business and landmark, searchable, from open IGN, BAN, SIRENE and OpenStreetMap data.",
+  applicationName: "Master Maps",
 };
 
-export default function RootLayout({
-  children,
-}: {
-  children: React.ReactNode;
-}) {
+export const viewport: Viewport = {
+  width: "device-width",
+  initialScale: 1,
+  maximumScale: 1,
+  userScalable: false,
+  themeColor: "#04060a",
+};
+
+export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
-    <html lang="fr" suppressHydrationWarning>
+    <html lang="en" className={`${mono.variable} ${display.variable}`} suppressHydrationWarning>
       <body>{children}</body>
     </html>
   );

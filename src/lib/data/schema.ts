@@ -205,6 +205,7 @@ export const RoadFeatureSchema = FeatureBaseSchema.extend({
   kind: z.literal("road"),
   highway: z.string().optional(),
   roadClass: z.string().optional(),
+  ref: z.string().optional(),
   width: FINITE_NUMBER.nonnegative().optional(),
   widthInferred: z.boolean().optional(),
   widthSource: WidthSourceEnum.optional(),
@@ -253,6 +254,7 @@ export type WaterFeature = z.infer<typeof WaterFeatureSchema>;
 export const LanduseFeatureSchema = FeatureBaseSchema.extend({
   kind: z.literal("landuse"),
   landuseType: z.string().min(1),
+  category: z.string().optional(),
   area: FINITE_NUMBER.nonnegative().optional(),
 }).strict();
 export type LanduseFeature = z.infer<typeof LanduseFeatureSchema>;
@@ -375,6 +377,7 @@ const RoadFeatureMetaSchema = FeatureMetaBaseSchema.extend({
   kind: z.literal("road"),
   highway: z.string().optional(),
   roadClass: z.string().optional(),
+  ref: z.string().optional(),
   width: FINITE_NUMBER.nonnegative().optional(),
   widthInferred: z.boolean().optional(),
   widthSource: WidthSourceEnum.optional(),

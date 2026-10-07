@@ -20,6 +20,10 @@ interface ExtractedBusinessRecord {
   coordinate?: { lon: number; lat: number } | null;
   administrativeStatus?: string;
   creationDate?: string;
+  /** Legal form code (nature_juridique); 1000 is a sole trader. */
+  legalForm?: string;
+  employer?: boolean;
+  headcountClass?: string;
   confidence: "high" | "medium" | "low";
   nominatedRecord: boolean;
   geocodedBy?: string;
@@ -413,6 +417,33 @@ async function moliAvailable(): Promise<boolean> {
   }
 }
 
+const LEGAL_FORM_WORDS = new Set(["SARL", "SAS", "SASU", "EURL", "SA", "SCI", "SNC", "SCM", "SCP", "SELARL", "SELAS", "SELAFA", "SELURL", "SCEA", "EARL", "GAEC", "GFA", "SCOP", "SEM", "SPL", "EI", "EIRL", "SC", "GIE"]);
+const SMALL_WORDS = new Set(["de", "du", "des", "la", "le", "les", "et", "en", "au", "aux", "sur", "sous", "a", "à", "d", "l"]);
+
+/** "SARL PHARMACIE OCCITANE" -> "Pharmacie Occitane": the name a sign shows, not the registry form. */
+export function displayBusinessName(raw: string | undefined): string | undefined {
+  if (raw === undefined) return undefined;
+  const withoutParen = raw.replace(/\(.*?\)/g, " ").replace(/\s+/g, " ").trim();
+  const words = withoutParen.split(" ").filter((word) => !LEGAL_FORM_WORDS.has(word.replace(/[.,]/g, "").toUpperCase()));
+  if (words.length === 0) return undefined;
+  const shouting = withoutParen === withoutParen.toUpperCase();
+  const cased = words.map((word, index) => {
+    if (!shouting) return word;
+    const lower = word.toLowerCase();
+    if (index > 0 && SMALL_WORDS.has(lower)) return lower;
+    return lower.replace(/(^|[-'’])(\p{L})/gu, (_match, separator: string, letter: string) => `${separator}${letter.toUpperCase()}`)
+      .replace(/^(D|L)'(\p{L})/u, (_match, article: string, letter: string) => `${index > 0 ? article.toLowerCase() : article}'${letter.toUpperCase()}`);
+  });
+  const name = cased.join(" ").trim();
+  return name.length > 0 ? name : undefined;
+}
+
+function firstText(value: unknown): string | undefined {
+  if (typeof value === "string" && value.trim() !== "") return value.trim();
+  if (Array.isArray(value)) for (const entry of value) if (typeof entry === "string" && entry.trim() !== "") return entry.trim();
+  return undefined;
+}
+
 function extractSireneRecord(
   apiResult: Record<string, unknown>,
   nominatedRecord: boolean,
@@ -429,22 +460,24 @@ function extractSireneRecord(
   const coordLon = local["longitude"] as string | number | undefined;
   const coordLat = local["latitude"] as string | number | undefined;
 
-  const nafCode = (local["activite_principale"] ?? siege?.["activite_principale"]) as string | undefined;
+  const nafCode = (local["activite_principale"] ?? siege?.["activite_principale"] ?? apiResult["activite_principale"]) as string | undefined;
   const nafLabel = (local["activite_principale_libelle"] ?? siege?.["libelle_activite_principale"]) as string | undefined;
+  const legalName = firstText(apiResult["nom_complet"]) ?? firstText(apiResult["nom_raison_sociale"]);
+  const signName = firstText(local["liste_enseignes"]) ?? firstText(local["nom_commercial"]) ?? firstText(local["enseigne_nom_commercial"]);
 
   return {
     sourceId: `sirene:${siret}`,
     siret,
     siren: apiResult["siren"] as string | undefined,
-    legalName: apiResult["nom_complet"] as string | undefined,
-    tradingName: (local["nom_commercial"] ??
-      local["enseigne_nom_commercial"] ??
-      apiResult["nom_complet"]) as string | undefined,
+    legalName,
+    tradingName: displayBusinessName(signName) ?? displayBusinessName(legalName),
     nafCode,
     nafLabel,
     address: local["adresse"] as string | undefined,
+    postcode: firstText(local["code_postal"]),
+    communeCode: firstText(local["commune"]),
     coordinate:
-      coordLon != null && coordLat != null
+      coordLon != null && coordLat != null && Number.isFinite(Number(coordLon)) && Number.isFinite(Number(coordLat))
         ? {
             lon: Number(coordLon),
             lat: Number(coordLat),
@@ -452,10 +485,29 @@ function extractSireneRecord(
         : null,
     administrativeStatus: local["etat_administratif"] as string | undefined,
     creationDate: local["date_creation"] as string | undefined,
+    legalForm: firstText(apiResult["nature_juridique"]),
+    employer: local["caractere_employeur"] === "O" ? true : local["caractere_employeur"] === "N" ? false : undefined,
+    headcountClass: firstText(local["tranche_effectif_salarie"]),
     confidence: "high",
     nominatedRecord,
     acquiredFromQuery: { q: query.q, page: query.page },
-  };
+    ...(signName === undefined ? {} : { signName }),
+  } as ExtractedBusinessRecord;
+}
+
+/**
+ * Whether an establishment belongs on a public map. Closed establishments
+ * are history, not places; an establishment whose holder asked INSEE not to
+ * publish it is skipped; and a sole trader registered at a home address is a
+ * person, so it is only shown once it trades under a sign or employs staff.
+ */
+export function publishableEstablishment(local: Record<string, unknown>, company: Record<string, unknown>): boolean {
+  if (local["etat_administratif"] !== undefined && local["etat_administratif"] !== "A") return false;
+  if (local["statut_diffusion_etablissement"] === "P" || company["statut_diffusion"] === "P") return false;
+  const legalForm = firstText(company["nature_juridique"]) ?? "";
+  if (!legalForm.startsWith("1")) return true;
+  const hasSign = firstText(local["liste_enseignes"]) !== undefined || firstText(local["nom_commercial"]) !== undefined;
+  return hasSign || local["caractere_employeur"] === "O";
 }
 
 function annuaireQueryString(params: Record<string, string | number>): string {
@@ -673,15 +725,11 @@ export class BanAddressIndex {
   }
 
   lookup(postcode: string, streetText: string, houseNumber: string): BanAddressIndexEntry | null {
+    /* Only an exact postcode, street and number match places a business:
+       the first entry of a merely similar street can sit kilometres away,
+       and an unplaced business is better than a misplaced one. */
     const exact = this.cells.get(geocodeKey(postcode, streetText, houseNumber));
     if (exact !== undefined && exact.length > 0) return exact[0]!;
-    const normalizedStreet = streetText.toUpperCase().replace(/[^A-Z0-9]+/g, " ").trim();
-    for (const [key, entries] of this.cells) {
-      if (!key.startsWith(`${postcode}|`)) continue;
-      const candidateStreet = key.split("|")[1] ?? "";
-      if (candidateStreet === normalizedStreet) return entries[0]!;
-      if (candidateStreet.includes(normalizedStreet) || normalizedStreet.includes(candidateStreet)) return entries[0]!;
-    }
     return null;
   }
 }
@@ -872,7 +920,8 @@ async function acquireSirene(
           const siret = local["siret"];
           if (typeof siret !== "string" || siret === "") continue;
           establishedReceived += 1;
-          const record = extractSireneRecord({ siege: local, matching_etablissements: [local], nom_complet: result["nom_complet"], siren: result["siren"] }, false, { q: entry.label, page });
+          if (!publishableEstablishment(local, result)) continue;
+          const record = extractSireneRecord({ siege: local, matching_etablissements: [local], nom_complet: result["nom_complet"], nom_raison_sociale: result["nom_raison_sociale"], nature_juridique: result["nature_juridique"], activite_principale: result["activite_principale"], siren: result["siren"] }, false, { q: entry.label, page });
           if (record === null) continue;
           if (record.coordinate === null) {
             const parsedAddress = parseSireneAddress(record.address);

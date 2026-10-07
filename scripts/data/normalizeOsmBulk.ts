@@ -1,4 +1,5 @@
 import { renderToWgs84, wgs84ToRender } from "../../src/lib/geo/crs";
+import { categoryForOsmTags } from "../../src/lib/data/categories";
 import { clipLineStringToPolygon, clipPolygonToPolygon, normalizePolygonGeometry, type PolygonGeometry } from "../../src/lib/geo/polygon";
 import type { BoundaryIndex } from "./boundaryIndex";
 import { MapFeatureSchema, type Geometry, type MapFeature } from "../../src/lib/data/schema";
@@ -120,6 +121,8 @@ const LEISURE_POINT_POI = new Set(["horse_riding", "fishing", "fitness_station",
 const LEISURE_AREAL_ONLY = new Set(Object.keys(LEISURE_LANDUSE));
 
 const MAN_MADE_STRUCTURE = new Set(["bridge", "works"]);
+/* Landmarks a map reader navigates by: Gers windmills, water towers and masts. */
+const MAN_MADE_LANDMARK = new Set(["windmill", "water_tower", "tower", "mast", "lighthouse", "chimney", "silo", "watermill", "wastewater_plant", "water_works", "observatory"]);
 
 const BARRIER_GATE = new Set(["gate", "stile", "lift_gate", "swing_gate", "kissing_gate", "wicket_gate", "bump_gate"]);
 
@@ -152,9 +155,24 @@ function resolveGeometry(geometry: Geometry, mode: GeometryMode): GeometryOutcom
   return ring === null ? reject : { ok: true, geometry: { type: "Polygon", coordinates: [ring] }, reason: "unclassified_tags" };
 }
 
+function poiTagValue(properties: Record<string, unknown>): string | undefined {
+  for (const key of POI_TAGS) {
+    const value = text(properties[key]);
+    if (value !== undefined && value !== "no") return value;
+  }
+  return undefined;
+}
+
 function classifyCompleteTags(properties: Record<string, unknown>): CompleteClassification | OsmDropReason {
   const building = text(properties.building);
-  if (building !== undefined || text(properties["building:part"]) !== undefined) return { kind: "building", subtype: building ?? "part", mode: "areal" };
+  if (building !== undefined || text(properties["building:part"]) !== undefined) {
+    /* A shop, church or town hall is often mapped on its building outline.
+       BD TOPO already supplies the footprint, so the OSM object is kept for
+       what only it carries: the named place people search for. */
+    const poi = poiTagValue(properties);
+    if (poi !== undefined && text(properties.name) !== undefined) return { kind: "poi", subtype: poi, mode: "any" };
+    return { kind: "building", subtype: building ?? "part", mode: "areal" };
+  }
   const place = text(properties.place);
   if (place !== undefined) {
     return PLACE_KINDS.has(place) ? { kind: "place", subtype: place, mode: "any" } : "excluded_tag";
@@ -210,7 +228,8 @@ function classifyCompleteTags(properties: Record<string, unknown>): CompleteClas
   }
   const manMade = text(properties["man_made"]);
   if (manMade !== undefined) {
-    return MAN_MADE_STRUCTURE.has(manMade) ? { kind: "poi", subtype: manMade, mode: "any" } : "excluded_tag";
+    if (MAN_MADE_STRUCTURE.has(manMade) || MAN_MADE_LANDMARK.has(manMade)) return { kind: "poi", subtype: manMade, mode: "any" };
+    return "excluded_tag";
   }
   if (highway !== undefined) {
     if (ROAD_HIGHWAY.has(highway)) return { kind: "road", subtype: highway, mode: "linear" };
@@ -328,6 +347,20 @@ function completeFeature(
     amenity: properties.amenity,
     shop: properties.shop,
     tourism: properties.tourism,
+    historic: properties.historic,
+    office: properties.office,
+    craft: properties.craft,
+    healthcare: properties.healthcare,
+    brand: properties.brand,
+    cuisine: properties.cuisine,
+    email: properties.email ?? properties["contact:email"],
+    ref: properties.ref,
+    altName: properties["alt_name"],
+    occitanName: properties["name:oc"],
+    wikipedia: properties.wikipedia,
+    wikidata: properties.wikidata,
+    religion: properties.religion,
+    sport: properties.sport,
   });
   const geometry: Geometry = isPoint ? { type: "Point", coordinates: anchor } : effective;
   const localGeometry: Geometry = isPoint
@@ -396,6 +429,7 @@ function completeFeature(
       localGeometry,
       highway: classification.subtype,
       roadClass: classification.subtype,
+      ref: text(properties.ref),
       width,
       widthInferred: width === undefined,
       widthSource: width === undefined ? "inferred_default" : "explicit",
@@ -447,7 +481,8 @@ function completeFeature(
     geometry,
     localGeometry,
     poiType: classification.subtype,
-    category: text(properties.amenity) ?? text(properties.shop) ?? text(properties.tourism) ?? text(properties.historic) ?? text(properties.office) ?? text(properties.craft) ?? text(properties.healthcare),
+    category: categoryForOsmTags(properties) ?? text(properties.amenity) ?? text(properties.shop) ?? text(properties.tourism) ?? text(properties.historic) ?? text(properties.office) ?? text(properties.craft) ?? text(properties.healthcare) ?? text(properties["man_made"]) ?? text(properties.leisure) ?? text(properties.natural),
+    address: osmAddress(properties),
     website: text(properties.website) ?? text(properties["contact:website"]),
     phone: text(properties.phone) ?? text(properties["contact:phone"]),
     openingHours: text(properties["opening_hours"]),
@@ -455,6 +490,15 @@ function completeFeature(
     operator: text(properties.operator),
     sourceMetadata,
   }), reason: "unclassified_tags" };
+}
+
+/** "12 Rue Gambetta, 32000 Auch" from the addr:* tags, when they say enough. */
+export function osmAddress(properties: Record<string, unknown>): string | undefined {
+  const street = text(properties["addr:street"]) ?? text(properties["addr:place"]);
+  if (street === undefined) return undefined;
+  const line = [text(properties["addr:housenumber"]), street].filter((part) => part !== undefined).join(" ");
+  const locality = [text(properties["addr:postcode"]), text(properties["addr:city"])].filter((part) => part !== undefined).join(" ");
+  return locality.length > 0 ? `${line}, ${locality}` : line;
 }
 
 function record(value: unknown): value is Record<string, unknown> {

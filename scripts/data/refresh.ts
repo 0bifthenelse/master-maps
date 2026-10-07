@@ -4,7 +4,7 @@ import * as path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { normalizeAll } from "./normalize";
-import { deduplicateAll } from "./deduplicate";
+import { createDedupAccounting, deduplicateAll } from "./deduplicate";
 import { buildTilesAll } from "./build-tiles";
 import { buildIndexAll } from "./build-search-index";
 import { validate } from "./validate";
@@ -59,6 +59,8 @@ function createPaths(scope: "gers" | "auch"): RefreshPaths {
 
 interface RefreshOptions {
   offline: boolean;
+  /** Acquire every source into the raw cache and stop before normalization. */
+  fetchOnly?: boolean;
   forceIgn: boolean;
   force: Set<string>;
   scope: "gers" | "auch";
@@ -85,7 +87,7 @@ function parseArgs(args: string[]): RefreshOptions {
   const scopeArgument = args.find((argument) => argument.startsWith("--scope="));
   const scopeValue = scopeArgument?.slice("--scope=".length) ?? "gers";
   if (scopeValue !== "gers" && scopeValue !== "auch") throw new Error(`Unsupported scope "${scopeValue}"`);
-  return { offline: args.includes("--offline"), forceIgn: args.includes("--force-ign"), force, scope: scopeValue };
+  return { offline: args.includes("--offline"), fetchOnly: args.includes("--fetch-only"), forceIgn: args.includes("--force-ign"), force, scope: scopeValue };
 }
 
 async function ensureDirs(paths: RefreshPaths): Promise<void> {
@@ -476,6 +478,10 @@ export async function refreshAll(options: RefreshOptions = { offline: false, for
   await phaseAddresses(paths, options);
   await phaseBusinesses(paths, options);
   await phaseOptionalIgn(paths, options);
+  if (options.fetchOnly === true) {
+    console.error(`[refresh] sources acquired in ${Math.round((Date.now() - started) / 1000)} s; stopping before normalization (--fetch-only)`);
+    return;
+  }
   const normalizeScope = paths.scope === "auch"
     ? { boundaryRawFile: AUCH_DETAIL_SCOPE.boundaryRawFile, osmExtractFile: AUCH_DETAIL_SCOPE.osmGeojsonFile, bdtopoDir: path.join(paths.rawDir, AUCH_DETAIL_SCOPE.bdtopoOutputDir) }
     : undefined;
@@ -497,7 +503,7 @@ export async function refreshAll(options: RefreshOptions = { offline: false, for
 }
 
 if (process.argv[1]?.endsWith("refresh.ts")) {
-  if (process.argv.includes("--help") || process.argv.includes("-h")) console.log("Usage: tsx scripts/data/refresh.ts [--offline] [--force-ign] [--force=<source[,source]>] [--scope=auch]");
+  if (process.argv.includes("--help") || process.argv.includes("-h")) console.log("Usage: tsx scripts/data/refresh.ts [--offline] [--fetch-only] [--force-ign] [--force=<source[,source]>] [--scope=auch]");
   else refreshAll(parseArgs(process.argv.slice(2))).catch((error: unknown) => {
     console.error("[refresh] Fatal:", error);
     process.exit(1);

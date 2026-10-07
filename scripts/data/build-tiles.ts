@@ -23,7 +23,7 @@ const AUDIT_EVERY = envNumber("MASTER_MAPS_TILE_AUDIT_SAMPLE", 64);
 const ZOD_AUDIT_PER_TILE = envNumber("MASTER_MAPS_TILE_ZOD_AUDIT", 2);
 const META_BYTES_PER_FEATURE_ESTIMATE = 1200;
 const RENDER_HEADER_UPPER_BYTES = 8192;
-const RENDER_BYTES_PER_GEOMETRY_POINT = 48;
+const RENDER_BYTES_PER_GEOMETRY_POINT = 96;
 const RENDER_BYTES_PER_FEATURE = 512;
 
 interface TileOptions { inDir: string; outDir: string; renderOutDir: string; metaOutDir: string; datasetVersion: string; forceSize?: number; benchmarkOnly: boolean; emitJsonTiles: boolean; quiet: boolean }
@@ -363,30 +363,34 @@ function lineLength(geometry: Geometry): number {
 }
 
 function roadRank(feature: MapFeature): number {
-  const ranks: Record<string, number> = { motorway: 0, trunk: 1, primary: 2, secondary: 3, tertiary: 4, residential: 5, unclassified: 6, service: 7, track: 8, path: 9, footway: 9 };
+  const ranks: Record<string, number> = { motorway: 0, trunk: 1, primary: 2, secondary: 3, tertiary: 4, residential: 5, unclassified: 6, service: 7, track: 8, path: 9, footway: 9, cycleway: 9, steps: 9 };
   return ranks[feature.kind === "road" ? feature.roadClass ?? feature.highway ?? "" : ""] ?? 10;
 }
 
+/* LOD0 (2 km tiles, street level and closer) keeps everything. LOD1 (8 km
+   tiles, town level) keeps the road network down to local roads, water,
+   land cover and named places but only the largest buildings, which are
+   sub-pixel at that scale anyway. LOD2 (32 km tiles, department overview)
+   keeps the skeleton: main roads, rivers, forests, communes and towns. */
 function keepAtLod(feature: MapFeature, lod: 0 | 1 | 2): boolean {
   if (lod === 0 || feature.kind === "boundary") return true;
+  if (feature.kind === "place" && feature.placeType === "commune") return true;
   if (lod === 1) {
-    if (feature.kind === "building") return featureArea(feature) >= 25 || feature.name !== undefined;
-    if (feature.kind === "road") return roadRank(feature) <= 5 || feature.name !== undefined;
-    if (feature.kind === "water") return feature.isSurface === true ? featureArea(feature) >= 100 : lineLength(feature.localGeometry ?? feature.geometry) >= 100;
-    if (feature.kind === "poi" || feature.kind === "business") return feature.name !== undefined || feature.businessName !== undefined;
-    if (feature.kind === "landuse") return featureArea(feature) >= 500 || feature.name !== undefined;
-    if (feature.kind === "transport") return feature.transportType !== "parking" || feature.name !== undefined;
-    if (feature.kind === "structure") return featureArea(feature) >= 500 || feature.name !== undefined;
-    if (feature.kind === "place") return (feature.importance ?? 6) <= 5 || feature.name !== undefined;
+    if (feature.kind === "building") return featureArea(feature) >= 1_500;
+    if (feature.kind === "road") return roadRank(feature) <= 7;
+    if (feature.kind === "water") return feature.isSurface === true ? featureArea(feature) >= 400 : lineLength(feature.localGeometry ?? feature.geometry) >= 150;
+    if (feature.kind === "poi" || feature.kind === "business") return feature.name !== undefined;
+    if (feature.kind === "landuse") return featureArea(feature) >= 2_000;
+    if (feature.kind === "transport") return feature.transportType !== "bus_stop" || feature.name !== undefined;
+    if (feature.kind === "structure") return featureArea(feature) >= 1_000;
+    if (feature.kind === "place") return (feature.importance ?? 6) <= 5;
     return false;
   }
-  if (feature.kind === "road") return roadRank(feature) <= 3 || feature.name !== undefined;
-  if (feature.kind === "water") return feature.isSurface === true ? featureArea(feature) >= 1_000 : lineLength(feature.localGeometry ?? feature.geometry) >= 500;
-  if (feature.kind === "poi") return ["city", "town", "village", "municipality", "townhall"].includes(feature.poiType) || feature.category === "townhall";
-  if (feature.kind === "landuse") return feature.name !== undefined && featureArea(feature) >= 1_000;
+  if (feature.kind === "road") return roadRank(feature) <= 4;
+  if (feature.kind === "water") return feature.isSurface === true ? featureArea(feature) >= 20_000 : lineLength(feature.localGeometry ?? feature.geometry) >= 1_500 && (feature.name !== undefined || (feature.width ?? 0) >= 5);
+  if (feature.kind === "landuse") return featureArea(feature) >= 150_000 && ["forest", "wood", "vineyard", "orchard", "reserve", "industrial", "residential"].includes(feature.landuseType);
   if (feature.kind === "place") return (feature.importance ?? 6) <= 3;
   if (feature.kind === "transport") return feature.transportType === "rail" || feature.transportType === "station" || feature.transportType === "aerodrome" || feature.transportType === "runway";
-  if (feature.kind === "building") return feature.name !== undefined;
   return false;
 }
 
@@ -726,7 +730,7 @@ async function writeRenderTile(context: BuildContext, features: MapFeature[], ti
     fs.writeFile(path.join(context.renderDir, `${tile}.mmt.gz`), compressed),
   ]);
   for (const layer of input.layers) {
-    const bytes = layer.positions.byteLength + layer.indices.byteLength + layer.ranges.byteLength;
+    const bytes = layer.vertices.byteLength + layer.indices.byteLength + layer.ranges.byteLength + (layer.edges?.byteLength ?? 0);
     context.layerBytes.set(layer.id, (context.layerBytes.get(layer.id) ?? 0) + bytes);
   }
   return { bytes: payload.byteLength, featureCount: input.meta.length };
