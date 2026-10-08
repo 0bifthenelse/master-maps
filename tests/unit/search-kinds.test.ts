@@ -25,6 +25,8 @@ const TILE_MAP = new Map<string, string>([
   ["business-named", "l0_0_20"],
   ["address-full", "l0_0_20"],
   ["place-unnamed", "l0_0_17"],
+  ["place-nogaro", "l0_0_21"],
+  ["toponym-nogaro-airfield", "l0_0_21"],
 ]);
 
 const FEATURES: MapFeature[] = [
@@ -37,6 +39,8 @@ const FEATURES: MapFeature[] = [
   feature({ stableId: "business-named", kind: "business", geometry: { type: "Point", coordinates: [0.5, 43.6] }, businessName: "NOCIBE", category: "beauty" }),
   feature({ stableId: "address-full", kind: "address", geometry: { type: "Point", coordinates: [0.5, 43.6] }, street: "Rue Nationale", housenumber: "12", postcode: "32000", city: "Auch" }),
   feature({ stableId: "place-unnamed", kind: "place", geometry: { type: "Point", coordinates: [0.5, 43.6] }, placeType: "detail_orographique" }),
+  feature({ stableId: "place-nogaro", kind: "place", geometry: { type: "Point", coordinates: [-0.0354, 43.7592] }, name: "Nogaro", placeType: "commune", population: 2238 }),
+  feature({ stableId: "toponym-nogaro-airfield", kind: "place", geometry: { type: "Point", coordinates: [-0.0368, 43.7650] }, name: "Nogaro", placeType: "airport" }),
 ];
 
 const RECORDS = buildSearchIndex(FEATURES, TILE_MAP, "unused");
@@ -91,6 +95,12 @@ describe("buildSearchIndex place and transport coverage", () => {
     expect(record.category).toBe("beauty");
     expect(Number.isFinite(record.x)).toBe(true);
     expect(Number.isFinite(record.z)).toBe(true);
+  });
+
+  it("keeps a commune a commune when a namesake place merges into it", () => {
+    const nogaro = RECORDS.filter((record) => record.canonicalName === "Nogaro");
+    expect(nogaro).toHaveLength(1);
+    expect(nogaro[0]?.category).toBe("commune");
   });
 
   it("keeps the transport name as its canonical name", () => {

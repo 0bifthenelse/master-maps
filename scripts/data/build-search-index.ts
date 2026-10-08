@@ -825,7 +825,9 @@ function deduplicate(drafts: Draft[]): Draft[] {
       for (const alias of draft.aliases) twin.aliases.add(alias);
       /* Keep the best-written spelling of the shared name ("Cathédrale Sainte-Marie" over "Cathedrale Sainte Marie"). */
       if (nameQuality(draft.name) > nameQuality(twin.name)) twin.name = draft.name;
-      if (twin.category === undefined || !CATEGORY_BY_ID.has(twin.category) || twin.category === "other") {
+      /* A POI-like record may borrow a better category from its twin; a place keeps its own type
+         (Nogaro the commune must not become the airport that shares its name). */
+      if (twin.kind !== "place" && (twin.category === undefined || !CATEGORY_BY_ID.has(twin.category) || twin.category === "other")) {
         if (draft.category !== undefined && CATEGORY_BY_ID.has(draft.category) && draft.category !== "other") twin.category = draft.category;
       }
       if ((twin.context === undefined || twin.context === "") && draft.context !== undefined) twin.context = draft.context;
