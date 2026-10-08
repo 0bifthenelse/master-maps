@@ -89,27 +89,42 @@ export interface BrowserErrors {
   pageErrors: string[];
 }
 
+/**
+ * The suite drives a Moli CDP browser when one is listening, and otherwise
+ * launches the local Chromium (SwiftShader WebGL) so it also runs in CI and
+ * in a bare container. E2E_BROWSER=local skips the CDP probe.
+ */
+async function openBrowser(): Promise<Browser> {
+  if (process.env.E2E_BROWSER !== "local") {
+    try {
+      return await chromium.connectOverCDP(MOLI_CDP, { timeout: 3_000 });
+    } catch {
+      /* No Moli browser: fall back to a local launch. */
+    }
+  }
+  return chromium.launch({
+    executablePath: process.env.CHROMIUM_PATH ?? "/opt/pw-browsers/chromium",
+    args: ["--use-angle=swiftshader", "--enable-unsafe-swiftshader", "--ignore-gpu-blocklist"],
+  });
+}
+
 export const test = base.extend<{
-  moliBrowser: Browser;
   moliContext: BrowserContext;
   page: Page;
   errors: BrowserErrors;
+}, {
+  moliBrowser: Browser;
 }>({
-  moliBrowser: async ({}, use) => {
-    const browser = await chromium.connectOverCDP(MOLI_CDP);
+  moliBrowser: [async ({}, use) => {
+    const browser = await openBrowser();
     await use(browser);
-    // connectOverCDP attaches a client to Moli's single long-lived browser
-    // process; disconnecting (not closing) releases this test's CDP session
-    // without tearing down the shared browser other tests still need.
     await browser.close();
-  },
-  moliContext: async ({ moliBrowser }, use) => {
-    const context = await moliBrowser.newContext({ viewport: { width: 1280, height: 720 } });
+  }, { scope: "worker" }],
+  moliContext: async ({ moliBrowser }, use, testInfo) => {
+    const viewport = (testInfo.project.use.viewport ?? null) ?? { width: 1280, height: 720 };
+    const context = await moliBrowser.newContext({ viewport });
     await use(context);
-    // Each test opens a fresh context holding a full WebGPU canvas and the
-    // full commune tile set; leaving contexts open across 20 sequential
-    // tests accumulates memory in Moli's single browser process until it
-    // crashes mid-suite. Close explicitly so only one context is live at a time.
+    /* One live context at a time keeps a single shared browser's memory flat. */
     await context.close();
   },
   page: async ({ moliContext }, use) => {

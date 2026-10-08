@@ -425,6 +425,18 @@ export default function MapShell() {
     }
   }, [transform]);
 
+  /* Read-only probe for end-to-end tests: screen ↔ map conversion of the live view. */
+  useEffect(() => {
+    const probe = {
+      screenToMap: (x: number, y: number): MapPoint => transform.screenToMap(x, y),
+      mapToScreen: (e: number, n: number): [number, number] => transform.mapToScreen(e, n),
+    };
+    (window as unknown as { __masterMaps?: typeof probe }).__masterMaps = probe;
+    return () => {
+      delete (window as unknown as { __masterMaps?: typeof probe }).__masterMaps;
+    };
+  }, [transform]);
+
   const onViewChange = useCallback(() => {
     invalidateRef.current();
     publishView();

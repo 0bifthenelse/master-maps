@@ -71,7 +71,9 @@ export function categoryLabel(meta: Pick<FeatureMeta, "k" | "c">): string {
       return "Department of the Gers";
     default: {
       const definition = categoryDefinition(meta.c);
-      return definition.id === "other" ? meta.c.replace(/_/g, " ") : definition.label;
+      if (definition.id !== "other") return definition.label;
+      if (meta.c === "other" || meta.c === meta.k) return meta.k === "business" ? "Business" : "Place";
+      return meta.c.replace(/_/g, " ");
     }
   }
 }
