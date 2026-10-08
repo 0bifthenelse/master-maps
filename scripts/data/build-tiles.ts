@@ -6,7 +6,7 @@ import { createInterface } from "node:readline";
 import * as path from "node:path";
 import { promisify } from "node:util";
 import { gzip } from "node:zlib";
-import { MapFeatureSchema, TileManifestSchema, type Bbox, type Geometry, type MapFeature, type TileManifest } from "../../src/lib/data/schema";
+import { FeatureBaseSchema, MapFeatureSchema, TileManifestSchema, type Bbox, type Geometry, type MapFeature, type TileManifest } from "../../src/lib/data/schema";
 import { clipPolygonToBounds, ensureRingClosed, ringArea, ringWindingOrder } from "../../src/lib/geo/polygon";
 import { buildRenderTile, RENDER_LAYER_BUDGET_BYTES } from "../../src/lib/render/buildRenderTile";
 import { encodeRenderTile } from "../../src/lib/render/codec";
@@ -69,24 +69,12 @@ const IGNORED_FILES: ReadonlySet<string> = new Set([
   "auch-boundary-source.json", "auch-osm-manifest.json", "osm-normalization.json",
 ]);
 const GEOMETRY_TYPES: ReadonlySet<string> = new Set(["Point", "LineString", "MultiLineString", "Polygon", "MultiPolygon"]);
-const BASE_FEATURE_FIELDS: ReadonlySet<string> = new Set([
-  "stableId", "kind", "geometry", "sourceId", "name", "lon", "lat", "x", "z", "localGeometry",
-  "sourceGeometry", "names", "displayName", "address", "confidence", "status", "provenance",
-  "sourceRefs", "fragmentId", "parentStableId", "fragmentOf", "sourceMetadata",
-]);
-const KIND_FIELDS: Readonly<Record<string, ReadonlySet<string>>> = {
-  boundary: new Set(["territoryCode"]),
-  building: new Set(["height", "heightInferred", "levels", "heightSource", "buildingType", "roofType", "wallType", "buildingLevels", "buildingColour", "roofColour", "startDate", "yearConstructed"]),
-  road: new Set(["highway", "roadClass", "width", "widthInferred", "widthSource", "surface", "bridge", "tunnel", "maxSpeed", "layer", "stratum", "oneway", "lanes", "lit", "sidewalk"]),
-  water: new Set(["waterType", "intermittent", "width", "widthInferred", "tidal", "salt", "fictiveAxis", "isSurface"]),
-  landuse: new Set(["landuseType", "area"]),
-  poi: new Set(["poiType", "category", "website", "phone", "openingHours", "wheelchair", "operator"]),
-  business: new Set(["businessName", "poiType", "category", "siret", "siren", "businessId", "brand", "legalName", "website", "phone", "openingHours", "operator", "wheelchair", "nafCode", "nafLabel", "administrativeStatus", "creationDate"]),
-  address: new Set(["street", "housenumber", "postcode", "city", "source", "banId"]),
-  transport: new Set(["transportType", "line", "route", "network", "operator", "ref", "publicTransport", "wheelchair"]),
-  structure: new Set(["structureType", "height", "heightSource"]),
-  place: new Set(["placeType", "importance", "population"]),
-};
+/* Field allow-lists come from the schemas themselves so the audit never drifts from them. */
+const BASE_FEATURE_FIELDS: ReadonlySet<string> = new Set(["kind", ...Object.keys(FeatureBaseSchema.shape)]);
+const KIND_FIELDS: Readonly<Record<string, ReadonlySet<string>>> = Object.fromEntries(MapFeatureSchema.options.map((option) => {
+  const shape = option.shape as Record<string, unknown> & { kind: { value: string } };
+  return [shape.kind.value, new Set(Object.keys(shape).filter((key) => !BASE_FEATURE_FIELDS.has(key) && key !== "kind"))];
+}));
 
 function parseFeatureRecords(text: string): MapFeature[] {
   const records: MapFeature[] = [];
