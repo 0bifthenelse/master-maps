@@ -1,7 +1,7 @@
 {
   "note": "Things a person commonly looks up on a consumer map of the Gers. Used only as a checklist of queries; every answer comes from the open sources in the pipeline.",
   "entities": [
-    { "query": "cathédrale sainte-marie auch", "expect": "Sainte-Marie", "group": "landmark", "anchor": [0.586107265060241, 43.64626884518072] },
+    { "query": "cathédrale sainte-marie auch", "expect": "Sainte[- ]Marie", "group": "landmark", "anchor": [0.586107265060241, 43.64626884518072] },
     { "query": "escalier monumental auch", "expect": "Escalier", "group": "landmark" },
     { "query": "tour d'armagnac", "expect": "Armagnac", "group": "landmark" },
     { "query": "musée des amériques auch", "expect": "Am[ée]riques|Mus[ée]e", "group": "landmark", "anchor": [0.5876155, 43.6472091] },
@@ -20,7 +20,8 @@
     { "query": "cathédrale saint-pierre condom", "expect": "Saint-Pierre|Condom", "group": "landmark" },
     { "query": "cathédrale saint-gervais lectoure", "expect": "Gervais|Lectoure", "group": "landmark" },
     { "query": "abbaye de boulaur", "expect": "Boulaur", "group": "landmark" },
-    { "query": "notre-dame de garaison", "expect": "Garaison", "group": "landmark" },
+    { "query": "musée campanaire l'isle-jourdain", "expect": "Campanaire", "group": "landmark" },
+    { "query": "arènes vic-fezensac", "expect": "Ar[èe]nes", "group": "leisure" },
     { "query": "circuit paul armagnac", "expect": "Paul Armagnac|Circuit", "group": "leisure" },
     { "query": "barbotan", "expect": "Barbotan", "group": "place" },
     { "query": "lac de l'uby", "expect": "Uby", "group": "leisure" },
@@ -58,7 +59,8 @@
     { "query": "miélan", "expect": "^Mi[ée]lan$", "group": "commune" },
     { "query": "montesquiou", "expect": "^Montesquiou$", "group": "commune" },
     { "query": "barcelonne-du-gers", "expect": "Barcelonne", "group": "commune" },
-    { "query": "N124", "expect": "^N124$", "group": "road" },
+    { "query": "N124", "expect": "^D1124$", "group": "road", "note": "renumbered D1124 in BD TOPO and OpenStreetMap" },
+    { "query": "D1124", "expect": "^D1124$", "group": "road" },
     { "query": "N21", "expect": "^N21$", "group": "road" },
     { "query": "D930", "expect": "^D930$", "group": "road" },
     { "query": "D924", "expect": "^D924$", "group": "road" },

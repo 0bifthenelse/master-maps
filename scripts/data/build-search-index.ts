@@ -414,6 +414,30 @@ interface RouteGroup {
 }
 
 const ROUTE_REF = /^(A|N|D|E)\s?(\d{1,4}[A-Z]?)$/i;
+/** Shorter route groups are border slivers of roads that run in a neighbouring department. */
+const MIN_ROUTE_METRES = 300;
+
+/**
+ * Numbers a road carried before it was transferred and renumbered. People and
+ * older signs still use them, so they stay searchable: the national road from
+ * Auch to Toulouse is now the departmental D1124 in BD TOPO and OpenStreetMap.
+ */
+export const FORMER_ROUTE_NUMBERS: Readonly<Record<string, readonly string[]>> = {
+  D1124: ["N124"],
+};
+
+/** BD TOPO kilometre markers: survey references, not places anyone looks for. */
+const SKIPPED_SOURCES = ["ign-bdtopo:point_de_repere/"];
+
+/** How well a spelling is written: accents and mixed case beat all-caps or stripped text. */
+function nameQuality(name: string): number {
+  let score = 0;
+  if (/[à-ÿÀ-Þ]/.test(name)) score += 2;
+  if (/[a-z]/.test(name) && /[A-Z]/.test(name)) score += 1;
+  if (/[-'’]/.test(name)) score += 1;
+  if (!/[a-z]/.test(name)) score -= 2;
+  return score;
+}
 
 function betterClass(current: string | undefined, candidate: string | undefined): string | undefined {
   if (candidate === undefined) return current;
@@ -520,6 +544,7 @@ export function buildSearchIndex(features: MapFeature[], tiles: Map<string, stri
   const waters = new Map<string, Array<{ names: Map<string, number>; box: Box; length: number; members: Array<{ id: string; anchor: Point; length: number }>; communes: Set<string>; waterType?: string }>>();
 
   for (const feature of unique.values()) {
+    if (SKIPPED_SOURCES.some((prefix) => feature.stableId.startsWith(prefix))) continue;
     const geometry = geometryFor(feature);
     if (geometry === null) continue;
     const anchor = anchorOf(feature, geometry);
@@ -580,7 +605,10 @@ export function buildSearchIndex(features: MapFeature[], tiles: Map<string, stri
         const group = streets.get(key) ?? { names: new Map(), kindClass: undefined, refs: new Set(), ...(commune === undefined ? {} : { commune }), length: 0, members: [] };
         group.names.set(name, (group.names.get(name) ?? 0) + 1);
         group.kindClass = betterClass(group.kindClass, feature.roadClass ?? feature.highway);
-        for (const ref of refs) group.refs.add(ref);
+        for (const ref of refs) {
+          group.refs.add(ref);
+          for (const former of FORMER_ROUTE_NUMBERS[ref] ?? []) group.refs.add(former);
+        }
         group.box = unionBox(group.box, box);
         group.length += length;
         group.members.push({ id: feature.stableId, anchor, length });
@@ -693,13 +721,15 @@ export function buildSearchIndex(features: MapFeature[], tiles: Map<string, stri
   }
 
   for (const group of routes.values()) {
+    if (group.length < MIN_ROUTE_METRES) continue;
     const box = group.box!;
     const rep = representative(group.members, box);
     const names = [...group.names.entries()].sort((first, second) => second[1] - first[1]).slice(0, 4).map(([value]) => displayCase(value));
-    const network = group.ref[0] === "A" ? 220 : group.ref[0] === "N" ? 200 : group.ref[0] === "E" ? 180 : 130;
+    const former = FORMER_ROUTE_NUMBERS[group.ref] ?? [];
+    const network = group.ref[0] === "A" ? 220 : group.ref[0] === "N" || former.some((value) => value.startsWith("N")) ? 200 : group.ref[0] === "E" ? 180 : 130;
     drafts.push({
-      featureId: rep.id, name: group.ref, kind: "road", ...(group.kindClass === undefined ? {} : { category: group.kindClass }), aliases: new Set(names),
-      context: `${formatKm(group.length)} · ${group.communes.size} commune${group.communes.size === 1 ? "" : "s"}`, ref: group.ref,
+      featureId: rep.id, name: group.ref, kind: "road", ...(group.kindClass === undefined ? {} : { category: group.kindClass }), aliases: new Set([...former, ...names]),
+      context: `${former.length > 0 ? `Former ${former.join(", ")} · ` : ""}${formatKm(group.length)} · ${group.communes.size} commune${group.communes.size === 1 ? "" : "s"}`, ref: [group.ref, ...former].join(";"),
       anchor: rep.anchor, box, boost: network + (ROAD_CLASS_BOOST[group.kindClass ?? ""] ?? 0), richness: 5,
     });
   }
@@ -793,6 +823,8 @@ function deduplicate(drafts: Draft[]): Draft[] {
     }
     if (twin !== undefined) {
       for (const alias of draft.aliases) twin.aliases.add(alias);
+      /* Keep the best-written spelling of the shared name ("Cathédrale Sainte-Marie" over "Cathedrale Sainte Marie"). */
+      if (nameQuality(draft.name) > nameQuality(twin.name)) twin.name = draft.name;
       if (twin.category === undefined || !CATEGORY_BY_ID.has(twin.category) || twin.category === "other") {
         if (draft.category !== undefined && CATEGORY_BY_ID.has(draft.category) && draft.category !== "other") twin.category = draft.category;
       }
