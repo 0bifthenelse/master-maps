@@ -35,7 +35,6 @@ function FrameSync({ transform, basemap, onFrame, onInvalidate }: Pick<MapCanvas
   const invalidate = useThree((state) => state.invalidate);
   const gl = useThree((state) => state.gl);
   useEffect(() => {
-    (camera as PerspectiveCamera & { manual?: boolean }).manual = true;
     onInvalidate(invalidate);
     invalidate();
   }, [camera, invalidate, onInvalidate]);
@@ -64,7 +63,7 @@ export default function MapCanvas(props: MapCanvasProps) {
       dpr={[1, 2]}
       frameloop="demand"
       gl={{ antialias: true, alpha: false, powerPreference: "high-performance", stencil: false }}
-      camera={{ fov: 36.87, near: 1, far: 1e6, position: [0, 1000, 0] }}
+      camera={{ fov: 36.87, near: 1, far: 1e6, position: [0, 1000, 0], manual: true }}
       style={{ position: "absolute", inset: 0, display: "block" }}
       onCreated={(state) => {
         const context = state.gl.getContext();

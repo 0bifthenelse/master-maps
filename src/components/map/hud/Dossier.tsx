@@ -43,6 +43,12 @@ export interface DossierProps {
  */
 export default function Dossier({ data, loading, onClose, onCenter, onCopyCoordinates, onShare }: DossierProps) {
   const [collapsed, setCollapsed] = useState(false);
+  /* A new subject always opens expanded (state reset during render, not in an effect). */
+  const [shownKey, setShownKey] = useState(data.key);
+  if (shownKey !== data.key) {
+    setShownKey(data.key);
+    setCollapsed(false);
+  }
   const closeRef = useRef<HTMLButtonElement | null>(null);
 
   useEffect(() => {
@@ -55,8 +61,6 @@ export default function Dossier({ data, loading, onClose, onCenter, onCopyCoordi
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose]);
-
-  useEffect(() => setCollapsed(false), [data.key]);
 
   return (
     <aside className="mm-dossier mm-panel mm-brackets" aria-label={`Details: ${data.title}`} data-collapsed={collapsed} data-testid="feature-dossier">

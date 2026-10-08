@@ -79,8 +79,11 @@ interface Toast {
   text: string;
 }
 
+const FALLBACK_FONTS = { display: "sans-serif", mono: "monospace" };
+const NO_HITS: SearchHit[] = [];
+
 function readFonts(): { display: string; mono: string } {
-  if (typeof document === "undefined") return { display: "sans-serif", mono: "monospace" };
+  if (typeof document === "undefined") return FALLBACK_FONTS;
   const style = getComputedStyle(document.documentElement);
   const display = style.getPropertyValue("--font-display").trim() || "Rajdhani";
   const mono = style.getPropertyValue("--font-mono").trim() || "monospace";
@@ -158,12 +161,14 @@ export default function MapShell() {
   const [layers, setLayers] = useState<MapLayers>(DEFAULT_LAYERS);
   const [basemap, setBasemap] = useState<BaseMap>("machine");
   const [selection, setSelection] = useState<Selection | null>(null);
-  const [record, setRecord] = useState<Record<string, unknown> | null>(null);
-  const [recordLoading, setRecordLoading] = useState(false);
+  /* The loaded canonical record, tagged with the selection it belongs to. */
+  const [recordState, setRecordState] = useState<{ key: string; record: Record<string, unknown> | null } | null>(null);
   const [hover, setHover] = useState<OverlayTarget | null>(null);
   const [query, setQuery] = useState("");
-  const [hits, setHits] = useState<SearchHit[]>([]);
-  const [searchPending, setSearchPending] = useState(false);
+  /* Text results are tagged with the query they answer; chip results stand alone. */
+  const [textResult, setTextResult] = useState<{ query: string; hits: SearchHit[] }>({ query: "", hits: [] });
+  const [chipHits, setChipHits] = useState<SearchHit[]>([]);
+  const [chipPending, setChipPending] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
   const [activeIndex, setActiveIndex] = useState(-1);
   const [chip, setChip] = useState<string | null>(null);
@@ -176,9 +181,18 @@ export default function MapShell() {
   const [now, setNow] = useState(() => new Date());
 
   const tilesRef = useRef(tiles);
-  tilesRef.current = tiles;
+  useEffect(() => {
+    tilesRef.current = tiles;
+  }, [tiles]);
   const tileIndexRef = useRef<TileIndex>(createTileIndex([]));
   const boundsRef = useRef<[number, number, number, number] | null>(null);
+  const [bounds, setBounds] = useState<[number, number, number, number] | null>(null);
+  /* Map gesture handlers are defined further down; the controller calls them through this ref. */
+  const handlersRef = useRef<{ click: (x: number, y: number) => void; contextMenu: (x: number, y: number, event: MouseEvent) => void; hover: (x: number, y: number) => void }>({
+    click: () => undefined,
+    contextMenu: () => undefined,
+    hover: () => undefined,
+  });
   const planRef = useRef<TilePlan | null>(null);
   const planKeyRef = useRef("");
   const lodRef = useRef(2);
@@ -207,7 +221,7 @@ export default function MapShell() {
     return list;
   }, [tiles, boundaryTile]);
 
-  const fontsRef = useRef(readFonts());
+  const fontsRef = useRef(FALLBACK_FONTS);
   const overlayStateRef = useRef<OverlayState>({
     tiles: [],
     layers: { labels: true, places: true, pois: true, businesses: true, addresses: true, roads: true },
@@ -215,7 +229,7 @@ export default function MapShell() {
     hover: null,
     highlights: [],
     basemap: "machine",
-    fonts: fontsRef.current,
+    fonts: FALLBACK_FONTS,
   });
 
   const selectionTarget = useMemo<OverlayTarget | null>(() => {
@@ -261,11 +275,13 @@ export default function MapShell() {
 
   /* Fonts arrive after first paint; re-measure labels when they do. */
   useEffect(() => {
-    void document.fonts?.ready.then(() => {
+    const refresh = (): void => {
       fontsRef.current = readFonts();
       overlayStateRef.current = { ...overlayStateRef.current, fonts: fontsRef.current };
       drawOverlay();
-    });
+    };
+    refresh();
+    void document.fonts?.ready.then(refresh);
   }, [drawOverlay]);
 
   /* ---------------------------------------------------------------- */
@@ -430,6 +446,7 @@ export default function MapShell() {
         tileIndexRef.current = createTileIndex(parsed.tiles ?? []);
         const bounds = parsed.bounds ?? [0, 0, 0, 0];
         boundsRef.current = bounds;
+        setBounds(bounds);
         const margin = Math.max(bounds[2] - bounds[0], bounds[3] - bounds[1]) * 0.15;
         transform.setConstraints({ minZoom: 7.5, maxZoom: 21.5, bounds: [bounds[0] - margin, bounds[1] - margin, bounds[2] + margin, bounds[3] + margin] });
         markBoot(1, "ok", `${(parsed.tileCount ?? 0).toLocaleString("en-GB")} TILES`);
@@ -467,9 +484,9 @@ export default function MapShell() {
     markBoot(2, "ok", `Z${transform.zoom.toFixed(1)}`);
     const controller = new MapController(stage, transform, {
       onChange: () => onViewChange(),
-      onClick: (x, y) => onMapClick(x, y),
-      onContextMenu: (x, y, event) => onMapContextMenu(x, y, event),
-      onHover: (x, y) => onMapHover(x, y),
+      onClick: (x, y) => handlersRef.current.click(x, y),
+      onContextMenu: (x, y, event) => handlersRef.current.contextMenu(x, y, event),
+      onHover: (x, y) => handlersRef.current.hover(x, y),
       onHoverEnd: () => {
         cursorStore.set({ point: null });
         setHover(null);
@@ -493,13 +510,10 @@ export default function MapShell() {
       controller.detach();
       controllerRef.current = null;
     };
-    // The handlers read refs and stable callbacks; attaching once per manifest is intended.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [manifest, transform]);
+  }, [manifest, transform, markBoot, onViewChange]);
 
-  useEffect(() => {
-    if (tiles.size > 0) markBoot(3, "ok", `${tiles.size} ONLINE`);
-  }, [tiles, markBoot]);
+  /* The last boot line reports the first tiles as they arrive. */
+  const bootSteps = useMemo(() => boot.map((step, index) => (index === 3 && tiles.size > 0 ? { ...step, status: "ok" as const, detail: `${tiles.size} ONLINE` } : step)), [boot, tiles.size]);
 
   useEffect(() => {
     sceneMetrics.loadedTileCount = tiles.size;
@@ -562,26 +576,27 @@ export default function MapShell() {
     setHover(marker === null ? null : marker.target);
   }, [transform]);
 
-  /* Full canonical record for the dossier, from the tile's metadata sidecar. */
   useEffect(() => {
-    if (selection === null) {
-      setRecord(null);
-      return;
-    }
+    handlersRef.current = { click: onMapClick, contextMenu: onMapContextMenu, hover: onMapHover };
+  }, [onMapClick, onMapContextMenu, onMapHover]);
+
+  /* Full canonical record for the dossier, from the tile's metadata sidecar. */
+  const selectionKey = selection === null ? null : `${selection.tileId}|${selection.meta.s}`;
+  useEffect(() => {
+    if (selection === null || selectionKey === null) return;
     const controller = new AbortController();
-    setRecord(null);
-    setRecordLoading(true);
     loadTileMeta(selection.tileId, controller.signal)
       .then((data) => {
         const found = data.features.find((feature) => feature.stableId === selection.meta.s || feature.fragmentId === selection.meta.s);
-        setRecord(found === undefined ? null : (found as unknown as Record<string, unknown>));
+        setRecordState({ key: selectionKey, record: found === undefined ? null : (found as unknown as Record<string, unknown>) });
       })
-      .catch(() => setRecord(null))
-      .finally(() => {
-        if (!controller.signal.aborted) setRecordLoading(false);
+      .catch(() => {
+        if (!controller.signal.aborted) setRecordState({ key: selectionKey, record: null });
       });
     return () => controller.abort();
-  }, [selection]);
+  }, [selection, selectionKey]);
+  const record = recordState !== null && recordState.key === selectionKey ? recordState.record : null;
+  const recordLoading = selectionKey !== null && recordState?.key !== selectionKey;
 
   const dossier = useMemo<DossierData | null>(() => (selection === null ? null : buildDossier(selection.meta, record, now)), [selection, record, now]);
 
@@ -631,53 +646,52 @@ export default function MapShell() {
     return generation === searchGeneration.current ? parsed : null;
   }, [transform]);
 
+  const trimmedQuery = query.trim();
+  const textActive = trimmedQuery.length >= SEARCH_MIN_QUERY_LENGTH;
   useEffect(() => {
-    const trimmed = query.trim();
-    if (trimmed.length < SEARCH_MIN_QUERY_LENGTH) {
-      if (chip === null) setHits([]);
-      setSearchPending(false);
-      return;
-    }
+    if (!textActive) return;
     const generation = ++searchGeneration.current;
-    setSearchPending(true);
     const timer = window.setTimeout(() => {
-      runSearch(new URLSearchParams({ q: trimmed, limit: "12" }), generation)
+      runSearch(new URLSearchParams({ q: trimmedQuery, limit: "12" }), generation)
         .then((found) => {
           if (found === null) return;
-          setHits(found);
+          setTextResult({ query: trimmedQuery, hits: found });
           setActiveIndex(found.length > 0 ? 0 : -1);
         })
-        .catch((error: unknown) => console.warn(error))
-        .finally(() => {
-          if (generation === searchGeneration.current) setSearchPending(false);
+        .catch((error: unknown) => {
+          console.warn(error);
+          if (generation === searchGeneration.current) setTextResult({ query: trimmedQuery, hits: [] });
         });
     }, SEARCH_DEBOUNCE_MS);
     return () => window.clearTimeout(timer);
-  }, [query, chip, runSearch]);
+  }, [trimmedQuery, textActive, runSearch]);
+  /* While typing, the previous answer stays on screen until the new one lands. */
+  const hits = textActive ? textResult.hits : chip !== null ? chipHits : NO_HITS;
+  const searchPending = textActive ? textResult.query !== trimmedQuery : chipPending;
 
   const onChip = useCallback((id: string | null) => {
     setChip(id);
     if (id === null) {
       setHighlights([]);
-      setHits([]);
+      setChipHits([]);
       return;
     }
     setQuery("");
     setSearchOpen(true);
     const generation = ++searchGeneration.current;
-    setSearchPending(true);
+    setChipPending(true);
     const radius = Math.max(1500, transform.metresPerPixel * Math.max(transform.width, transform.height) * 0.7);
     runSearch(new URLSearchParams({ category: id, limit: "40", radius: String(Math.round(radius)) }), generation)
       .then((found) => {
         if (found === null) return;
-        setHits(found);
+        setChipHits(found);
         setActiveIndex(-1);
         setHighlights(found.map(hitTarget));
         if (found.length === 0) toastText(`No ${categoryDefinition(id).label.toLowerCase()} found nearby`);
       })
       .catch((error: unknown) => console.warn(error))
       .finally(() => {
-        if (generation === searchGeneration.current) setSearchPending(false);
+        if (generation === searchGeneration.current) setChipPending(false);
       });
   }, [runSearch, transform, toastText]);
 
@@ -818,7 +832,7 @@ export default function MapShell() {
   return (
     <div className="mm-shell" data-basemap={basemap}>
       <div className="mm-stage" ref={stageRef} aria-label="Map of the Gers. Drag to pan, scroll to zoom, right-drag to rotate and tilt." role="application">
-        {manifest !== null && boundsRef.current !== null ? (
+        {manifest !== null && bounds !== null ? (
           <MapCanvas
             transform={transform}
             revision={revision}
@@ -826,7 +840,7 @@ export default function MapShell() {
             visibility={visibility}
             basemap={basemap}
             grid={layers.grid}
-            bounds={boundsRef.current}
+            bounds={bounds}
             buildingsRef={buildingsRef}
             onInvalidate={(invalidate) => { invalidateRef.current = invalidate; }}
             onFrame={drawOverlay}
@@ -914,7 +928,7 @@ export default function MapShell() {
           </div>
         </div>
       ) : (
-        <BootSequence steps={boot} ready={ready} />
+        <BootSequence steps={bootSteps} ready={ready} />
       )}
       <div id="scene-diagnostics" aria-hidden="true" />
     </div>

@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import { BufferAttribute, BufferGeometry, DoubleSide, NoColorSpace, ShaderMaterial, Texture, TextureLoader, LinearFilter, type Mesh } from "three";
 import { renderToWgs84, wgs84ToRender } from "@/lib/geo/crs";
 import type { MapTransform } from "@/lib/map/transform";
@@ -140,23 +140,44 @@ export interface SatelliteLayerProps {
   onLoaded: () => void;
 }
 
-export default function SatelliteLayer({ transform, revision, onLoaded }: SatelliteLayerProps) {
-  const cache = useRef(new Map<string, LoadedTile>());
-  const pending = useRef(new Set<string>());
-  const [, setVersion] = useState(0);
-  const wanted = useMemo(() => {
-    void revision;
-    return satelliteTilesFor(transform, transform.metresPerPixel * Math.max(transform.width, transform.height) * 2.5);
-  }, [transform, revision]);
+interface SatelliteView {
+  tiles: LoadedTile[];
+  wantedLevel: number;
+}
 
-  useEffect(() => {
+/**
+ * Texture cache and the tiles to draw, kept outside React: loading finishes
+ * asynchronously and the drawn set is the wanted tiles plus the nearest loaded
+ * ancestor of each missing one, so zooming never flashes an empty frame.
+ */
+class SatelliteTileStore {
+  private readonly cache = new Map<string, LoadedTile>();
+  private readonly pending = new Set<string>();
+  private readonly listeners = new Set<() => void>();
+  private wanted: TileKey[] = [];
+  private view: SatelliteView = { tiles: [], wantedLevel: MIN_LEVEL };
+  private loaded: () => void = () => undefined;
+
+  readonly subscribe = (listener: () => void): (() => void) => {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  };
+
+  readonly snapshot = (): SatelliteView => this.view;
+
+  setOnLoaded(callback: () => void): void {
+    this.loaded = callback;
+  }
+
+  request(wanted: TileKey[]): void {
+    this.wanted = wanted;
     for (const tile of wanted) {
       const key = keyOf(tile);
-      if (cache.current.has(key) || pending.current.has(key)) continue;
-      pending.current.add(key);
+      if (this.cache.has(key) || this.pending.has(key)) continue;
+      this.pending.add(key);
       const url = `${WMTS_URL}&TILEMATRIX=${tile.level}&TILEROW=${tile.y}&TILECOL=${tile.x}`;
       loader.load(url, (texture) => {
-        pending.current.delete(key);
+        this.pending.delete(key);
         texture.colorSpace = NoColorSpace;
         texture.minFilter = LinearFilter;
         texture.generateMipmaps = false;
@@ -169,65 +190,88 @@ export default function SatelliteLayer({ transform, revision, onLoaded }: Satell
           depthWrite: false,
           side: DoubleSide,
         });
-        cache.current.set(key, { key, tile, geometry: tileGeometry(tile), material, texture, lastUsed: performance.now() });
-        if (cache.current.size > CACHE_LIMIT) {
-          const sorted = [...cache.current.values()].sort((a, b) => a.lastUsed - b.lastUsed);
-          for (const old of sorted.slice(0, cache.current.size - CACHE_LIMIT)) {
-            old.geometry.dispose();
-            old.material.dispose();
-            old.texture.dispose();
-            cache.current.delete(old.key);
-          }
-        }
-        setVersion((value) => value + 1);
-        onLoaded();
+        this.cache.set(key, { key, tile, geometry: tileGeometry(tile), material, texture, lastUsed: performance.now() });
+        this.evict();
+        this.refresh();
+        this.loaded();
       }, undefined, () => {
-        pending.current.delete(key);
+        this.pending.delete(key);
       });
     }
-  }, [wanted, onLoaded]);
+    this.refresh();
+  }
 
-  useEffect(() => () => {
-    for (const entry of cache.current.values()) {
+  dispose(): void {
+    for (const entry of this.cache.values()) {
       entry.geometry.dispose();
       entry.material.dispose();
       entry.texture.dispose();
     }
-    cache.current.clear();
-  }, []);
+    this.cache.clear();
+    this.listeners.clear();
+  }
 
-  /* Draw the wanted tiles plus any loaded coarser ancestor of a missing one, so
-     zooming never flashes an empty frame. */
-  const visible: LoadedTile[] = [];
-  const now = performance.now();
-  const wantedLevel = wanted[0]?.level ?? MIN_LEVEL;
-  for (const tile of wanted) {
-    const loaded = cache.current.get(keyOf(tile));
-    if (loaded !== undefined) {
-      loaded.lastUsed = now;
-      visible.push(loaded);
-      continue;
-    }
-    for (let level = tile.level - 1; level >= Math.max(MIN_LEVEL, tile.level - 5); level -= 1) {
-      const shift = tile.level - level;
-      const parent = cache.current.get(keyOf({ level, x: tile.x >> shift, y: tile.y >> shift }));
-      if (parent !== undefined) {
-        parent.lastUsed = now;
-        if (!visible.includes(parent)) visible.push(parent);
-        break;
-      }
+  private evict(): void {
+    if (this.cache.size <= CACHE_LIMIT) return;
+    const drawn = new Set(this.view.tiles.map((entry) => entry.key));
+    const sorted = [...this.cache.values()].filter((entry) => !drawn.has(entry.key)).sort((a, b) => a.lastUsed - b.lastUsed);
+    for (const old of sorted.slice(0, this.cache.size - CACHE_LIMIT)) {
+      old.geometry.dispose();
+      old.material.dispose();
+      old.texture.dispose();
+      this.cache.delete(old.key);
     }
   }
-  visible.sort((a, b) => a.tile.level - b.tile.level);
+
+  private refresh(): void {
+    const tiles: LoadedTile[] = [];
+    const now = performance.now();
+    for (const tile of this.wanted) {
+      const loaded = this.cache.get(keyOf(tile));
+      if (loaded !== undefined) {
+        loaded.lastUsed = now;
+        tiles.push(loaded);
+        continue;
+      }
+      for (let level = tile.level - 1; level >= Math.max(MIN_LEVEL, tile.level - 5); level -= 1) {
+        const shift = tile.level - level;
+        const parent = this.cache.get(keyOf({ level, x: tile.x >> shift, y: tile.y >> shift }));
+        if (parent !== undefined) {
+          parent.lastUsed = now;
+          if (!tiles.includes(parent)) tiles.push(parent);
+          break;
+        }
+      }
+    }
+    tiles.sort((a, b) => a.tile.level - b.tile.level);
+    const previous = this.view.tiles;
+    if (tiles.length === previous.length && tiles.every((entry, index) => entry === previous[index])) return;
+    this.view = { tiles, wantedLevel: this.wanted[0]?.level ?? MIN_LEVEL };
+    for (const listener of this.listeners) listener();
+  }
+}
+
+export default function SatelliteLayer({ transform, revision, onLoaded }: SatelliteLayerProps) {
+  const [store] = useState(() => new SatelliteTileStore());
+  const wanted = useMemo(() => {
+    void revision;
+    return satelliteTilesFor(transform, transform.metresPerPixel * Math.max(transform.width, transform.height) * 2.5);
+  }, [transform, revision]);
+
+  useEffect(() => store.setOnLoaded(onLoaded), [store, onLoaded]);
+  useEffect(() => store.request(wanted), [store, wanted]);
+  useEffect(() => () => store.dispose(), [store]);
+
+  const view = useSyncExternalStore(store.subscribe, store.snapshot, store.snapshot);
 
   return (
     <group>
-      {visible.map((entry) => (
+      {view.tiles.map((entry) => (
         <mesh
           key={entry.key}
           geometry={entry.geometry}
           material={entry.material}
-          renderOrder={-10 + (entry.tile.level - wantedLevel) * 0.01}
+          renderOrder={-10 + (entry.tile.level - view.wantedLevel) * 0.01}
           frustumCulled={false}
           raycast={noRaycast}
           ref={(mesh: Mesh | null) => { if (mesh !== null) mesh.matrixAutoUpdate = false; }}
