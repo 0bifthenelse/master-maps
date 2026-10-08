@@ -4,7 +4,7 @@ import * as path from "node:path";
 import { CATEGORY_BY_ID, categoryDefinition } from "../../src/lib/data/categories";
 import { MapFeatureSchema, SearchRecordSchema, TileManifestSchema, type Geometry, type MapFeature, type SearchRecord, type TileManifest } from "../../src/lib/data/schema";
 import { displayCase } from "../../src/lib/data/displayText";
-import { foldSearchText, normalizeSearchText } from "../../src/lib/data/search";
+import { foldSearchText, isStopWord, normalizeSearchText, searchTokens } from "../../src/lib/data/search";
 import { renderToWgs84, transformGeometryToRender, wgs84ToRender } from "../../src/lib/geo/crs";
 import { canonicalCategory, geometryAnchor } from "../../src/lib/render/buildRenderTile";
 
@@ -695,7 +695,8 @@ export function buildSearchIndex(features: MapFeature[], tiles: Map<string, stri
         drafts.push({
           featureId: feature.stableId, name: displayCase(name), kind: "transport", category: TRANSPORT_CATEGORY[feature.transportType] ?? TRANSPORT_CATEGORY[category] ?? category,
           aliases: new Set([name, ...feature.names]), context: commune?.name ?? "", ...(commune === undefined ? {} : { commune: commune.name }),
-          ...(feature.ref === undefined ? {} : { ref: feature.ref }), anchor, boost: TRANSPORT_BOOST[feature.transportType] ?? TRANSPORT_BOOST[category] ?? 15, richness: 6,
+          ...(feature.ref === undefined ? {} : { ref: feature.ref }), anchor, ...(geometry.type === "Point" ? {} : { box: boundsOf(geometry) }),
+          boost: TRANSPORT_BOOST[feature.transportType] ?? TRANSPORT_BOOST[category] ?? 15, richness: 6,
         });
         break;
       }
@@ -802,27 +803,49 @@ export function buildSearchIndex(features: MapFeature[], tiles: Map<string, stri
  * a short distance collapse into the richest one, keeping the others' names
  * as aliases.
  */
+/** Toponyms for somewhere people live keep their identity; other place names (an airfield, a square) can be a POI's twin. */
+const SETTLEMENT_TYPES = new Set(["commune", "city", "town", "village", "suburb", "quarter", "neighbourhood", "hamlet", "settlement", "isolated_dwelling", "farm", "locality"]);
+const SAME_NAME_RADIUS_METRES = 150;
+const SAME_SETTLEMENT_RADIUS_METRES = 1500;
+/** An airfield or a park is one place across sources whose anchors sit far apart inside it. */
+const MAX_EXTENT_RADIUS_METRES = 3000;
+
+/** Name identity for duplicates: "Aéroport d'Auch-Gers" and "Aéroport Auch-Gers" are one name. */
+function duplicateKey(name: string): string {
+  const tokens = searchTokens(name).filter((token) => !isStopWord(token));
+  return tokens.length > 0 ? tokens.join(" ") : foldSearchText(name);
+}
+
+function extentRadius(box: Box | undefined): number {
+  if (box === undefined) return 0;
+  return Math.min(MAX_EXTENT_RADIUS_METRES, Math.hypot(box[2] - box[0], box[3] - box[1]) / 2);
+}
+
 function deduplicate(drafts: Draft[]): Draft[] {
   const CELL = 1000;
+  const reach = Math.ceil(Math.max(MAX_EXTENT_RADIUS_METRES, SAME_SETTLEMENT_RADIUS_METRES) / CELL);
   const grid = new Map<string, Draft[]>();
+  const keys = new Map<Draft, string>();
   const kept: Draft[] = [];
+  const settlement = (draft: Draft): boolean => draft.kind === "place" && SETTLEMENT_TYPES.has(draft.category ?? "");
   const ordered = drafts.slice().sort((first, second) => second.richness - first.richness || second.boost - first.boost || first.featureId.localeCompare(second.featureId));
   for (const draft of ordered) {
     if (draft.kind === "address" || draft.kind === "road" || draft.kind === "boundary" || draft.kind === "water") {
       kept.push(draft);
       continue;
     }
-    const radius = draft.kind === "place" ? 1500 : 150;
-    const key = foldSearchText(draft.name);
+    const key = duplicateKey(draft.name);
     const cx = Math.floor(draft.anchor[0] / CELL);
     const cz = Math.floor(draft.anchor[1] / CELL);
-    const reach = Math.ceil(radius / CELL);
     let twin: Draft | undefined;
     for (let dx = -reach; dx <= reach && twin === undefined; dx += 1) {
       for (let dz = -reach; dz <= reach && twin === undefined; dz += 1) {
         for (const other of grid.get(`${cx + dx}:${cz + dz}`) ?? []) {
-          if (foldSearchText(other.name) !== key) continue;
-          if ((draft.kind === "place") !== (other.kind === "place")) continue;
+          if (keys.get(other) !== key) continue;
+          const places = (draft.kind === "place") === (other.kind === "place");
+          /* A settlement and a POI sharing its name stay apart (Nogaro the commune is not its airfield). */
+          if (!places && (settlement(draft) || settlement(other))) continue;
+          const radius = places && draft.kind === "place" ? SAME_SETTLEMENT_RADIUS_METRES : Math.max(SAME_NAME_RADIUS_METRES, extentRadius(draft.box), extentRadius(other.box));
           if (Math.hypot(other.anchor[0] - draft.anchor[0], other.anchor[1] - draft.anchor[1]) > radius) continue;
           twin = other;
           break;
@@ -831,6 +854,7 @@ function deduplicate(drafts: Draft[]): Draft[] {
     }
     if (twin !== undefined) {
       for (const alias of draft.aliases) twin.aliases.add(alias);
+      if (foldSearchText(draft.name) !== foldSearchText(twin.name)) twin.aliases.add(draft.name);
       /* Keep the best-written spelling of the shared name ("Cathédrale Sainte-Marie" over "Cathedrale Sainte Marie"). */
       if (nameQuality(draft.name) > nameQuality(twin.name)) twin.name = draft.name;
       /* A POI-like record may borrow a better category from its twin; a place keeps its own type
@@ -843,6 +867,7 @@ function deduplicate(drafts: Draft[]): Draft[] {
       continue;
     }
     kept.push(draft);
+    keys.set(draft, key);
     const cellKey = `${cx}:${cz}`;
     const bucket = grid.get(cellKey);
     if (bucket === undefined) grid.set(cellKey, [draft]);

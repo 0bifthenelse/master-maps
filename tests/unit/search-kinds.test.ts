@@ -27,6 +27,10 @@ const TILE_MAP = new Map<string, string>([
   ["place-unnamed", "l0_0_17"],
   ["place-nogaro", "l0_0_21"],
   ["toponym-nogaro-airfield", "l0_0_21"],
+  ["transport-auch-airfield", "l0_0_22"],
+  ["transport-auch-airfield-point", "l0_0_22"],
+  ["toponym-auch-airfield", "l0_0_22"],
+  ["poi-airfield-restaurant", "l0_0_22"],
 ]);
 
 const FEATURES: MapFeature[] = [
@@ -41,6 +45,11 @@ const FEATURES: MapFeature[] = [
   feature({ stableId: "place-unnamed", kind: "place", geometry: { type: "Point", coordinates: [0.5, 43.6] }, placeType: "detail_orographique" }),
   feature({ stableId: "place-nogaro", kind: "place", geometry: { type: "Point", coordinates: [-0.0354, 43.7592] }, name: "Nogaro", placeType: "commune", population: 2238 }),
   feature({ stableId: "toponym-nogaro-airfield", kind: "place", geometry: { type: "Point", coordinates: [-0.0368, 43.7650] }, name: "Nogaro", placeType: "airport" }),
+  /* One airfield from three sources: an OSM outline, an OSM point 600 m away, a BD TOPO toponym. */
+  feature({ stableId: "transport-auch-airfield", kind: "transport", lon: 0.603, lat: 43.688, geometry: { type: "Polygon", coordinates: [[[0.595, 43.686], [0.611, 43.686], [0.611, 43.690], [0.595, 43.690], [0.595, 43.686]]] }, name: "Aéroport Auch-Gers", transportType: "aerodrome" }),
+  feature({ stableId: "transport-auch-airfield-point", kind: "transport", lon: 0.6105, lat: 43.6885, geometry: { type: "Point", coordinates: [0.6105, 43.6885] }, name: "Aéroport d'Auch-Gers", transportType: "aerodrome" }),
+  feature({ stableId: "toponym-auch-airfield", kind: "place", lon: 0.5985, lat: 43.6875, geometry: { type: "Point", coordinates: [0.5985, 43.6875] }, name: "Aéroport d'Auch-Gers", placeType: "airport" }),
+  feature({ stableId: "poi-airfield-restaurant", kind: "poi", lon: 0.604, lat: 43.6878, geometry: { type: "Point", coordinates: [0.604, 43.6878] }, name: "Restaurant de l'Aéroport", poiType: "restaurant" }),
 ];
 
 const RECORDS = buildSearchIndex(FEATURES, TILE_MAP, "unused");
@@ -101,6 +110,13 @@ describe("buildSearchIndex place and transport coverage", () => {
     const nogaro = RECORDS.filter((record) => record.canonicalName === "Nogaro");
     expect(nogaro).toHaveLength(1);
     expect(nogaro[0]?.category).toBe("commune");
+  });
+
+  it("keeps one record for an airfield known to several sources under near-identical names", () => {
+    const airfield = RECORDS.filter((record) => /a[ée]roport d?'?\s?auch-gers/i.test(record.canonicalName));
+    expect(airfield).toHaveLength(1);
+    expect(airfield[0]?.kind).toBe("transport");
+    expect(RECORDS.some((record) => record.featureId === "poi-airfield-restaurant")).toBe(true);
   });
 
   it("keeps the transport name as its canonical name", () => {
