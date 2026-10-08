@@ -1,6 +1,6 @@
 'use client';
 
-import { renderLayerIndices, renderLayerPositions, renderLayerRanges, type DecodedRenderTile } from './codec';
+import { renderLayerIndices, renderLayerRanges, renderLayerVertices, type DecodedRenderTile } from './codec';
 import { disposeTileWorkerPool, getTileWorkerPool, type QueueStats } from './workerPool';
 
 export const DEFAULT_RENDER_TILE_CACHE_BYTES = 256 * 1024 * 1024;
@@ -84,14 +84,14 @@ export function measuredTileBytes(tile: DecodedRenderTile): number {
 }
 
 export function tileLayerViews(tile: DecodedRenderTile, layerId: DecodedRenderTile['layers'][number]['id']): {
-  positions: Float32Array;
+  vertices: Float32Array;
   indices: Uint32Array;
   ranges: Uint32Array;
 } | null {
   const layer = tile.layers.find((candidate) => candidate.id === layerId);
   if (layer === undefined) return null;
   return {
-    positions: renderLayerPositions(tile.payload, layer),
+    vertices: renderLayerVertices(tile.payload, layer),
     indices: renderLayerIndices(tile.payload, layer),
     ranges: renderLayerRanges(tile.payload, layer),
   };

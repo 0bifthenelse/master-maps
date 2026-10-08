@@ -102,7 +102,7 @@ export function openState(week: WeekSchedule, now: Date): OpenState {
   const day = (now.getDay() + 6) % 7;
   const minute = now.getHours() * 60 + now.getMinutes();
   const yesterday = (day + 6) % 7;
-  for (const [start, end] of week[yesterday]!) {
+  for (const [, end] of week[yesterday]!) {
     if (end > 1440 && minute < end - 1440) return { open: true, detail: `Closes ${clock(end)}` };
   }
   for (const [start, end] of week[day]!) {
