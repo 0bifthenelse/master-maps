@@ -5,7 +5,7 @@
     { "query": "escalier monumental auch", "expect": "Escalier", "group": "landmark" },
     { "query": "tour d'armagnac", "expect": "Armagnac", "group": "landmark" },
     { "query": "musée des amériques auch", "expect": "Am[ée]riques|Mus[ée]e", "group": "landmark", "anchor": [0.5876155, 43.6472091] },
-    { "query": "préfecture du gers", "expect": "Pr[ée]fecture", "group": "public", "anchor": [0.5857, 43.6477] },
+    { "query": "préfecture du gers", "expect": "Pr[ée]fecture", "group": "public", "anchor": [0.58674, 43.64679] },
     { "query": "gare d'auch", "expect": "Gare", "group": "transport", "anchor": [0.5967168714285714, 43.64730908571429] },
     { "query": "centre hospitalier auch", "expect": "[Hh]ospitalier|H[ôo]pital", "group": "health" },
     { "query": "aérodrome d'auch", "expect": "^A[ée]ro(port|drome) d?'?\\s?Auch", "group": "transport" },

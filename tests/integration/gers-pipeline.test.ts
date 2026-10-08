@@ -89,12 +89,18 @@ describe("Gers production territory", () => {
   it("resolves the five Auch source anchors in generated data", async () => {
     if (!DATA_AVAILABLE) return;
     const keys = ["gareAuch", "cathedralSainteMarie", "prefectureGers", "boulevardSadiCarnot", "avenueDAlsace"];
+    /* Drivable OSM roads give way to the BD TOPO network, so a street anchor is matched by name too. */
+    const streetNames: Record<string, string> = { boulevardSadiCarnot: "sadi carnot", avenueDAlsace: "avenue d alsace" };
     const urls = keys.map((key) => anchorRecords[key]!.sourceUrl);
-    const features = await findFeatures((raw) => urls.some((url) => raw.includes(url)));
+    const features = await findFeatures(
+      (raw) => urls.some((url) => raw.includes(url)) || (raw.includes('"kind":"road"') && /sadi|alsace/i.test(raw)),
+      (feature) => feature.kind !== "road" || Object.values(streetNames).some((street) => normalized(feature.name ?? "").includes(street)) || feature.sourceRefs.some((reference) => urls.includes(reference.url ?? "")),
+    );
     for (const key of keys) {
       const anchor = anchorRecords[key]!;
+      const street = streetNames[key];
       const feature = features
-        .filter((candidate) => candidate.sourceRefs.some((reference) => reference.url === anchor.sourceUrl))
+        .filter((candidate) => candidate.sourceRefs.some((reference) => reference.url === anchor.sourceUrl) || (street !== undefined && candidate.kind === "road" && normalized(candidate.name ?? "").includes(street)))
         .sort((first, second) => metricDistance([first.lon ?? 0, first.lat ?? 0], anchor.coordinate) - metricDistance([second.lon ?? 0, second.lat ?? 0], anchor.coordinate))[0];
       expect(feature, `${key} source anchor`).toBeDefined();
       if (feature) {

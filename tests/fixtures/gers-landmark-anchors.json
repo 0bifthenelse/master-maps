@@ -4,7 +4,7 @@
   "anchors": {
     "gareAuch": { "coordinate": [0.5967168714285714, 43.64730908571429], "sourceUrl": "https://www.openstreetmap.org/way/65477442" },
     "cathedralSainteMarie": { "coordinate": [0.586107265060241, 43.64626884518072], "sourceUrl": "https://www.openstreetmap.org/way/65470768" },
-    "prefectureGers": { "coordinate": [0.5857, 43.6477], "sourceUrl": "https://www.openstreetmap.org/way/65461658" },
+    "prefectureGers": { "coordinate": [0.58674, 43.64679], "sourceUrl": "https://www.openstreetmap.org/way/65461658" },
     "boulevardSadiCarnot": { "coordinate": [0.588768775, 43.647426925], "sourceUrl": "https://www.openstreetmap.org/way/29892033" },
     "avenueDAlsace": { "coordinate": [0.591534, 43.64844878], "sourceUrl": "https://www.openstreetmap.org/way/29891995" },
     "condom": { "coordinate": [0.3712, 43.9582], "sourceUrl": "https://www.openstreetmap.org/search?query=Condom%2C%20Gers" },
