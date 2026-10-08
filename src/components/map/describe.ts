@@ -111,12 +111,12 @@ const SOURCE_LABELS: Readonly<Record<string, string>> = {
  * Turn a feature (render meta plus, when loaded, its full canonical record)
  * into the dossier sheet. Every field shown comes from a source record.
  */
-export function buildDossier(meta: FeatureMeta, record: Record<string, unknown> | null, now: Date): DossierData {
+export function buildDossier(meta: FeatureMeta, record: Record<string, unknown> | null, now: Date, pickedName?: string): DossierData {
   const kind = meta.k;
   const { code, tone } = classify(kind, meta.c);
   const get = (key: string): unknown => record?.[key];
   const sourceMetadata = (record?.sourceMetadata ?? {}) as Record<string, unknown>;
-  const name = text(get("businessName")) ?? text(get("name")) ?? meta.n;
+  const name = (kind === "address" ? undefined : text(pickedName)) ?? text(get("businessName")) ?? text(get("name")) ?? meta.n;
   const address = text(get("address"));
   const label = categoryLabel(meta);
   const title = kind === "address" ? (meta.n ?? address ?? "Address") : name ?? (meta.r !== undefined ? meta.r : label);

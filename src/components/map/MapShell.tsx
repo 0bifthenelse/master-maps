@@ -64,6 +64,8 @@ const CHIPS: readonly CategoryChip[] = [
 interface Selection {
   tileId: string;
   meta: FeatureMeta;
+  /** The name the user picked in search, which may be a better spelling from a twin record. */
+  label?: string;
   bbox?: [number, number, number, number];
 }
 
@@ -610,7 +612,7 @@ export default function MapShell() {
   const record = recordState !== null && recordState.key === selectionKey ? recordState.record : null;
   const recordLoading = selectionKey !== null && recordState?.key !== selectionKey;
 
-  const dossier = useMemo<DossierData | null>(() => (selection === null ? null : buildDossier(selection.meta, record, now)), [selection, record, now]);
+  const dossier = useMemo<DossierData | null>(() => (selection === null ? null : buildDossier(selection.meta, record, now, selection.label)), [selection, record, now]);
 
   /* ---------------------------------------------------------------- */
   /*  Camera commands                                                   */
@@ -722,11 +724,11 @@ export default function MapShell() {
         setTiles((previous) => new Map(previous).set(hit.tileId, loaded));
       }
       const meta = tile.meta.find((entry) => entry.s === hit.featureId);
-      if (meta !== undefined) setSelection({ tileId: hit.tileId, meta, bbox: hit.bbox });
-      else setSelection({ tileId: hit.tileId, meta: { s: hit.featureId, k: hit.kind, c: hit.category ?? hit.kind, n: hit.canonicalName, a: target.anchor }, bbox: hit.bbox });
+      if (meta !== undefined) setSelection({ tileId: hit.tileId, meta, label: hit.canonicalName, bbox: hit.bbox });
+      else setSelection({ tileId: hit.tileId, meta: { s: hit.featureId, k: hit.kind, c: hit.category ?? hit.kind, n: hit.canonicalName, a: target.anchor }, label: hit.canonicalName, bbox: hit.bbox });
     } catch (error) {
       console.warn("Search target unavailable", error);
-      setSelection({ tileId: hit.tileId, meta: { s: hit.featureId, k: hit.kind, c: hit.category ?? hit.kind, n: hit.canonicalName, a: target.anchor }, bbox: hit.bbox });
+      setSelection({ tileId: hit.tileId, meta: { s: hit.featureId, k: hit.kind, c: hit.category ?? hit.kind, n: hit.canonicalName, a: target.anchor }, label: hit.canonicalName, bbox: hit.bbox });
     } finally {
       window.setTimeout(() => pinnedRef.current.delete(hit.tileId), 30_000);
     }
