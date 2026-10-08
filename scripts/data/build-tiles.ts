@@ -8,6 +8,7 @@ import { promisify } from "node:util";
 import { gzip } from "node:zlib";
 import { FeatureBaseSchema, MapFeatureSchema, TileManifestSchema, type Bbox, type Geometry, type MapFeature, type TileManifest } from "../../src/lib/data/schema";
 import { clipPolygonToBounds, ensureRingClosed, ringArea, ringWindingOrder } from "../../src/lib/geo/polygon";
+import { simplifyLine } from "../../src/lib/geo/simplify";
 import { buildRenderTile, RENDER_LAYER_BUDGET_BYTES } from "../../src/lib/render/buildRenderTile";
 import { encodeRenderTile } from "../../src/lib/render/codec";
 
@@ -198,37 +199,6 @@ function roadWidth(feature: MapFeature): number {
     return defaults[feature.waterType ?? ""] ?? 3;
   }
   return 0;
-}
-
-function pointToSegmentDistance(point: Point, start: Point, end: Point): number {
-  const dx = end[0] - start[0];
-  const dz = end[1] - start[1];
-  const lengthSquared = dx * dx + dz * dz;
-  if (lengthSquared === 0) return Math.hypot(point[0] - start[0], point[1] - start[1]);
-  const ratio = Math.max(0, Math.min(1, ((point[0] - start[0]) * dx + (point[1] - start[1]) * dz) / lengthSquared));
-  return Math.hypot(point[0] - (start[0] + ratio * dx), point[1] - (start[1] + ratio * dz));
-}
-
-function simplifyLine(points: Point[], tolerance: number): Point[] {
-  if (points.length <= 2 || tolerance <= 0) return points.slice();
-  const keep = new Uint8Array(points.length);
-  keep[0] = 1;
-  keep[points.length - 1] = 1;
-  const pending: Array<[number, number]> = [[0, points.length - 1]];
-  while (pending.length > 0) {
-    const [startIndex, endIndex] = pending.pop()!;
-    let greatest = tolerance;
-    let split = -1;
-    for (let index = startIndex + 1; index < endIndex; index += 1) {
-      const distance = pointToSegmentDistance(points[index]!, points[startIndex]!, points[endIndex]!);
-      if (distance > greatest) { greatest = distance; split = index; }
-    }
-    if (split >= 0) {
-      keep[split] = 1;
-      pending.push([startIndex, split], [split, endIndex]);
-    }
-  }
-  return points.filter((_point, index) => keep[index] === 1);
 }
 
 function pointInRing(ring: Point[], x: number, z: number): boolean {

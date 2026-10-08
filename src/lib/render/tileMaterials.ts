@@ -134,7 +134,8 @@ void main() {
   vec3 world = position + vec3(aExtrude.x, 0.0, aExtrude.y) * halfMetres;
   vDistancePx = aDistance / uMpp;
   vDash = params.zw;
-  vFade = smoothstep(params.y - 0.75, params.y, uZoom);
+  /* fromZoom > 0 fades a line in up to that zoom; < 0 fades it out from there. */
+  vFade = params.y >= 0.0 ? smoothstep(params.y - 0.75, params.y, uZoom) : 1.0 - smoothstep(-params.y - 0.75, -params.y, uZoom);
   gl_Position = projectionMatrix * modelViewMatrix * vec4(world, 1.0);
 }
 `;
@@ -308,7 +309,8 @@ export function layerMaterials(): Map<RenderLayerId, LayerPasses> {
     order: 11,
   });
   map.set("road_bridge", {
-    under: lineMaterial({ colors: roadParams.map(() => "#020305"), params: roadParams, extraPx: 1.8, solid: true }),
+    /* The dark deck edge only reads at street scale; earlier, a culvert's widened casing would cut its road into dashes. */
+    under: lineMaterial({ colors: roadParams.map(() => "#020305"), params: roadParams.map((look) => ({ ...look, fromZoom: Math.max(look.fromZoom, 15.5) })), extraPx: 1.8, solid: true }),
     main: lineMaterial({ colors: roadColors, params: roadParams }),
     order: 13,
   });
@@ -316,7 +318,7 @@ export function layerMaterials(): Map<RenderLayerId, LayerPasses> {
   map.set("structure_line", { main: lineMaterial({ colors: structureLooks.map((look) => look.color), params: structureLooks }), order: 14 });
   const boundaryLooks = BOUNDARY_STYLES.map((style) => BOUNDARY_LOOK[style]);
   map.set("boundary", {
-    under: lineMaterial({ colors: boundaryLooks.map((look) => look.color), alphas: [0.16, 0], params: boundaryLooks, extraPx: 3.5, solid: true }),
+    under: lineMaterial({ colors: boundaryLooks.map((look) => look.color), alphas: [0.16, 0, 0.16], params: boundaryLooks, extraPx: 3, solid: true }),
     main: lineMaterial({ colors: boundaryLooks.map((look) => look.color), params: boundaryLooks, maxHalfPx: 1.6 }),
     order: 15,
   });

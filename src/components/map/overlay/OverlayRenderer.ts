@@ -205,7 +205,9 @@ export class OverlayRenderer {
           places.push(place);
         }
         places.sort((a, b) => b.priority - a.priority);
-        for (const place of places.slice(0, 260)) this.drawPlace(transform, place, zoom, state, satellite);
+        /* A commune and its chef-lieu (or an OSM town node) share a name: label it once. */
+        const placedPlaces = new Map<string, [number, number][]>();
+        for (const place of places.slice(0, 260)) this.drawPlace(transform, place, zoom, state, satellite, placedPlaces);
       }
 
       /* 2. Road numbers and street names. */
@@ -240,12 +242,16 @@ export class OverlayRenderer {
         points.push(point);
       }
       points.sort((a, b) => b.priority - a.priority);
-      const budget = zoom >= 17 ? 420 : zoom >= 15.5 ? 260 : 140;
+      /* Like a printed map: fewer, well-spaced markers at town scale, everything at street scale. */
+      const budget = zoom >= 18 ? 420 : zoom >= 17 ? 220 : zoom >= 16 ? 110 : 50;
+      const spacing = zoom >= 18 ? 2 : zoom >= 17 ? 6 : 11;
+      const placedNames = new Map<string, [number, number][]>();
       let drawn = 0;
       for (const point of points) {
         if (drawn >= budget) break;
-        if (this.drawPoint(transform, point, zoom, state, now)) drawn += 1;
+        if (this.drawPoint(transform, point, zoom, state, spacing, placedNames)) drawn += 1;
       }
+      void now;
     }
 
     /* 4. House numbers. */
@@ -287,10 +293,13 @@ export class OverlayRenderer {
   /*  Drawing                                                           */
   /* ---------------------------------------------------------------- */
 
-  private drawPlace(transform: MapTransform, place: PlaceCandidate, zoom: number, state: OverlayState, satellite: boolean): void {
+  private drawPlace(transform: MapTransform, place: PlaceCandidate, zoom: number, state: OverlayState, satellite: boolean, placedNames: Map<string, [number, number][]>): void {
     const g = this.context;
     const point = transform.project(place.anchor[0], place.anchor[1], 0, this.scratch);
     if (!this.onScreen(point, 60)) return;
+    const nameKey = place.name.toLowerCase();
+    const previous = placedNames.get(nameKey) ?? [];
+    if (previous.some(([x, y]) => Math.hypot(x - point.x, y - point.y) < 500)) return;
     const tierSize = [21, 16, 13, 11.5][place.tier]!;
     const size = Math.min(26, tierSize + Math.max(0, zoom - 11) * (place.tier <= 1 ? 0.6 : 0.25));
     const upper = place.tier <= 2;
@@ -302,6 +311,8 @@ export class OverlayRenderer {
     const box = { x0: point.x - width / 2 - 4, y0: point.y - size / 2 - 3, x1: point.x + width / 2 + 4, y1: point.y + size / 2 + 3 };
     if (this.collides(box)) return;
     this.insert(box);
+    previous.push([point.x, point.y]);
+    placedNames.set(nameKey, previous);
     const color = place.tier <= 1 ? MACHINE.white : place.tier === 2 ? "#d6dee7" : satellite ? "#f3f6f9" : "#9fadbb";
     g.textAlign = "center";
     g.textBaseline = "middle";
@@ -329,7 +340,8 @@ export class OverlayRenderer {
       if (count > 70) break;
       const point = transform.project(road.anchor[0], road.anchor[1], 0, this.scratch);
       if (!this.onScreen(point, 0)) continue;
-      const ref = road.ref.split(" / ")[0]!;
+      const ref = shieldText(road.ref);
+      if (ref === null) continue;
       const previous = placedRefs.get(ref) ?? [];
       if (previous.some(([x, y]) => Math.hypot(x - point.x, y - point.y) < 280)) continue;
       const width = this.measure(ref, g.font) + 10;
@@ -417,13 +429,16 @@ export class OverlayRenderer {
     }
   }
 
-  private drawPoint(transform: MapTransform, candidate: PointCandidate, zoom: number, state: OverlayState, now: number): boolean {
+  private drawPoint(transform: MapTransform, candidate: PointCandidate, zoom: number, state: OverlayState, spacing: number, placedNames: Map<string, [number, number][]>): boolean {
     const point = transform.project(candidate.anchor[0], candidate.anchor[1], 0, this.scratch);
     if (!this.onScreen(point, 12)) return false;
     const size = zoom >= 17 ? 17 : 15;
     const half = size / 2;
+    const nameKey = candidate.name?.toLowerCase();
+    if (nameKey !== undefined && (placedNames.get(nameKey) ?? []).some(([x, y]) => Math.hypot(x - point.x, y - point.y) < 160)) return false;
+    const reach = half + spacing;
+    if (this.collides({ x0: point.x - reach, y0: point.y - reach, x1: point.x + reach, y1: point.y + reach })) return false;
     const markerBox = { x0: point.x - half - 1, y0: point.y - half - 1, x1: point.x + half + 1, y1: point.y + half + 1 };
-    if (this.collides(markerBox)) return false;
     const g = this.context;
     const showName = candidate.name !== undefined && (zoom >= candidate.minZoom + 0.6 || candidate.priority > 60);
     let labelBox: Box | null = null;
@@ -449,7 +464,7 @@ export class OverlayRenderer {
       y: point.y,
       radius: half + 6,
     });
-    void now;
+    if (nameKey !== undefined) placedNames.set(nameKey, [...(placedNames.get(nameKey) ?? []), [point.x, point.y]]);
     return true;
   }
 
@@ -638,6 +653,17 @@ function rotatedBox(x: number, y: number, width: number, height: number, angle: 
 /*  Candidate extraction (once per tile)                               */
 /* ------------------------------------------------------------------ */
 
+const SHIELD_REF = /^(A|N|D|E)\s?(\d{1,4}[A-Z]?)$/i;
+
+/** The first official road number of a ref list, written compactly ("D 930" → "D930"); communal and exit refs get no shield. */
+export function shieldText(ref: string): string | null {
+  for (const part of ref.split(/\s*[/;,]\s*/)) {
+    const match = SHIELD_REF.exec(part.trim());
+    if (match !== null) return `${match[1]!.toUpperCase()}${match[2]!.toUpperCase()}`;
+  }
+  return null;
+}
+
 function placeTier(meta: FeatureMeta): { tier: 0 | 1 | 2 | 3; minZoom: number; priority: number } | null {
   const population = typeof meta.p?.pop === "number" ? meta.p.pop : 0;
   const importance = typeof meta.p?.imp === "number" ? meta.p.imp : 6;
@@ -765,7 +791,7 @@ export function buildCandidates(tile: DecodedRenderTile): TileCandidates {
           category,
           anchor: meta.a,
           minZoom: meta.k === "business" ? Math.max(minZoom, 15.5) : minZoom,
-          priority: groupWeight + (named ? 10 : 0) - (meta.k === "business" ? 5 : 0),
+          priority: groupWeight + (named ? 10 : 0) - (meta.k === "business" ? 5 : 0) + (typeof meta.p?.brand === "string" ? 6 : 0),
           emergency,
         });
         break;

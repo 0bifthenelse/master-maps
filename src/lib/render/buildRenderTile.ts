@@ -1,6 +1,7 @@
 import { ShapeUtils, Vector2 } from "three";
 import type { Geometry, MapFeature } from "../data/schema";
 import { categoryForOsmValue, CATEGORY_BY_ID } from "../data/categories";
+import { simplifyLine } from "../geo/simplify";
 import {
   LAYER_KIND_STRIDE,
   RENDER_LAYER_IDS,
@@ -41,6 +42,7 @@ const WATER_WIDTH_DEFAULTS: Readonly<Record<string, number>> = {
 const RAIL_HALF_WIDTH = 1.6;
 const STRUCTURE_HALF_WIDTH = 1.5;
 const BOUNDARY_HALF_WIDTH = 1;
+const OVERVIEW_BORDER_TOLERANCE_METRES = 90;
 const BRIDGE_LIFT_METRES = 0.4;
 const TUNNEL_DEPTH_METRES = -0.4;
 /** Sharper turns than this (cosine of the half angle) are split instead of mitered. */
@@ -128,6 +130,8 @@ export function buildRenderTile(features: MapFeature[], options: BuildRenderTile
         break;
       }
       case "road": {
+        /* BD TOPO "fictif" segments only keep the network connected across squares and car parks. */
+        if (feature.sourceMetadata?.fictif === true) break;
         const style = roadStyle(feature.roadClass ?? feature.highway);
         const halfWidth = resolveRoadWidth(feature) / 2;
         const id: RenderLayerId = roadLayerFor(feature);
@@ -220,7 +224,11 @@ export function buildRenderTile(features: MapFeature[], options: BuildRenderTile
         const outline = layer("boundary");
         outline.begin();
         for (const polygon of polygons(geometry)) {
-          for (const ring of polygon) emitOutline(outline, ring, BOUNDARY_HALF_WIDTH * 2, BOUNDARY_STYLES.indexOf("department"), 0.2, null);
+          for (const ring of polygon) {
+            emitOutline(outline, ring, BOUNDARY_HALF_WIDTH * 2, BOUNDARY_STYLES.indexOf("department"), 0.2, null);
+            /* River-traced stretches meander below a pixel at department scale; a generalised copy keeps the overview line clean. */
+            emitOutline(outline, simplifyLine(ring, OVERVIEW_BORDER_TOLERANCE_METRES), BOUNDARY_HALF_WIDTH * 2, BOUNDARY_STYLES.indexOf("department_overview"), 0.2, null);
+          }
         }
         outline.end(metaIndex);
         break;

@@ -355,6 +355,10 @@ a:hover {
   overflow-x: auto;
   scrollbar-width: none;
   padding-bottom: 2px;
+  padding-right: 28px;
+  /* The row scrolls sideways; the fade says there is more. */
+  -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 36px), transparent);
+  mask-image: linear-gradient(to right, #000 calc(100% - 36px), transparent);
 }
 
 .mm-chips::-webkit-scrollbar {

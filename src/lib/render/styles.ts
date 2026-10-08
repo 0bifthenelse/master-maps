@@ -50,7 +50,8 @@ export type LandcoverStyle = (typeof LANDCOVER_STYLES)[number];
 export const WATER_AREA_STYLES = ["water", "reservoir", "pool", "wetland"] as const;
 export const WATER_LINE_STYLES = ["river", "stream", "canal", "ditch", "intermittent"] as const;
 export const RAIL_STYLES = ["rail", "disused", "runway"] as const;
-export const BOUNDARY_STYLES = ["department", "commune"] as const;
+/** "department_overview" is the generalised border drawn at regional zoom. */
+export const BOUNDARY_STYLES = ["department", "commune", "department_overview"] as const;
 export const TRANSPORT_AREA_STYLES = ["parking", "aerodrome", "runway", "rail", "other"] as const;
 export const STRUCTURE_STYLES = ["bridge", "dam", "wall", "other"] as const;
 export const BUILDING_STYLES = [

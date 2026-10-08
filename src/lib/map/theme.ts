@@ -115,8 +115,10 @@ export const RAIL_LOOK: Readonly<Record<(typeof RAIL_STYLES)[number], LineLook>>
 };
 
 export const BOUNDARY_LOOK: Readonly<Record<(typeof BOUNDARY_STYLES)[number], LineLook>> = {
-  department: { color: MACHINE.yellow, minHalfPx: 1.1, fromZoom: 0, dash: [10, 6], opacity: 0.95 },
+  /* The detailed border takes over from the generalised one around z11.5 (a negative fromZoom means "until"). */
+  department: { color: MACHINE.yellow, minHalfPx: 1.1, fromZoom: 11.5, dash: [10, 6], opacity: 0.95 },
   commune: { color: "#56677a", minHalfPx: 0.55, fromZoom: 10.5, dash: [5, 4], opacity: 0.7 },
+  department_overview: { color: MACHINE.yellow, minHalfPx: 1.1, fromZoom: -11.5, dash: [10, 6], opacity: 0.95 },
 };
 
 export const STRUCTURE_LINE_LOOK: Readonly<Record<(typeof STRUCTURE_STYLES)[number], LineLook>> = {

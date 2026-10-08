@@ -121,7 +121,7 @@ export default function SearchConsole(props: SearchConsoleProps) {
           type="search"
           autoComplete="off"
           spellCheck={false}
-          placeholder="Search the Gers — places, streets, addresses, companies"
+          placeholder="Search places, streets, addresses"
           value={query}
           role="combobox"
           aria-expanded={showResults}
