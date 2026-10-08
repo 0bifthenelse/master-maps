@@ -38,6 +38,7 @@ import { ADOPTED_LAYERS } from "./bdtopoLayers";
 import { createBoundaryIndex, type BoundaryIndex } from "./boundaryIndex";
 import { normalizeBdtopo, settlementAnchors } from "./normalizeBdtopo";
 import { categoryForNaf, categoryForOsmTags, nafIsPlace } from "../../src/lib/data/categories";
+import { displayCase } from "../../src/lib/data/displayText";
 import { conflateBusinesses } from "./conflate";
 import {
   emptyOsmNormalizeReport,
@@ -1328,7 +1329,8 @@ async function normalizeAddressesInto(source: AddressSourceInput, boundary: Boun
       const latitude = numberValue(record.lat);
       if (longitude === undefined || latitude === undefined || !boundaryIndex.contains([longitude, latitude])) continue;
       const housenumber = [text(record.numero), text(record.repetition)].filter((part) => part !== undefined).join(" ");
-      const street = text(record.streetName ?? record.street) ?? text(record.localityName) ?? "unknown street";
+      const rawStreet = text(record.streetName ?? record.street) ?? text(record.localityName);
+      const street = rawStreet === undefined ? "unknown street" : displayCase(rawStreet);
       const postcode = text(record.postalCode) ?? "";
       const city = text(record.city) ?? GERS_TERRITORY.name;
       const banId = text(record.banId);

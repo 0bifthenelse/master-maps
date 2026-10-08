@@ -15,6 +15,13 @@ export const SearchHitSchema = z.object({
   focusLon: z.number().finite(),
   focusLat: z.number().finite(),
   score: z.number(),
-  matchType: z.enum(["exact", "accent-insensitive", "prefix", "contains", "edit-distance"]),
+  matchType: z.enum(["exact", "accent-insensitive", "prefix", "contains", "edit-distance", "category"]),
+  /** Second line of a result: commune, category or street. */
+  context: z.string().optional(),
+  /** Local Lambert-93 metres of the result anchor. */
+  x: z.number().finite().optional(),
+  z: z.number().finite().optional(),
+  /** Extent to frame when the result is selected (streets, communes, areas). */
+  bbox: z.tuple([z.number(), z.number(), z.number(), z.number()]).optional(),
 }).strict();
 export type SearchHit = z.infer<typeof SearchHitSchema>;

@@ -138,6 +138,23 @@ export function categoryDefinition(id: string | undefined): CategoryDefinition {
   return (id === undefined ? undefined : CATEGORY_BY_ID.get(id)) ?? CATEGORY_BY_ID.get("other")!;
 }
 
+/** Neighbouring categories a browse for one of them also shows (the "Doctors" chip lists dentists too). */
+const CATEGORY_FAMILIES: Readonly<Record<string, readonly string[]>> = {
+  restaurant: ["restaurant", "fast_food"],
+  supermarket: ["supermarket", "convenience"],
+  doctor: ["doctor", "hospital", "dentist", "nurse", "laboratory"],
+  bank: ["bank", "atm"],
+  hotel: ["hotel", "guest_house", "campsite"],
+  fuel: ["fuel", "charging"],
+  attraction: ["attraction", "castle", "monument", "museum", "viewpoint", "tourist_info"],
+  castle: ["castle", "monument"],
+  winery: ["winery", "wine_shop"],
+};
+
+export function categoryFamily(id: string): readonly string[] {
+  return CATEGORY_FAMILIES[id] ?? [id];
+}
+
 /* ------------------------------------------------------------------ */
 /*  OSM tags                                                           */
 /* ------------------------------------------------------------------ */
