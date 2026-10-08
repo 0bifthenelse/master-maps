@@ -38,7 +38,7 @@ import { ADOPTED_LAYERS } from "./bdtopoLayers";
 import { createBoundaryIndex, type BoundaryIndex } from "./boundaryIndex";
 import { normalizeBdtopo, settlementAnchors } from "./normalizeBdtopo";
 import { categoryForNaf, categoryForOsmTags, nafIsPlace } from "../../src/lib/data/categories";
-import { displayCase } from "../../src/lib/data/displayText";
+import { displayCase, tidyLabel } from "../../src/lib/data/displayText";
 import { conflateBusinesses } from "./conflate";
 import {
   emptyOsmNormalizeReport,
@@ -1295,9 +1295,16 @@ function canonicalGeometry(geometry: Geometry): Geometry {
 /** Kinds whose source labels sometimes arrive in capitals (BD TOPO public places, ERP, SIRENE signs). */
 const TITLE_CASED_KINDS = new Set(["poi", "business", "landuse", "building", "transport", "structure"]);
 
+function canonicalLabel(kind: string, value: string): string {
+  const tidied = tidyLabel(value);
+  return TITLE_CASED_KINDS.has(kind) && !/[a-zß-ÿ]/.test(tidied) && /[A-Z]{3}/.test(tidied) ? displayCase(tidied) : tidied;
+}
+
 function canonicalFeature(input: MapFeature): MapFeature {
-  const feature = input.name !== undefined && TITLE_CASED_KINDS.has(input.kind) && !/[a-zß-ÿ]/.test(input.name) && /[A-Z]{3}/.test(input.name)
-    ? { ...input, name: displayCase(input.name), ...(input.kind === "business" && input.businessName === input.name ? { businessName: displayCase(input.name) } : {}) } as MapFeature
+  const name = input.name === undefined ? undefined : canonicalLabel(input.kind, input.name);
+  const businessName = input.kind === "business" ? canonicalLabel(input.kind, input.businessName) : undefined;
+  const feature = (name !== input.name || (input.kind === "business" && businessName !== input.businessName))
+    ? { ...input, ...(name === undefined ? {} : { name }), ...(businessName === undefined ? {} : { businessName }) } as MapFeature
     : input;
   const geometry = canonicalGeometry(feature.geometry);
   const localGeometry = feature.localGeometry ? canonicalGeometry(feature.localGeometry) : undefined;

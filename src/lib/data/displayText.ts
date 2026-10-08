@@ -19,3 +19,17 @@ export function displayCase(value: string): string {
     return capitalised.replace(/^(L|D)(['’])/u, (_, letter: string, quote: string) => `${letter.toLowerCase()}${quote}`);
   }).join(" ");
 }
+
+/**
+ * Trim what a source's field limit or export left on a label: a parenthesis
+ * cut off mid-way ("Clinique Vétérinaire (place du") and dangling separators
+ * ("Adapei du Gers - Ludothèque /"). Complete parentheticals stay.
+ */
+export function tidyLabel(value: string): string {
+  const tidied = value
+    .replace(/\s*\([^)]*$/, "")
+    .replace(/^[\s\-–—,;:/_]+|[\s\-–—,;:/_]+$/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  return tidied === "" ? value.trim() : tidied;
+}

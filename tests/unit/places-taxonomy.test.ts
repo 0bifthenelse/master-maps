@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { conflateBusinesses, nameSimilarity } from "../../scripts/data/conflate";
 import { categoryFamily, categoryForFreeText, categoryForNaf, categoryForOsmTags, categoryIntents, nafIsPlace } from "@/lib/data/categories";
-import { displayCase } from "@/lib/data/displayText";
+import { displayCase, tidyLabel } from "@/lib/data/displayText";
 import { formatDay, openState, parseOpeningHours } from "@/lib/data/openingHours";
 import type { BusinessFeature, PoiFeature } from "@/lib/data/schema";
 
@@ -129,5 +129,15 @@ describe("displayCase", () => {
     expect(displayCase("RUE DE L'ÉGLISE")).toBe("Rue de l'Église");
     expect(displayCase("SAINT-JEAN-POUTGE")).toBe("Saint-Jean-Poutge");
     expect(displayCase("Rue Gambetta")).toBe("Rue Gambetta");
+  });
+});
+
+describe("tidyLabel", () => {
+  it("drops a parenthesis cut off by a field limit and dangling separators, keeping whole ones", () => {
+    expect(tidyLabel("CLINIQUE VETERINAIRE (PLACE DU")).toBe("CLINIQUE VETERINAIRE");
+    expect(tidyLabel("Adapei du Gers - Ludotheque /")).toBe("Adapei du Gers - Ludotheque");
+    expect(tidyLabel("Musée (annexe)")).toBe("Musée (annexe)");
+    expect(tidyLabel("Saint-Clar")).toBe("Saint-Clar");
+    expect(tidyLabel(" / ")).toBe("/");
   });
 });
