@@ -904,6 +904,16 @@ function featureName(layer: BdtopoLayerName, properties: Record<string, unknown>
   }
 }
 
+/** The first source vertex that lies inside the department. */
+function firstVertexInside(geometry: Geometry, boundaryIndex: BoundaryIndex): Coordinate | null {
+  const lists: Coordinate[][] = geometry.type === "Point" ? [[geometry.coordinates]]
+    : geometry.type === "LineString" ? [geometry.coordinates]
+      : geometry.type === "MultiLineString" || geometry.type === "Polygon" ? geometry.coordinates
+        : geometry.coordinates.flat();
+  for (const list of lists) for (const vertex of list) if (boundaryIndex.contains(vertex)) return vertex;
+  return null;
+}
+
 export interface BdtopoNormalizationOptions {
   edition?: string;
   /** Local anchor of every inhabited place, keyed by its BD TOPO cleabs, so a
@@ -948,8 +958,17 @@ export function normalizeBdtopo(sourceFeatures: Record<string, unknown>[], bound
     const localGeometry = localize(clipped);
     if (!localGeometry) continue;
     const chefLieu = resolved.name === "communes" ? options.chefLieuAnchors?.get(text(properties.lien_vers_chef_lieu) ?? "") : undefined;
-    const localAnchor = chefLieu ?? geometryAnchor(localGeometry);
-    const [lon, lat] = renderToWgs84(localAnchor);
+    let localAnchor = chefLieu ?? geometryAnchor(localGeometry);
+    let [lon, lat] = renderToWgs84(localAnchor);
+    /* A feature clipped along the border (a river that is the border, a concave wood) can have its
+       centroid or midpoint just outside: anchor it on one of its own vertices inside instead. */
+    if (!boundaryIndex.contains([lon, lat])) {
+      const inside = firstVertexInside(clipped, boundaryIndex);
+      if (inside !== null) {
+        [lon, lat] = inside;
+        localAnchor = wgs84ToRender(inside);
+      }
+    }
     const stableId = `ign-bdtopo:${resolved.layer}/${sourceId}`;
     const common = {
       stableId,

@@ -23,6 +23,8 @@ export interface OsmNormalizeConfig {
   stableIdPrefix: string;
   priority: number;
   retention: OsmRetention;
+  /** Leave the public road network to BD TOPO and keep only the OSM ways it lacks. */
+  roadNetworkFromBdtopo?: boolean;
 }
 
 const DEFAULT_OSM_NORMALIZE_CONFIG: OsmNormalizeConfig = {
@@ -31,6 +33,7 @@ const DEFAULT_OSM_NORMALIZE_CONFIG: OsmNormalizeConfig = {
   stableIdPrefix: "osm-bulk:",
   priority: 60,
   retention: "complete",
+  roadNetworkFromBdtopo: true,
 };
 
 export type CompleteKind = "building" | "water" | "landuse" | "road" | "transport" | "poi" | "place";
@@ -83,12 +86,22 @@ const ROAD_HIGHWAY = new Set([
   "tertiary", "tertiary_link", "unclassified", "residential", "living_street", "service", "road", "busway",
   "track", "path", "footway", "cycleway", "bridleway", "pedestrian", "steps", "corridor", "via_ferrata",
 ]);
+/* The public road network comes from IGN BD TOPO, whose segments carry the
+   official number, class and commune; the same roads from OSM would be drawn
+   twice, slightly offset. OSM still adds what BD TOPO maps sparsely: service
+   roads, tracks, paths, footways, cycleways and steps. */
+const BDTOPO_CANONICAL_HIGHWAY = new Set([
+  "motorway", "motorway_link", "trunk", "trunk_link", "primary", "primary_link", "secondary", "secondary_link",
+  "tertiary", "tertiary_link", "unclassified", "residential", "living_street", "road", "busway",
+]);
 const ROAD_POINT_HIGHWAY = new Set(["mini_roundabout", "motorway_junction"]);
 const TRANSPORT_POINT_HIGHWAY = new Set(["bus_stop", "stop"]);
-const TRAFFIC_POLE_HIGHWAY = new Set([
-  "crossing", "give_way", "traffic_signals", "street_lamp", "speed_camera", "turning_circle", "turning_loop", "milestone", "elevator",
+const TRAFFIC_POLE_HIGHWAY = new Set(["traffic_signals", "speed_camera"]);
+/* Street furniture is not a place anyone looks for and would bury the real markers. */
+const EXCLUDED_HIGHWAY = new Set([
+  "construction", "proposed", "raceway", "rest_area", "bus_stop:condition", "platform",
+  "crossing", "give_way", "street_lamp", "turning_circle", "turning_loop", "milestone", "elevator",
 ]);
-const EXCLUDED_HIGHWAY = new Set(["construction", "proposed", "raceway", "rest_area", "bus_stop:condition", "platform"]);
 
 const RAILWAY_LINEAR = new Set(["rail", "light_rail", "subway", "tram", "narrow_gauge", "monorail", "funicular", "miniature", "preserved"]);
 const RAILWAY_POINT_TRANSPORT: Record<string, string> = { station: "station", halt: "halt", stop: "halt", train_station_entrance: "station", subway_entrance: "station" };
@@ -307,6 +320,7 @@ function completeFeature(
 ): { feature: MapFeature | null; reason: OsmDropReason } {
   const classification = classifyCompleteTags(properties);
   if (typeof classification === "string") return { feature: null, reason: classification };
+  if (config.roadNetworkFromBdtopo === true && classification.kind === "road" && BDTOPO_CANONICAL_HIGHWAY.has(classification.subtype)) return { feature: null, reason: "excluded_tag" };
   const resolved = resolveGeometry(sourceGeometry, classification.mode);
   if (!resolved.ok || !resolved.geometry) return { feature: null, reason: resolved.reason };
   const sourceId = stableSourceId(raw, properties);

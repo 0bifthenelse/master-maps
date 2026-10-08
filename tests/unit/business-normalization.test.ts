@@ -154,3 +154,14 @@ describe("department wide SIRENE records", () => {
     ]);
   });
 });
+
+describe("displayBusinessName", () => {
+  it("title-cases shouted names, drops legal forms, parentheticals and dangling punctuation", async () => {
+    const { displayBusinessName } = await import("../../scripts/data/fetch-businesses");
+    expect(displayBusinessName("SALON DE COIFFURE -")).toBe("Salon de Coiffure");
+    expect(displayBusinessName("CLINIQUE VETERINAIRE (PLACE DU")).toBe("Clinique Veterinaire");
+    expect(displayBusinessName("PHARMACIE DU CENTRE (SELARL)")).toBe("Pharmacie du Centre");
+    expect(displayBusinessName("SARL LES DELICES D'AUCH")).toBe("Les Delices d'Auch");
+    expect(displayBusinessName("Le 8 Pool 32")).toBe("Le 8 Pool 32");
+  });
+});

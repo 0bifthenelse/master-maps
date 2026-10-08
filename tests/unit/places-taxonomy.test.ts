@@ -58,6 +58,11 @@ describe("OSM and SIRENE conflation", () => {
     expect(result.businesses[0]!.sourceRefs.map((reference) => reference.source).sort()).toEqual(["osm", "sirene"]);
   });
 
+  it("lets an exact name match reach further than a similar one", () => {
+    expect(conflateBusinesses([poi("Préfecture du Gers", 100)], [business("Prefecture du Gers", 310)]).merged).toBe(1);
+    expect(conflateBusinesses([poi("Pharmacie du Centre Ville", 100)], [business("Pharmacie du Centre", 310)]).merged).toBe(0);
+  });
+
   it("keeps namesakes apart when they are too far apart or named differently", () => {
     const far = conflateBusinesses([poi("Pharmacie du Centre", 100)], [business("Pharmacie du Centre", 5000)]);
     expect(far.merged).toBe(0);

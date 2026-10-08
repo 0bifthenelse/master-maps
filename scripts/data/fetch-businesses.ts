@@ -425,7 +425,8 @@ const SMALL_WORDS = new Set(["de", "du", "des", "la", "le", "les", "et", "en", "
 /** "SARL PHARMACIE OCCITANE" -> "Pharmacie Occitane": the name a sign shows, not the registry form. */
 export function displayBusinessName(raw: string | undefined): string | undefined {
   if (raw === undefined) return undefined;
-  const withoutParen = raw.replace(/\(.*?\)/g, " ").replace(/\s+/g, " ").trim();
+  /* Drop parentheticals, including one SIRENE cut off at its length limit ("… (PLACE DU"), and dangling punctuation. */
+  const withoutParen = raw.replace(/\(.*?\)/g, " ").replace(/\([^)]*$/, " ").replace(/\s+/g, " ").trim().replace(/^[\s\-–—,;:/.]+|[\s\-–—,;:/]+$/g, "");
   const words = withoutParen.split(" ").filter((word) => !LEGAL_FORM_WORDS.has(word.replace(/[.,]/g, "").toUpperCase()));
   if (words.length === 0) return undefined;
   const shouting = withoutParen === withoutParen.toUpperCase();

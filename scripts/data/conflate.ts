@@ -3,6 +3,8 @@ import { foldSearchText } from "../../src/lib/data/categories";
 
 /** Match radius between an OSM place and a SIRENE establishment. */
 export const CONFLATION_RADIUS_METRES = 150;
+/** The same exact name may sit further apart: SIRENE geocodes the postal entrance, OSM maps the building or campus. */
+export const CONFLATION_EXACT_RADIUS_METRES = 300;
 export const CONFLATION_MIN_SIMILARITY = 0.8;
 
 const GENERIC_TOKENS = new Set(["sarl", "sas", "sasu", "eurl", "sa", "sci", "snc", "et", "de", "du", "des", "la", "le", "les", "l", "d", "a", "au", "aux", "en"]);
@@ -63,16 +65,19 @@ export function conflateBusinesses(osmPois: readonly PoiFeature[], businesses: r
     let best = -1;
     let bestScore = 0;
     let bestDistance = Infinity;
-    for (let dz = -1; dz <= 1; dz += 1) {
-      for (let dx = -1; dx <= 1; dx += 1) {
+    const reach = Math.ceil(CONFLATION_EXACT_RADIUS_METRES / cell);
+    for (let dz = -reach; dz <= reach; dz += 1) {
+      for (let dx = -reach; dx <= reach; dx += 1) {
         for (const index of grid.get(`${column + dx}:${row + dz}`) ?? []) {
           if (consumed.has(index)) continue;
           const poi = osmPois[index]!;
           const other = position(poi)!;
           const distance = Math.hypot(other[0] - at[0], other[1] - at[1]);
-          if (distance > CONFLATION_RADIUS_METRES) continue;
+          if (distance > CONFLATION_EXACT_RADIUS_METRES) continue;
           const score = Math.max(nameSimilarity(poi.name, business.businessName), nameSimilarity(poi.name, business.brand));
           if (score < CONFLATION_MIN_SIMILARITY) continue;
+          const exact = foldSearchText(poi.name ?? "") === foldSearchText(business.businessName);
+          if (distance > (exact ? CONFLATION_EXACT_RADIUS_METRES : CONFLATION_RADIUS_METRES)) continue;
           if (score > bestScore || (score === bestScore && distance < bestDistance)) {
             best = index;
             bestScore = score;

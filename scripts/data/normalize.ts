@@ -167,6 +167,7 @@ const AUCH_OSM_CONFIG: OsmNormalizeConfig = {
   stableIdPrefix: "osm-auch:",
   priority: 65,
   retention: "complete",
+  roadNetworkFromBdtopo: true,
 };
 
 function dataRoot(): string {
@@ -1291,7 +1292,13 @@ function canonicalGeometry(geometry: Geometry): Geometry {
   return normalized;
 }
 
-function canonicalFeature(feature: MapFeature): MapFeature {
+/** Kinds whose source labels sometimes arrive in capitals (BD TOPO public places, ERP, SIRENE signs). */
+const TITLE_CASED_KINDS = new Set(["poi", "business", "landuse", "building", "transport", "structure"]);
+
+function canonicalFeature(input: MapFeature): MapFeature {
+  const feature = input.name !== undefined && TITLE_CASED_KINDS.has(input.kind) && !/[a-zß-ÿ]/.test(input.name) && /[A-Z]{3}/.test(input.name)
+    ? { ...input, name: displayCase(input.name), ...(input.kind === "business" && input.businessName === input.name ? { businessName: displayCase(input.name) } : {}) } as MapFeature
+    : input;
   const geometry = canonicalGeometry(feature.geometry);
   const localGeometry = feature.localGeometry ? canonicalGeometry(feature.localGeometry) : undefined;
   const source = feature.sourceGeometry === undefined ? undefined : canonicalGeometry(feature.sourceGeometry);
