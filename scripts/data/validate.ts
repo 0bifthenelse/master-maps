@@ -15,6 +15,7 @@ import {
 import { GERS_TERRITORY } from "../../src/lib/data/territory";
 import { reconcileCoverage, readExclusionReport, type CoverageReconciliation, type ExclusionReport } from "./exclusion-report";
 import { createBoundaryIndex, type BoundaryIndex } from "./boundaryIndex";
+import { BOUNDARY_TILE_ID } from "./build-tiles";
 import { RANGE_STRIDE, RENDER_LAYER_KINDS, decodeRenderTile, renderLayerIndices, renderLayerRanges, renderLayerVertices, type DecodedRenderTile } from "../../src/lib/render/codec";
 
 const MAX_HEIGHT_METRES = 100;
@@ -69,13 +70,20 @@ function parseArgs(args: string[]): ValidateOptions {
   return { generatedDir, coverageOnly };
 }
 
+/** About a metre in degrees: roads and streams that are the border itself carry anchors on the line. */
+const BORDER_TOLERANCE_DEGREES = 1e-5;
+
+function onBorder(lon: number, lat: number, boundaryIndex: BoundaryIndex): boolean {
+  const d = BORDER_TOLERANCE_DEGREES;
+  return boundaryIndex.touches([[lon - d, lat], [lon + d, lat]]) || boundaryIndex.touches([[lon, lat - d], [lon, lat + d]]);
+}
 
 function coordinateIssues(feature: TileMetaFeature, boundaryIndex: BoundaryIndex): ValidationIssue[] {
   const issues: ValidationIssue[] = [];
   const featureId = feature.stableId;
   if (feature.lon === undefined || feature.lat === undefined || !Number.isFinite(feature.lon) || !Number.isFinite(feature.lat)) {
     issues.push({ severity: "error", message: "feature has no finite WGS84 anchor", featureId });
-  } else if (!boundaryIndex.contains([feature.lon, feature.lat]) && feature.kind !== "boundary") {
+  } else if (feature.kind !== "boundary" && !boundaryIndex.contains([feature.lon, feature.lat]) && !onBorder(feature.lon, feature.lat, boundaryIndex)) {
     issues.push({ severity: "error", message: "feature anchor lies outside the Gers boundary", featureId });
   }
   if (feature.x === undefined || feature.z === undefined || !Number.isFinite(feature.x) || !Number.isFinite(feature.z)) {
@@ -313,6 +321,11 @@ async function loadTiles(generatedDir: string): Promise<{ features: TileMetaFeat
   for (const entry of entries) {
     if (!entry.isFile() || !entry.name.endsWith(".json.gz")) continue;
     const tileId = entry.name.slice(0, -".json.gz".length);
+    if (tileId === BOUNDARY_TILE_ID) {
+      /* The territory outline lives outside the LOD grid: it has no manifest row, only its own sidecar and render tile. */
+      for (const feature of await loadMetaFeatures(metaDir, tileId, issues)) featuresById.set(feature.stableId, { lod: -1, feature });
+      continue;
+    }
     const tile = manifestById.get(tileId);
     if (!tile) {
       issues.push({ severity: "error", message: "meta sidecar has no manifest entry", tileId });

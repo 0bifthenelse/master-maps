@@ -63,7 +63,8 @@ const DETAILED_TARGET_BYTES = 1024 * 1024;
 const DETAILED_HARD_LIMIT_BYTES = 2 * 1024 * 1024;
 const META_TILE_HARD_LIMIT_BYTES = 2 * 1024 * 1024;
 const DEFAULT_DATASET_VERSION = "0.1.0";
-const BOUNDARY_TILE_ID = "boundary";
+/** The territory outline ships as one tile outside the LOD grid, fetched once by every client. */
+export const BOUNDARY_TILE_ID = "boundary";
 const IGNORED_FILES: ReadonlySet<string> = new Set([
   "provenance.json", "boundary-source.json", "bdtopo-manifest.json", "ign-unavailable.json",
   "osm-manifest.json", "osm-bulk-manifest.json", "relation-issues.json", "normalization-issues.json",
