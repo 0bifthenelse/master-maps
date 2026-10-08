@@ -53,8 +53,8 @@ export default function Telemetry({ tiles, datasetDate }: TelemetryProps) {
   const date = now.toLocaleDateString("en-CA", { timeZone: "Europe/Paris" });
   return (
     <div className="mm-telemetry" aria-label="Map telemetry">
-      <span className="mm-telemetry__item mm-telemetry__live">● LIVE FEED</span>
-      <span className="mm-telemetry__item"><span className="mm-telemetry__key">{cursor.point === null ? "CENTRE" : "CURSOR"}</span><span className="mm-telemetry__value">{latLon}</span></span>
+      <span className="mm-telemetry__item mm-telemetry__live">●<span className="mm-telemetry__desktop"> LIVE FEED</span></span>
+      <span className="mm-telemetry__item"><span className="mm-telemetry__key mm-telemetry__desktop">{cursor.point === null ? "CENTRE" : "CURSOR"}</span><span className="mm-telemetry__value">{latLon}</span></span>
       <span className="mm-telemetry__item mm-telemetry__desktop"><span className="mm-telemetry__key">L93</span><span className="mm-telemetry__value">{lambert}</span></span>
       <span className="mm-telemetry__item"><span className="mm-telemetry__key">Z</span><span className="mm-telemetry__value">{view.zoom.toFixed(1)}</span></span>
       <span className="mm-telemetry__item mm-telemetry__desktop"><span className="mm-telemetry__key">HDG</span><span className="mm-telemetry__value">{String(heading).padStart(3, "0")}°</span></span>
