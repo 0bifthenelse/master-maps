@@ -1064,8 +1064,10 @@ async function runScan(
 }
 
 async function writeProvenance(source: string, destination: string): Promise<void> {
-  const reader = readline.createInterface({ input: createReadStream(source), crlfDelay: Infinity });
+  /* Open the destination before the reader: a readline interface that finishes a small file while
+     an await is pending closes before `for await` attaches, and the loop then waits forever. */
   const handle = await fs.open(destination, "w");
+  const reader = readline.createInterface({ input: createReadStream(source), crlfDelay: Infinity });
   let buffer = "[";
   let first = true;
   try {

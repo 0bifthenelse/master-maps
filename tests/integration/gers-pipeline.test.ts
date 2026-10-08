@@ -2,6 +2,7 @@ import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { createBoundaryIndex, type BoundaryIndex } from "../../scripts/data/boundaryIndex";
+import { featureRecords } from "../../scripts/data/deduplicate";
 import { wgs84ToRender } from "@/lib/geo/crs";
 import { GERS_TERRITORY } from "@/lib/data/territory";
 import { MapFeatureSchema, SearchRecordSchema, type Geometry, type MapFeature, type SearchRecord } from "@/lib/data/schema";
@@ -11,6 +12,9 @@ const ROOT = process.env.MASTER_MAPS_DATA_DIR ?? "data";
 const DATA_AVAILABLE = existsSync(join(ROOT, "raw", GERS_TERRITORY.boundaryRawFile))
   && existsSync(join(ROOT, "search", "index.json"))
   && existsSync(join(ROOT, "intermediate"));
+
+/* Streaming every canonical feature of the department takes a minute or two. */
+const STREAM_TIMEOUT_MS = 300_000;
 
 type Anchor = { coordinate: [number, number]; sourceUrl: string };
 const anchorRecords = anchors.anchors as Record<string, Anchor>;
@@ -43,16 +47,20 @@ function nearestGeometryPoint(geometry: Geometry, target: [number, number]): [nu
 }
 
 
-function loadFeatures(): MapFeature[] {
+/** Stream the canonical features and keep the few a test asks for; the full set is gigabytes. */
+async function findFeatures(hint: (raw: string) => boolean, accept: (feature: MapFeature) => boolean = () => true): Promise<MapFeature[]> {
   const directory = join(ROOT, "intermediate");
   const ignored = new Set(["provenance.json", "boundary-source.json", "bdtopo-manifest.json", "ign-unavailable.json", "osm-manifest.json", "osm-bulk-manifest.json", "relation-issues.json", "normalization-issues.json"]);
-  const features: MapFeature[] = [];
+  const features = new Map<string, MapFeature>();
   for (const entry of readdirSync(directory, { withFileTypes: true })) {
     if (!entry.isFile() || !entry.name.endsWith(".json") || ignored.has(entry.name)) continue;
-    const parsed = JSON.parse(readFileSync(join(directory, entry.name), "utf8")) as unknown;
-    if (Array.isArray(parsed)) for (const value of parsed) features.push(MapFeatureSchema.parse(value));
+    for await (const raw of featureRecords(join(directory, entry.name))) {
+      if (!hint(raw)) continue;
+      const feature = MapFeatureSchema.parse(JSON.parse(raw) as unknown);
+      if (accept(feature)) features.set(feature.stableId, feature);
+    }
   }
-  return [...new Map(features.map((feature) => [feature.stableId, feature])).values()];
+  return [...features.values()];
 }
 
 function loadSearch(): SearchRecord[] {
@@ -78,10 +86,12 @@ describe("Gers production territory", () => {
     expect(Object.keys(anchorRecords)).toHaveLength(15);
   });
 
-  it("resolves the five Auch source anchors in generated data", () => {
+  it("resolves the five Auch source anchors in generated data", async () => {
     if (!DATA_AVAILABLE) return;
-    const features = loadFeatures();
-    for (const key of ["gareAuch", "cathedralSainteMarie", "prefectureGers", "boulevardSadiCarnot", "avenueDAlsace"]) {
+    const keys = ["gareAuch", "cathedralSainteMarie", "prefectureGers", "boulevardSadiCarnot", "avenueDAlsace"];
+    const urls = keys.map((key) => anchorRecords[key]!.sourceUrl);
+    const features = await findFeatures((raw) => urls.some((url) => raw.includes(url)));
+    for (const key of keys) {
       const anchor = anchorRecords[key]!;
       const feature = features
         .filter((candidate) => candidate.sourceRefs.some((reference) => reference.url === anchor.sourceUrl))
@@ -93,7 +103,7 @@ describe("Gers production territory", () => {
         if (point) expect(metricDistance(point, anchor.coordinate), key).toBeLessThan(150);
       }
     }
-  });
+  }, STREAM_TIMEOUT_MS);
 
   it("locates every distributed town inside the Gers boundary", () => {
     if (!DATA_AVAILABLE) return;
@@ -111,9 +121,12 @@ describe("Gers production territory", () => {
     }
   });
 
-  it("keeps central Auch topology on the expected sides of the Gers", () => {
+  it("keeps central Auch topology on the expected sides of the Gers", async () => {
     if (!DATA_AVAILABLE) return;
-    const features = loadFeatures();
+    const features = await findFeatures(
+      (raw) => (raw.includes('"kind":"water"') && /gers/i.test(raw)) || (raw.includes('"kind":"road"') && /pasteur/i.test(raw)),
+      (feature) => normalized(feature.name ?? "").includes(feature.kind === "water" ? "gers" : "rue pasteur"),
+    );
     const centre = anchorRecords.cathedralSainteMarie.coordinate;
     const rivers = features.filter((feature) => feature.kind === "water" && normalized(feature.name ?? "").includes("gers"));
     const river = rivers.sort((first, second) => {
@@ -139,5 +152,5 @@ describe("Gers production territory", () => {
       const riverNearPasteur = pasteurPoint ? nearestGeometryPoint(river.geometry, pasteurPoint) : undefined;
       if (pasteurPoint && riverNearPasteur) expect(metricDistance(pasteurPoint, riverNearPasteur)).toBeLessThan(150);
     }
-  });
+  }, STREAM_TIMEOUT_MS);
 });
