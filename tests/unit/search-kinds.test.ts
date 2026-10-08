@@ -31,6 +31,8 @@ const TILE_MAP = new Map<string, string>([
   ["transport-auch-airfield-point", "l0_0_22"],
   ["toponym-auch-airfield", "l0_0_22"],
   ["poi-airfield-restaurant", "l0_0_22"],
+  ["business-prefecture-register", "l0_0_23"],
+  ["business-prefecture-mapped", "l0_0_23"],
 ]);
 
 const FEATURES: MapFeature[] = [
@@ -49,6 +51,9 @@ const FEATURES: MapFeature[] = [
   feature({ stableId: "transport-auch-airfield", kind: "transport", lon: 0.603, lat: 43.688, geometry: { type: "Polygon", coordinates: [[[0.595, 43.686], [0.611, 43.686], [0.611, 43.690], [0.595, 43.690], [0.595, 43.686]]] }, name: "Aéroport Auch-Gers", transportType: "aerodrome" }),
   feature({ stableId: "transport-auch-airfield-point", kind: "transport", lon: 0.6105, lat: 43.6885, geometry: { type: "Point", coordinates: [0.6105, 43.6885] }, name: "Aéroport d'Auch-Gers", transportType: "aerodrome" }),
   feature({ stableId: "toponym-auch-airfield", kind: "place", lon: 0.5985, lat: 43.6875, geometry: { type: "Point", coordinates: [0.5985, 43.6875] }, name: "Aéroport d'Auch-Gers", placeType: "airport" }),
+  /* The same prefecture registered twice in SIRENE; one was conflated with its OSM building. */
+  feature({ stableId: "business-prefecture-register", kind: "business", lon: 0.58677, lat: 43.64655, geometry: { type: "Point", coordinates: [0.58677, 43.64655] }, businessName: "Préfecture du Gers", category: "town_hall", phone: "0562000000", website: "gers.gouv.fr", openingHours: "Mo-Fr 09:00-12:00", sourceRefs: [{ source: "sirene", timestamp: "2026" }] }),
+  feature({ stableId: "business-prefecture-mapped", kind: "business", lon: 0.58674, lat: 43.64679, geometry: { type: "Point", coordinates: [0.58674, 43.64679] }, businessName: "Préfecture du Gers", category: "town_hall", sourceRefs: [{ source: "sirene", timestamp: "2026" }, { source: "osm-bulk", timestamp: "2026" }], sourceMetadata: { conflatedWith: "osm-bulk:w65461658" } }),
   feature({ stableId: "poi-airfield-restaurant", kind: "poi", lon: 0.604, lat: 43.6878, geometry: { type: "Point", coordinates: [0.604, 43.6878] }, name: "Restaurant de l'Aéroport", poiType: "restaurant" }),
 ];
 
@@ -117,6 +122,12 @@ describe("buildSearchIndex place and transport coverage", () => {
     expect(airfield).toHaveLength(1);
     expect(airfield[0]?.kind).toBe("transport");
     expect(RECORDS.some((record) => record.featureId === "poi-airfield-restaurant")).toBe(true);
+  });
+
+  it("answers a place registered twice with the registration OpenStreetMap puts on its building", () => {
+    const prefecture = RECORDS.filter((record) => record.canonicalName === "Préfecture du Gers");
+    expect(prefecture).toHaveLength(1);
+    expect(prefecture[0]?.featureId).toBe("business-prefecture-mapped");
   });
 
   it("keeps the transport name as its canonical name", () => {

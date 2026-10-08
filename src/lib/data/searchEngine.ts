@@ -417,7 +417,9 @@ export class SearchEngine {
       const wanted = parsed.tokens[0]!.toUpperCase();
       for (const candidate of candidates) {
         const record = this.records[candidate.record]!;
-        if (record.kind === "road" && record.ref?.split(/[;,]/).some((ref) => ref.trim().toUpperCase() === wanted) === true) candidate.score += ROAD_NUMBER_BONUS;
+        /* The route itself ("D1021", formerly N21), not a street that merely carries the number. */
+        const route = ROAD_NUMBER.test(record.canonicalName.replace(/\s+/g, "").toLowerCase());
+        if (route && record.kind === "road" && record.ref?.split(/[;,]/).some((ref) => ref.trim().toUpperCase() === wanted) === true) candidate.score += ROAD_NUMBER_BONUS;
       }
     }
 

@@ -330,6 +330,8 @@ interface Draft {
   ref?: string;
   brand?: string;
   anchor: Point;
+  /** Position taken from OpenStreetMap, which maps a place on its building rather than its postal address. */
+  mapped?: boolean;
   box?: Box;
   boost: number;
   /** Which duplicate wins when two records describe the same place. */
@@ -670,7 +672,7 @@ export function buildSearchIndex(features: MapFeature[], tiles: Map<string, stri
           context: [line, communeName].filter(Boolean).join(", "), ...(communeName === undefined ? {} : { commune: communeName }),
           ...(postal.postcode ?? commune?.postcode ? { postcode: postal.postcode ?? commune?.postcode } : {}),
           ...(street === undefined ? {} : { street }), ...(feature.brand === undefined ? {} : { brand: feature.brand }),
-          anchor, boost: 60 + (feature.phone ? 6 : 0) + (feature.website ? 6 : 0) + (feature.openingHours ? 8 : 0) + (feature.brand ? 10 : 0) + (conflated ? 8 : 0), richness: 8,
+          anchor, ...(conflated ? { mapped: true } : {}), boost: 60 + (feature.phone ? 6 : 0) + (feature.website ? 6 : 0) + (feature.openingHours ? 8 : 0) + (feature.brand ? 10 : 0) + (conflated ? 8 : 0), richness: 8,
         });
         break;
       }
@@ -863,6 +865,12 @@ function deduplicate(drafts: Draft[]): Draft[] {
         if (draft.category !== undefined && CATEGORY_BY_ID.has(draft.category) && draft.category !== "other") twin.category = draft.category;
       }
       if ((twin.context === undefined || twin.context === "") && draft.context !== undefined) twin.context = draft.context;
+      /* Two registrations of one place: answer with the one OpenStreetMap puts on its building. */
+      if (draft.mapped === true && twin.mapped !== true && twin.kind === draft.kind && twin.box === undefined) {
+        twin.featureId = draft.featureId;
+        twin.anchor = draft.anchor;
+        twin.mapped = true;
+      }
       twin.boost = Math.max(twin.boost, draft.boost);
       continue;
     }

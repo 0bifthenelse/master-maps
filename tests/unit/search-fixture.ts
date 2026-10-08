@@ -58,6 +58,7 @@ export const FIXTURE_RECORDS: SearchRecord[] = [
   record({ featureId: "route-d1021", canonicalName: "D1021", kind: "road", category: "primary", boost: 200, context: "Former N21 · 60 km · 12 communes", ref: "D1021;N21", aliases: ["N21"], ...at(AUCH, 0, 9000), bbox: [-10000, -40000, 10000, 40000] }),
   record({ featureId: "bus-cinema", canonicalName: "Cinéma", kind: "transport", category: "bus_stop", boost: 25, context: "Auch", commune: "Auch", ...at(AUCH, 400, 300) }),
   record({ featureId: "cine-32", canonicalName: "Ciné 32", kind: "poi", category: "cinema", boost: 90, context: "Auch", commune: "Auch", ...at(AUCH, 420, 330) }),
+  record({ featureId: "street-n21-lectoure", canonicalName: "N 21 Lectoure", kind: "road", category: "primary", boost: 95, context: "Sainte-Mère", commune: "Sainte-Mère", ref: "D1021;N21", ...at(AUCH, 0, 30000) }),
   record({ featureId: "river-baise", canonicalName: "La Baïse", kind: "water", category: "river", boost: 90, context: "88 km · 30 communes", ...at(CONDOM, 500, 0), bbox: [-35000, -40000, -20000, 40000] }),
 ];
 
