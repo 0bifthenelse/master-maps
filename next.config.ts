@@ -5,9 +5,6 @@ const nextConfig: NextConfig = {
     webpackBuildWorker: true,
   },
   serverExternalPackages: ["three"],
-  eslint: {
-    ignoreDuringBuilds: false,
-  },
   typescript: {
     ignoreBuildErrors: false,
   },
