@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { gunzipSync } from "node:zlib";
 import { MapFeatureSchema, TileManifestSchema, type Geometry, type MapFeature } from "@/lib/data/schema";
-import { decodeRenderTile } from "@/lib/render/codec";
+import { RANGE_STRIDE, decodeRenderTile } from "@/lib/render/codec";
 
 const BOUNDARY: unknown[] = [{
   stableId: "boundary:32",
@@ -194,14 +194,19 @@ describe("build-tiles streaming output", () => {
       const decoded = decodeRenderTile(buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength) as ArrayBuffer);
       expect(decoded.header.tileId).toBe(name.slice(0, -".mmt".length));
       for (const layer of decoded.layers) {
-        const vertexCount = layer.positionLength / 3;
+        const vertexCount = layer.vertexLength / layer.stride;
         const indices = new Uint32Array(decoded.payload, layer.indexOffset, layer.indexLength);
         for (const index of indices) expect(index).toBeLessThan(vertexCount);
         const ranges = new Uint32Array(decoded.payload, layer.rangeOffset, layer.rangeLength);
-        expect(ranges.length % 3).toBe(0);
-        for (let entry = 0; entry < ranges.length; entry += 3) {
-          expect(ranges[entry]! + ranges[entry + 1]!).toBeLessThanOrEqual(indices.length);
-          expect(ranges[entry + 2]!).toBeLessThan(decoded.meta.length);
+        expect(ranges.length % RANGE_STRIDE).toBe(0);
+        for (let entry = 0; entry < ranges.length; entry += RANGE_STRIDE) {
+          const [indexStart, indexCount, metaIndex, vertexStart, vertexSpan] = Array.from(ranges.slice(entry, entry + RANGE_STRIDE)) as [number, number, number, number, number];
+          expect(indexStart + indexCount).toBeLessThanOrEqual(indices.length);
+          expect(metaIndex).toBeLessThan(decoded.meta.length);
+          /* Every triangle of a feature stays within that feature's own vertices. */
+          for (let at = indexStart; at < indexStart + indexCount; at += 1) {
+            expect(indices[at]! >= vertexStart && indices[at]! < vertexStart + vertexSpan).toBe(true);
+          }
           checkedRanges += 1;
         }
       }

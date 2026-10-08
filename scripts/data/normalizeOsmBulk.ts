@@ -254,13 +254,18 @@ function clipGeometryToBoundary(sourceGeometry: Geometry, boundary: BulkBoundary
   if (sourceGeometry.type === "Point") return boundary.index.contains(sourceGeometry.coordinates) ? sourceGeometry : null;
   if (sourceGeometry.type === "LineString" || sourceGeometry.type === "MultiLineString") {
     const vertices = sourceGeometry.type === "LineString" ? sourceGeometry.coordinates : sourceGeometry.coordinates.flat();
+    const sourceLines = sourceGeometry.type === "LineString" ? [sourceGeometry.coordinates] : sourceGeometry.coordinates;
+    /* Almost every way lies well inside the department: skip the exact clip for those. */
+    if (sourceLines.every((line) => boundary.index.lineInside(line))) return sourceGeometry;
     if (!boundary.index.touches(vertices)) return null;
-    const lines = (sourceGeometry.type === "LineString" ? [sourceGeometry.coordinates] : sourceGeometry.coordinates)
+    const lines = sourceLines
       .flatMap((line) => boundary.polygons.flatMap((polygon) => clipLineStringToPolygon(line, polygon)));
     if (lines.length === 0) return null;
     return lines.length === 1 ? { type: "LineString", coordinates: lines[0]! } : { type: "MultiLineString", coordinates: lines };
   }
   const rings = sourceGeometry.type === "Polygon" ? [sourceGeometry.coordinates] : sourceGeometry.coordinates;
+  if (rings.every((polygon) => boundary.index.polygonInside(polygon))) return sourceGeometry;
+  if (rings.every((polygon) => boundary.index.polygonOutside(polygon))) return null;
   const polygons = rings.flatMap((coordinates) => boundary.polygons.flatMap((polygon) => {
     const clipped = clipPolygonToPolygon({ type: "Polygon", coordinates }, polygon);
     if (!clipped) return [];

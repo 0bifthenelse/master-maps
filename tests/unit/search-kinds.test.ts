@@ -77,17 +77,23 @@ describe("buildSearchIndex place and transport coverage", () => {
     expect(byId("transport-bus").category).toBe("bus_stop");
   });
 
-  it("composes a searchable name for an address that only has its street parts", () => {
+  it("names an address by number and street, with its postcode and commune as context", () => {
     const record = byId("address-full");
-    expect(record.canonicalName).toBe("12 Rue Nationale 32000 Auch");
+    expect(record.canonicalName).toBe("12 Rue Nationale");
+    expect(record.context).toBe("32000 Auch");
+    expect(record.street).toBe("Rue Nationale");
+    expect(record.housenumber).toBe("12");
     expect(record.normalizedName).toContain("rue nationale");
   });
 
-  it("keeps the address street as an alias for street only queries", () => {
-    expect(byId("address-full").aliases).toContain("rue nationale");
+  it("keeps the business category and anchors every record locally", () => {
+    const record = byId("business-named");
+    expect(record.category).toBe("beauty");
+    expect(Number.isFinite(record.x)).toBe(true);
+    expect(Number.isFinite(record.z)).toBe(true);
   });
 
-  it("keeps the transport name as an alias", () => {
-    expect(byId("transport-gare").aliases).toContain("gare d'auch");
+  it("keeps the transport name as its canonical name", () => {
+    expect(byId("transport-gare").canonicalName).toBe("Gare d'Auch");
   });
 });

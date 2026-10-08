@@ -112,18 +112,9 @@ function isSeparated(bounds: Bounds, quad: TileQuad, axis: WorldPoint): boolean 
     if (projection < quadMin) quadMin = projection;
     if (projection > quadMax) quadMax = projection;
   }
-  const tileLow = Math.min(
-    axis.x >= 0 ? axis.x * bounds[0] : axis.x * bounds[2],
-    axis.z >= 0 ? axis.z * bounds[1] : axis.z * bounds[3],
-    axis.x >= 0 ? axis.x * bounds[2] : axis.x * bounds[0],
-    axis.z >= 0 ? axis.z * bounds[3] : axis.z * bounds[1],
-  );
-  const tileHigh = Math.max(
-    axis.x >= 0 ? axis.x * bounds[0] : axis.x * bounds[2],
-    axis.z >= 0 ? axis.z * bounds[1] : axis.z * bounds[3],
-    axis.x >= 0 ? axis.x * bounds[2] : axis.x * bounds[0],
-    axis.z >= 0 ? axis.z * bounds[3] : axis.z * bounds[1],
-  );
+  /* Projection of the box onto the axis: the nearest and farthest corners. */
+  const tileLow = (axis.x >= 0 ? axis.x * bounds[0] : axis.x * bounds[2]) + (axis.z >= 0 ? axis.z * bounds[1] : axis.z * bounds[3]);
+  const tileHigh = (axis.x >= 0 ? axis.x * bounds[2] : axis.x * bounds[0]) + (axis.z >= 0 ? axis.z * bounds[3] : axis.z * bounds[1]);
   return tileLow > quadMax || tileHigh < quadMin;
 }
 
