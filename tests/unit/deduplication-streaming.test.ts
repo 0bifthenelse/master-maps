@@ -202,6 +202,19 @@ describe("bounded memory deduplication equals the in memory reference", () => {
     expect(streamed[0]?.stableId).toBe("ign-bdtopo:road/60");
   });
 
+  it("books a metric conflation once, so every source layer balances", () => {
+    const osm = feature("road", "osm:way/61", "osm", { type: "LineString", coordinates: [[190, 5], [210, 5.2]] }, centred(190, 5, 210, 5.2, { name: "Rue de la Gare", roadClass: "residential", highway: "residential" }));
+    const ign = feature("road", "ign-bdtopo:road/61", "IGN BD TOPO", { type: "LineString", coordinates: [[190, 5.1], [210, 5.3]] }, centred(190, 5.1, 210, 5.3, { name: "Rue de la Gare" }));
+    const accounting = createDedupAccounting();
+    expect(deduplicateFeatures([osm, ign], accounting)).toHaveLength(1);
+    const rows = accounting.sources.rows();
+    expect(rows.length).toBeGreaterThan(0);
+    for (const row of rows) {
+      const excluded = row.excludedByRule.reduce((sum, entry) => sum + entry.count, 0);
+      expect(row.accepted + excluded).toBe(row.input);
+    }
+  });
+
   it("merges water surfaces, keeps a reservoir apart and refuses a surface to centreline merge", async () => {
     const surface = feature("water", "ign-bdtopo:surface/70", "IGN BD TOPO", square(40, 40, 60, 60), centred(40, 40, 60, 60, { waterType: "Ecoulement naturel", isSurface: true }));
     const osm = feature("water", "osm-bulk:way/70", "osm-bulk", square(41, 41, 59, 59), centred(40, 40, 60, 60, { waterType: "Ecoulement naturel", isSurface: true }));
