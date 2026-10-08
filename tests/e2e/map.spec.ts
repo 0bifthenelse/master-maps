@@ -60,6 +60,8 @@ test.describe("WebGL map", () => {
     await page.mouse.up({ button: "right" });
     const turned = await settle(page);
     expect(turned.headingRadians).toBeGreaterThan(0.2);
+    /* Turning the map is not a right-click: no context menu, even where the browser asks for one on press. */
+    await expect(page.getByRole("menu")).toHaveCount(0);
     const degrees = Math.round((((turned.headingRadians * 180) / Math.PI) % 360 + 360) % 360);
     await expect(page.locator(".mm-compass")).toHaveAttribute("aria-label", new RegExp(`heading ${degrees} degrees`));
 
@@ -74,6 +76,17 @@ test.describe("WebGL map", () => {
     const north = await settle(page);
     expect(Math.abs(north.headingRadians)).toBeLessThan(1e-3);
     expect(north.pitchRadians).toBeLessThan(1e-3);
+  });
+
+  test("a right-click without moving opens the context menu", async ({ page }) => {
+    await openMap(page, viewHash(15));
+    const box = await stageBox(page);
+    await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2, { button: "right" });
+    const menu = page.getByRole("menu");
+    await expect(menu).toBeVisible();
+    await expect(menu).toContainText(/What's here|Open details/i);
+    await page.keyboard.press("Escape");
+    await expect(menu).toHaveCount(0);
   });
 
   test("H J K L and the arrows reveal the map in that direction", async ({ page }) => {

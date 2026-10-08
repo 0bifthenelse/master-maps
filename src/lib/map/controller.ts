@@ -114,6 +114,8 @@ export class MapController {
   private dragged = false;
   private grabbed: MapPoint | null = null;
   private rotateStart = { x: 0, y: 0, bearing: 0, pitch: 0 };
+  /** A context menu asked for while the button that may still rotate the map is down (Linux, macOS). */
+  private pendingMenu: { x: number; y: number; event: MouseEvent } | null = null;
   private pinch = { midX: 0, midY: 0, distance: 0, angle: 0, tilt: false, decided: false, moved: 0, startTime: 0, startMidY: 0 };
   private samples: PointerSample[] = [];
   private inertia: { vx: number; vy: number; last: number } | null = null;
@@ -539,6 +541,9 @@ export class MapController {
     if (tracked === undefined) return;
     const [x, y] = this.local(event);
     const mode = this.dragMode;
+    const menu = this.pendingMenu;
+    this.pendingMenu = null;
+    if (menu !== null && !this.dragged) this.callbacks.onContextMenu?.(menu.x, menu.y, menu.event);
     this.pointers.delete(event.pointerId);
     try {
       this.element.releasePointerCapture(event.pointerId);
@@ -588,6 +593,7 @@ export class MapController {
   };
 
   private readonly onPointerCancel = (event: PointerEvent): void => {
+    this.pendingMenu = null;
     this.pointers.delete(event.pointerId);
     if (this.pointers.size === 0) {
       this.dragMode = "none";
@@ -661,6 +667,12 @@ export class MapController {
     event.preventDefault();
     if (this.dragged) return;
     const [x, y] = this.local(event);
+    /* Some systems ask for the menu as the button goes down, before a rotate drag can begin:
+       wait for the release and open it only if the map did not turn. */
+    if (this.dragMode === "rotate") {
+      this.pendingMenu = { x, y, event };
+      return;
+    }
     this.callbacks.onContextMenu?.(x, y, event);
   };
 
