@@ -67,6 +67,16 @@ test.describe("search", () => {
     await expect(dossier).toHaveCount(0);
   });
 
+  test("Enter straight after typing opens the best match", async ({ page }) => {
+    await openMap(page);
+    const input = page.getByTestId("search-input");
+    await input.fill("tour d'armagnac");
+    await input.press("Enter");
+    const dossier = page.getByTestId("feature-dossier");
+    await expect(dossier).toBeVisible({ timeout: 15_000 });
+    await expect(dossier).toContainText(/Tour d'Armagnac/i);
+  });
+
   test("a category chip lists nearby places on the map", async ({ page }) => {
     await openMap(page, viewHash(15));
     await page.getByRole("toolbar", { name: "Find nearby" }).getByRole("button", { name: "Pharmacies" }).click();

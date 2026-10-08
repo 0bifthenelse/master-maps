@@ -732,6 +732,24 @@ export default function MapShell() {
     }
   }, [focusTarget]);
 
+  const submitSearch = useCallback(() => {
+    if (!textActive) return;
+    const submitted = trimmedQuery;
+    const generation = ++searchGeneration.current;
+    runSearch(new URLSearchParams({ q: submitted, limit: "12" }), generation)
+      .then((found) => {
+        if (found === null) return;
+        setTextResult({ query: submitted, hits: found });
+        setActiveIndex(found.length > 0 ? 0 : -1);
+        if (found[0] !== undefined) void selectHit(found[0]);
+        else toastText(`Nothing found for “${submitted}”`);
+      })
+      .catch((error: unknown) => {
+        console.warn(error);
+        if (generation === searchGeneration.current) setTextResult({ query: submitted, hits: [] });
+      });
+  }, [textActive, trimmedQuery, runSearch, selectHit, toastText]);
+
   const resultViews = useMemo<SearchResultView[]>(() => hits.map((hit) => {
     const { code, tone } = classify(hit.kind, hit.category);
     const label = categoryLabel({ k: hit.kind, c: hit.category ?? hit.kind });
@@ -885,6 +903,7 @@ export default function MapShell() {
               const hit = hits[index];
               if (hit !== undefined) void selectHit(hit);
             }}
+            onSubmit={submitSearch}
             onClose={() => setSearchOpen(false)}
             onFocus={() => setSearchOpen(true)}
             chips={CHIPS}

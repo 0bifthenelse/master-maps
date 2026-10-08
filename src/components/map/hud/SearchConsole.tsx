@@ -27,6 +27,8 @@ export interface SearchConsoleProps {
   activeIndex: number;
   onActiveIndexChange: (index: number) => void;
   onSelect: (index: number) => void;
+  /** Enter before the typed query has answered: search it now and open the best match. */
+  onSubmit: () => void;
   onClose: () => void;
   onFocus: () => void;
   chips: readonly CategoryChip[];
@@ -83,7 +85,7 @@ function highlight(text: string, query: string): React.ReactNode {
 }
 
 export default function SearchConsole(props: SearchConsoleProps) {
-  const { inputRef, query, onQueryChange, results, pending, open, activeIndex, onActiveIndexChange, onSelect, onClose, onFocus, chips, activeChip, onChip, statusText } = props;
+  const { inputRef, query, onQueryChange, results, pending, open, activeIndex, onActiveIndexChange, onSelect, onSubmit, onClose, onFocus, chips, activeChip, onChip, statusText } = props;
   const listId = useId();
   const showResults = open && (results.length > 0 || (query.trim().length >= 2 && !pending));
 
@@ -97,7 +99,8 @@ export default function SearchConsole(props: SearchConsoleProps) {
       if (results.length > 0) onActiveIndexChange((activeIndex - 1 + results.length) % results.length);
     } else if (event.key === "Enter") {
       event.preventDefault();
-      if (results.length > 0) onSelect(Math.max(0, activeIndex));
+      if (pending || results.length === 0) onSubmit();
+      else onSelect(Math.max(0, activeIndex));
     } else if (event.key === "Escape") {
       event.preventDefault();
       if (query !== "") onQueryChange("");
