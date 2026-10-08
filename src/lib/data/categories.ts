@@ -68,7 +68,7 @@ export const CATEGORIES: readonly CategoryDefinition[] = [
   C("parking", "Parking", "transport", "parking", 15.5, ["parking", "car park", "stationnement", "garer"]),
   C("car_repair", "Car repair", "transport", "wrench", 15.5, ["car repair", "garage", "mecanique", "mechanic", "carrosserie", "body shop", "controle technique", "pneus", "tyres"]),
   C("car_dealer", "Car dealer", "transport", "car", 15.5, ["car dealer", "concessionnaire", "automobile", "voitures", "occasion", "car sales"]),
-  C("train_station", "Train station", "transport", "train", 12, ["train", "station", "gare", "sncf", "railway", "ter"]),
+  C("train_station", "Train station", "transport", "train", 12, ["train", "train station", "railway station", "gare", "sncf", "railway"]),
   C("bus_stop", "Bus stop", "transport", "bus", 16.5, ["bus", "bus stop", "arret", "autocar", "car", "liO", "lio"]),
   C("airport", "Airfield", "transport", "plane", 12, ["airport", "aerodrome", "airfield", "aeroport", "aviation"]),
   C("taxi", "Taxi & ambulance", "transport", "car", 16, ["taxi", "vtc", "ambulance", "transport sanitaire"]),
@@ -514,11 +514,11 @@ export interface CategoryIntent {
  * "restaurants"). Returns every matching category phrase so the caller can
  * strip the consumed tokens and treat the rest as a place name.
  */
-export function categoryIntents(tokens: readonly string[]): CategoryIntent[] {
+export function categoryIntents(tokens: readonly string[], options: { prefix?: boolean } = {}): CategoryIntent[] {
   const found: CategoryIntent[] = [];
   const used = new Set<number>();
   /* Whole words first, so "gare" means a station before it is read as the start of "garer". */
-  for (const allowPrefix of [false, true]) {
+  for (const allowPrefix of options.prefix === false ? [false] : [false, true]) {
     for (const entry of terms()) {
       for (let start = 0; start + entry.tokens.length <= tokens.length; start += 1) {
         let matches = true;
@@ -586,8 +586,26 @@ export function categoryForBdtopoNature(nature: string | undefined, fallbackText
   }
   for (const text of [fallbackText, nature]) {
     if (text === undefined) continue;
-    const intents = categoryIntents(foldSearchText(text).split(" ").filter(Boolean));
-    if (intents.length > 0) return intents[0]!.category;
+    const category = categoryForFreeText(text);
+    if (category !== undefined) return category;
+  }
+  return undefined;
+}
+
+/**
+ * Category of a free-text label. Words after the first "de / du / des" say
+ * where a place is rather than what it is ("Relais de la Gare" is a restaurant
+ * near the station, "Hôtel de la Poste" a hotel), unless a category phrase
+ * runs across them ("Hôtel de Ville", "Station d'épuration").
+ */
+export function categoryForFreeText(text: string): string | undefined {
+  const tokens = foldSearchText(text).split(" ").filter(Boolean);
+  const particle = tokens.findIndex((token, index) => index > 0 && (token === "de" || token === "du" || token === "des" || token === "d"));
+  const cut = particle < 0 ? tokens.length : particle;
+  for (const intent of categoryIntents(tokens, { prefix: false })) {
+    const first = intent.consumed[0]!;
+    const last = intent.consumed[intent.consumed.length - 1]!;
+    if (last < cut || (first < cut && intent.consumed.length > 1)) return intent.category;
   }
   return undefined;
 }

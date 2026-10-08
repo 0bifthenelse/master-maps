@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { conflateBusinesses, nameSimilarity } from "../../scripts/data/conflate";
-import { categoryFamily, categoryForNaf, categoryForOsmTags, categoryIntents, nafIsPlace } from "@/lib/data/categories";
+import { categoryFamily, categoryForFreeText, categoryForNaf, categoryForOsmTags, categoryIntents, nafIsPlace } from "@/lib/data/categories";
 import { displayCase } from "@/lib/data/displayText";
 import { formatDay, openState, parseOpeningHours } from "@/lib/data/openingHours";
 import type { BusinessFeature, PoiFeature } from "@/lib/data/schema";
@@ -31,6 +31,15 @@ describe("category taxonomy", () => {
   it("prefers whole words to prefixes and still completes a word being typed", () => {
     expect(categoryIntents(["gare"])[0]?.category).toBe("train_station");
     expect(categoryIntents(["restau"])[0]?.category).toBe("restaurant");
+  });
+
+  it("classifies a free-text label by what the place is, not where it is", () => {
+    expect(categoryForFreeText("Le Relais de la Gare")).toBeUndefined();
+    expect(categoryForFreeText("Hôtel de la Poste")).toBe("hotel");
+    expect(categoryForFreeText("Hôtel de Ville")).toBe("town_hall");
+    expect(categoryForFreeText("Station d'épuration")).toBe("utility");
+    expect(categoryForFreeText("Station Dyneff")).toBeUndefined();
+    expect(categoryForFreeText("Gare SNCF")).toBe("train_station");
   });
 
   it("widens chips to their neighbouring categories", () => {
