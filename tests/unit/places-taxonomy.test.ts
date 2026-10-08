@@ -72,6 +72,19 @@ describe("OSM and SIRENE conflation", () => {
     expect(result.businesses[0]!.sourceRefs.map((reference) => reference.source).sort()).toEqual(["osm", "sirene"]);
   });
 
+  it("puts a merged business on the anchor of an OSM POI mapped as a building", () => {
+    const building: PoiFeature = {
+      ...poi("Préfecture du Gers", 100),
+      lon: 0.5867, lat: 43.6468,
+      geometry: { type: "Polygon", coordinates: [[[0.5866, 43.6467], [0.5868, 43.6467], [0.5868, 43.6469], [0.5866, 43.6469], [0.5866, 43.6467]]] },
+      localGeometry: { type: "Polygon", coordinates: [[[90, -10], [110, -10], [110, 10], [90, 10], [90, -10]]] },
+    };
+    const merged = conflateBusinesses([building], [business("Préfecture du Gers", 150)]).businesses[0]!;
+    expect(merged.geometry).toEqual({ type: "Point", coordinates: [0.5867, 43.6468] });
+    expect(merged.localGeometry).toEqual({ type: "Point", coordinates: [100, 0] });
+    expect(merged).toMatchObject({ lon: 0.5867, lat: 43.6468, x: 100, z: 0 });
+  });
+
   it("lets an exact name match reach further than a similar one", () => {
     expect(conflateBusinesses([poi("Préfecture du Gers", 100)], [business("Prefecture du Gers", 310)]).merged).toBe(1);
     expect(conflateBusinesses([poi("Pharmacie du Centre Ville", 100)], [business("Pharmacie du Centre", 310)]).merged).toBe(0);

@@ -93,16 +93,24 @@ export function conflateBusinesses(osmPois: readonly PoiFeature[], businesses: r
     consumed.add(best);
     merged += 1;
     const poi = osmPois[best]!;
+    /* OSM places a mapped POI on its building; SIRENE only knows the postal address. A POI drawn as
+       a building outline is reduced to a point on its anchor so geometry and anchor agree. */
+    const lon = poi.lon ?? business.lon;
+    const lat = poi.lat ?? business.lat;
+    const x = poi.x ?? business.x;
+    const z = poi.z ?? business.z;
+    const geometry = poi.geometry.type === "Point" ? poi.geometry : lon !== undefined && lat !== undefined ? { type: "Point" as const, coordinates: [lon, lat] as [number, number] } : business.geometry;
+    const localGeometry = poi.localGeometry?.type === "Point" ? poi.localGeometry : x !== undefined && z !== undefined ? { type: "Point" as const, coordinates: [x, z] as [number, number] } : business.localGeometry;
     out.push({
       ...business,
       name: poi.name ?? business.name,
       businessName: poi.name ?? business.businessName,
-      geometry: poi.geometry.type === "Point" ? poi.geometry : business.geometry,
-      localGeometry: poi.localGeometry?.type === "Point" ? poi.localGeometry : business.localGeometry,
-      lon: poi.lon ?? business.lon,
-      lat: poi.lat ?? business.lat,
-      x: poi.x ?? business.x,
-      z: poi.z ?? business.z,
+      geometry,
+      localGeometry,
+      lon,
+      lat,
+      x,
+      z,
       address: poi.address ?? business.address,
       website: poi.website ?? business.website,
       phone: poi.phone ?? business.phone,
