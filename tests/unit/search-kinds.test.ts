@@ -25,6 +25,14 @@ const TILE_MAP = new Map<string, string>([
   ["business-named", "l0_0_20"],
   ["address-full", "l0_0_20"],
   ["place-unnamed", "l0_0_17"],
+  ["place-nogaro", "l0_0_21"],
+  ["toponym-nogaro-airfield", "l0_0_21"],
+  ["transport-auch-airfield", "l0_0_22"],
+  ["transport-auch-airfield-point", "l0_0_22"],
+  ["toponym-auch-airfield", "l0_0_22"],
+  ["poi-airfield-restaurant", "l0_0_22"],
+  ["business-prefecture-register", "l0_0_23"],
+  ["business-prefecture-mapped", "l0_0_23"],
 ]);
 
 const FEATURES: MapFeature[] = [
@@ -37,6 +45,16 @@ const FEATURES: MapFeature[] = [
   feature({ stableId: "business-named", kind: "business", geometry: { type: "Point", coordinates: [0.5, 43.6] }, businessName: "NOCIBE", category: "beauty" }),
   feature({ stableId: "address-full", kind: "address", geometry: { type: "Point", coordinates: [0.5, 43.6] }, street: "Rue Nationale", housenumber: "12", postcode: "32000", city: "Auch" }),
   feature({ stableId: "place-unnamed", kind: "place", geometry: { type: "Point", coordinates: [0.5, 43.6] }, placeType: "detail_orographique" }),
+  feature({ stableId: "place-nogaro", kind: "place", geometry: { type: "Point", coordinates: [-0.0354, 43.7592] }, name: "Nogaro", placeType: "commune", population: 2238 }),
+  feature({ stableId: "toponym-nogaro-airfield", kind: "place", geometry: { type: "Point", coordinates: [-0.0368, 43.7650] }, name: "Nogaro", placeType: "airport" }),
+  /* One airfield from three sources: an OSM outline, an OSM point 600 m away, a BD TOPO toponym. */
+  feature({ stableId: "transport-auch-airfield", kind: "transport", lon: 0.603, lat: 43.688, geometry: { type: "Polygon", coordinates: [[[0.595, 43.686], [0.611, 43.686], [0.611, 43.690], [0.595, 43.690], [0.595, 43.686]]] }, name: "Aéroport Auch-Gers", transportType: "aerodrome" }),
+  feature({ stableId: "transport-auch-airfield-point", kind: "transport", lon: 0.6105, lat: 43.6885, geometry: { type: "Point", coordinates: [0.6105, 43.6885] }, name: "Aéroport d'Auch-Gers", transportType: "aerodrome" }),
+  feature({ stableId: "toponym-auch-airfield", kind: "place", lon: 0.5985, lat: 43.6875, geometry: { type: "Point", coordinates: [0.5985, 43.6875] }, name: "Aéroport d'Auch-Gers", placeType: "airport" }),
+  /* The same prefecture registered twice in SIRENE; one was conflated with its OSM building. */
+  feature({ stableId: "business-prefecture-register", kind: "business", lon: 0.58677, lat: 43.64655, geometry: { type: "Point", coordinates: [0.58677, 43.64655] }, businessName: "Préfecture du Gers", category: "town_hall", phone: "0562000000", website: "gers.gouv.fr", openingHours: "Mo-Fr 09:00-12:00", sourceRefs: [{ source: "sirene", timestamp: "2026" }] }),
+  feature({ stableId: "business-prefecture-mapped", kind: "business", lon: 0.58674, lat: 43.64679, geometry: { type: "Point", coordinates: [0.58674, 43.64679] }, businessName: "Préfecture du Gers", category: "town_hall", sourceRefs: [{ source: "sirene", timestamp: "2026" }, { source: "osm-bulk", timestamp: "2026" }], sourceMetadata: { conflatedWith: "osm-bulk:w65461658" } }),
+  feature({ stableId: "poi-airfield-restaurant", kind: "poi", lon: 0.604, lat: 43.6878, geometry: { type: "Point", coordinates: [0.604, 43.6878] }, name: "Restaurant de l'Aéroport", poiType: "restaurant" }),
 ];
 
 const RECORDS = buildSearchIndex(FEATURES, TILE_MAP, "unused");
@@ -72,22 +90,47 @@ describe("buildSearchIndex place and transport coverage", () => {
     expect(byId("place-hameau").category).toBe("lieu_dit_non_habite");
   });
 
-  it("exposes the transport classification as the record category", () => {
-    expect(byId("transport-gare").category).toBe("station");
+  it("expresses transport types in the shared category taxonomy", () => {
+    expect(byId("transport-gare").category).toBe("train_station");
     expect(byId("transport-bus").category).toBe("bus_stop");
   });
 
-  it("composes a searchable name for an address that only has its street parts", () => {
+  it("names an address by number and street, with its postcode and commune as context", () => {
     const record = byId("address-full");
-    expect(record.canonicalName).toBe("12 Rue Nationale 32000 Auch");
+    expect(record.canonicalName).toBe("12 Rue Nationale");
+    expect(record.context).toBe("32000 Auch");
+    expect(record.street).toBe("Rue Nationale");
+    expect(record.housenumber).toBe("12");
     expect(record.normalizedName).toContain("rue nationale");
   });
 
-  it("keeps the address street as an alias for street only queries", () => {
-    expect(byId("address-full").aliases).toContain("rue nationale");
+  it("keeps the business category and anchors every record locally", () => {
+    const record = byId("business-named");
+    expect(record.category).toBe("beauty");
+    expect(Number.isFinite(record.x)).toBe(true);
+    expect(Number.isFinite(record.z)).toBe(true);
   });
 
-  it("keeps the transport name as an alias", () => {
-    expect(byId("transport-gare").aliases).toContain("gare d'auch");
+  it("keeps a commune a commune when a namesake place merges into it", () => {
+    const nogaro = RECORDS.filter((record) => record.canonicalName === "Nogaro");
+    expect(nogaro).toHaveLength(1);
+    expect(nogaro[0]?.category).toBe("commune");
+  });
+
+  it("keeps one record for an airfield known to several sources under near-identical names", () => {
+    const airfield = RECORDS.filter((record) => /a[ée]roport d?'?\s?auch-gers/i.test(record.canonicalName));
+    expect(airfield).toHaveLength(1);
+    expect(airfield[0]?.kind).toBe("transport");
+    expect(RECORDS.some((record) => record.featureId === "poi-airfield-restaurant")).toBe(true);
+  });
+
+  it("answers a place registered twice with the registration OpenStreetMap puts on its building", () => {
+    const prefecture = RECORDS.filter((record) => record.canonicalName === "Préfecture du Gers");
+    expect(prefecture).toHaveLength(1);
+    expect(prefecture[0]?.featureId).toBe("business-prefecture-mapped");
+  });
+
+  it("keeps the transport name as its canonical name", () => {
+    expect(byId("transport-gare").canonicalName).toBe("Gare d'Auch");
   });
 });

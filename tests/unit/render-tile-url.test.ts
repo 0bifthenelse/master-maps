@@ -45,10 +45,10 @@ function renderTileBuffer(tileId: string, datasetVersion: string): ArrayBuffer {
     datasetVersion,
     layers: [
       {
-        id: "buildings",
-        positions: new Float32Array([0, 0, 0]),
-        indices: new Uint32Array([0, 0, 0]),
-        ranges: new Uint32Array([0, 3, 0]),
+        id: "building",
+        vertices: new Float32Array([0, 0, 0, 6, 0, 1, 0, 0, 6, 0, 0, 0, 1, 6, 0]),
+        indices: new Uint32Array([0, 1, 2]),
+        ranges: new Uint32Array([0, 3, 0, 0, 3]),
       },
     ],
     meta: [{ s: `building/${tileId}/${datasetVersion}`, k: "building", c: "yes", a: [0, 0], h: 6 }],

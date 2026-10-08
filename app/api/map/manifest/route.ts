@@ -5,7 +5,8 @@ import { DatasetManifestSchema } from "@/lib/data/schema";
 import { MappedFileCache, type FileVersion } from "@/lib/data/mappedCache";
 import { parseTileManifestList, slimTileManifestEntries, tileManifestUnionBounds, type SlimTileManifestFields } from "@/lib/data/manifestSlim";
 
-export const dynamic = "force-static";
+/* Read on every request: the data can be refreshed without rebuilding the app. */
+export const dynamic = "force-dynamic";
 const TILE_ID_RE = /^[a-zA-Z0-9_-]+$/;
 const MANIFEST_CACHE_ENTRIES = 4;
 

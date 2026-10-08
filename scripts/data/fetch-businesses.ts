@@ -20,6 +20,10 @@ interface ExtractedBusinessRecord {
   coordinate?: { lon: number; lat: number } | null;
   administrativeStatus?: string;
   creationDate?: string;
+  /** Legal form code (nature_juridique); 1000 is a sole trader. */
+  legalForm?: string;
+  employer?: boolean;
+  headcountClass?: string;
   confidence: "high" | "medium" | "low";
   nominatedRecord: boolean;
   geocodedBy?: string;
@@ -291,6 +295,7 @@ interface FetchOptions {
   maxBytes?: number;
   forceRefresh?: boolean;
   signal?: AbortSignal;
+  beforeNetwork?: () => Promise<void>;
 }
 
 async function cachedFetch(
@@ -316,6 +321,7 @@ async function cachedFetch(
     maxBytes: opts.maxBytes ?? MAX_RESPONSE_BYTES,
     forceRefresh: opts.forceRefresh,
     signal,
+    beforeNetwork: opts.beforeNetwork,
   });
   return {
     status: outcome.httpStatus,
@@ -413,6 +419,34 @@ async function moliAvailable(): Promise<boolean> {
   }
 }
 
+const LEGAL_FORM_WORDS = new Set(["SARL", "SAS", "SASU", "EURL", "SA", "SCI", "SNC", "SCM", "SCP", "SELARL", "SELAS", "SELAFA", "SELURL", "SCEA", "EARL", "GAEC", "GFA", "SCOP", "SEM", "SPL", "EI", "EIRL", "SC", "GIE"]);
+const SMALL_WORDS = new Set(["de", "du", "des", "la", "le", "les", "et", "en", "au", "aux", "sur", "sous", "a", "à", "d", "l"]);
+
+/** "SARL PHARMACIE OCCITANE" -> "Pharmacie Occitane": the name a sign shows, not the registry form. */
+export function displayBusinessName(raw: string | undefined): string | undefined {
+  if (raw === undefined) return undefined;
+  /* Drop parentheticals, including one SIRENE cut off at its length limit ("… (PLACE DU"), and dangling punctuation. */
+  const withoutParen = raw.replace(/\(.*?\)/g, " ").replace(/\([^)]*$/, " ").replace(/\s+/g, " ").trim().replace(/^[\s\-–—,;:/.]+|[\s\-–—,;:/]+$/g, "");
+  const words = withoutParen.split(" ").filter((word) => !LEGAL_FORM_WORDS.has(word.replace(/[.,]/g, "").toUpperCase()));
+  if (words.length === 0) return undefined;
+  const shouting = withoutParen === withoutParen.toUpperCase();
+  const cased = words.map((word, index) => {
+    if (!shouting) return word;
+    const lower = word.toLowerCase();
+    if (index > 0 && SMALL_WORDS.has(lower)) return lower;
+    return lower.replace(/(^|[-'’])(\p{L})/gu, (_match, separator: string, letter: string) => `${separator}${letter.toUpperCase()}`)
+      .replace(/^(D|L)'(\p{L})/u, (_match, article: string, letter: string) => `${index > 0 ? article.toLowerCase() : article}'${letter.toUpperCase()}`);
+  });
+  const name = cased.join(" ").trim();
+  return name.length > 0 ? name : undefined;
+}
+
+function firstText(value: unknown): string | undefined {
+  if (typeof value === "string" && value.trim() !== "") return value.trim();
+  if (Array.isArray(value)) for (const entry of value) if (typeof entry === "string" && entry.trim() !== "") return entry.trim();
+  return undefined;
+}
+
 function extractSireneRecord(
   apiResult: Record<string, unknown>,
   nominatedRecord: boolean,
@@ -429,22 +463,24 @@ function extractSireneRecord(
   const coordLon = local["longitude"] as string | number | undefined;
   const coordLat = local["latitude"] as string | number | undefined;
 
-  const nafCode = (local["activite_principale"] ?? siege?.["activite_principale"]) as string | undefined;
+  const nafCode = (local["activite_principale"] ?? siege?.["activite_principale"] ?? apiResult["activite_principale"]) as string | undefined;
   const nafLabel = (local["activite_principale_libelle"] ?? siege?.["libelle_activite_principale"]) as string | undefined;
+  const legalName = firstText(apiResult["nom_complet"]) ?? firstText(apiResult["nom_raison_sociale"]);
+  const signName = firstText(local["liste_enseignes"]) ?? firstText(local["nom_commercial"]) ?? firstText(local["enseigne_nom_commercial"]);
 
   return {
     sourceId: `sirene:${siret}`,
     siret,
     siren: apiResult["siren"] as string | undefined,
-    legalName: apiResult["nom_complet"] as string | undefined,
-    tradingName: (local["nom_commercial"] ??
-      local["enseigne_nom_commercial"] ??
-      apiResult["nom_complet"]) as string | undefined,
+    legalName,
+    tradingName: displayBusinessName(signName) ?? displayBusinessName(legalName),
     nafCode,
     nafLabel,
     address: local["adresse"] as string | undefined,
+    postcode: firstText(local["code_postal"]),
+    communeCode: firstText(local["commune"]),
     coordinate:
-      coordLon != null && coordLat != null
+      coordLon != null && coordLat != null && Number.isFinite(Number(coordLon)) && Number.isFinite(Number(coordLat))
         ? {
             lon: Number(coordLon),
             lat: Number(coordLat),
@@ -452,10 +488,29 @@ function extractSireneRecord(
         : null,
     administrativeStatus: local["etat_administratif"] as string | undefined,
     creationDate: local["date_creation"] as string | undefined,
+    legalForm: firstText(apiResult["nature_juridique"]),
+    employer: local["caractere_employeur"] === "O" ? true : local["caractere_employeur"] === "N" ? false : undefined,
+    headcountClass: firstText(local["tranche_effectif_salarie"]),
     confidence: "high",
     nominatedRecord,
     acquiredFromQuery: { q: query.q, page: query.page },
-  };
+    ...(signName === undefined ? {} : { signName }),
+  } as ExtractedBusinessRecord;
+}
+
+/**
+ * Whether an establishment belongs on a public map. Closed establishments
+ * are history, not places; an establishment whose holder asked INSEE not to
+ * publish it is skipped; and a sole trader registered at a home address is a
+ * person, so it is only shown once it trades under a sign or employs staff.
+ */
+export function publishableEstablishment(local: Record<string, unknown>, company: Record<string, unknown>): boolean {
+  if (local["etat_administratif"] !== undefined && local["etat_administratif"] !== "A") return false;
+  if (local["statut_diffusion_etablissement"] === "P" || company["statut_diffusion"] === "P") return false;
+  const legalForm = firstText(company["nature_juridique"]) ?? "";
+  if (!legalForm.startsWith("1")) return true;
+  const hasSign = firstText(local["liste_enseignes"]) !== undefined || firstText(local["nom_commercial"]) !== undefined;
+  return hasSign || local["caractere_employeur"] === "O";
 }
 
 function annuaireQueryString(params: Record<string, string | number>): string {
@@ -481,8 +536,7 @@ async function querySirene(
   retryCount: number;
   rateLimitCount: number;
 }> {
-  await annuaireRateLimiter.acquire();
-  const result = await cachedFetch(annuaireSearchUrl(params), { timeoutMs: 20_000, forceRefresh });
+  const result = await cachedFetch(annuaireSearchUrl(params), { timeoutMs: 20_000, forceRefresh, beforeNetwork: () => annuaireRateLimiter.acquire() });
   const body: unknown = JSON.parse(result.body);
   if (typeof body !== "object" || body === null || Array.isArray(body)) throw new Error("Annuaire des Entreprises returned a non-object JSON response");
   return { body: body as Record<string, unknown>, sha256: result.sha256, status: result.status, fromCache: result.fromCache, bytesDownloaded: result.bytesDownloaded, requestCount: result.requestCount, retryCount: result.retryCount, rateLimitCount: result.rateLimitCount };
@@ -627,8 +681,20 @@ function annuaireResultPages(body: Record<string, unknown>, perPage: number): nu
   return Math.ceil(annuaireResultTotal(body) / perPage);
 }
 
-function geocodeKey(postcode: string, streetText: string, houseNumber: string): string {
-  return `${postcode}|${streetText.toUpperCase().replace(/[^A-Z0-9]+/g, " ").trim()}|${houseNumber.toUpperCase()}`;
+/** Street types SIRENE abbreviates and BAN spells out. */
+const STREET_TYPE_ABBREVIATIONS: Readonly<Record<string, string>> = {
+  AV: "AVENUE", AVE: "AVENUE", BD: "BOULEVARD", BLD: "BOULEVARD", BOUL: "BOULEVARD", PL: "PLACE", CHE: "CHEMIN", CHEM: "CHEMIN", CH: "CHEMIN",
+  RTE: "ROUTE", IMP: "IMPASSE", ALL: "ALLEE", RES: "RESIDENCE", CRS: "COURS", FBG: "FAUBOURG", SQ: "SQUARE", QU: "QUAI",
+  PROM: "PROMENADE", HAM: "HAMEAU", LOT: "LOTISSEMENT", CTRE: "CENTRE", RPT: "ROND POINT", PASS: "PASSAGE", SENT: "SENTIER",
+  CHS: "CHAUSSEE", MTE: "MONTEE", VLA: "VILLA", DOM: "DOMAINE", ESP: "ESPLANADE", R: "RUE", VC: "VOIE COMMUNALE", CR: "CHEMIN RURAL",
+  ZA: "ZONE ARTISANALE", ZI: "ZONE INDUSTRIELLE", ST: "SAINT", STE: "SAINTE",
+};
+
+/** Accent-free, abbreviation-expanded street key: "PL DE L HOTEL DE VILLE" = "Place de l'Hôtel de Ville". */
+export function banStreetKey(streetText: string): string {
+  const words = streetText.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toUpperCase().replace(/[^A-Z0-9]+/g, " ").trim().split(" ").filter(Boolean);
+  if (words[0] === "LD" || words[0] === "LIEU" && words[1] === "DIT") words.splice(0, words[0] === "LD" ? 1 : 2);
+  return words.map((word, index) => (index === 0 || word === "ST" || word === "STE" ? STREET_TYPE_ABBREVIATIONS[word] ?? word : word)).join(" ");
 }
 
 export function parseSireneAddress(address: string | undefined): { postcode: string; streetText: string; houseNumber: string } | null {
@@ -640,7 +706,7 @@ export function parseSireneAddress(address: string | undefined): { postcode: str
   const postcode = postcodeMatch[1]!;
   const beforePostcode = trimmed.slice(0, postcodeMatch.index).trim();
   if (beforePostcode === "") return null;
-  const houseNumberMatch = beforePostcode.match(/^(\d+)\s*(?:BIS|TER|QUATER)?\b/i)
+  const houseNumberMatch = beforePostcode.match(/^(\d+)\s*(?:BIS|TER|QUATER|[A-D](?=\s))?\b/i)
     ?? beforePostcode.match(/\b(\d+)\s*(?:BIS|TER|QUATER)\b/i);
   if (houseNumberMatch === null || houseNumberMatch.index === undefined) {
     return { postcode, streetText: beforePostcode, houseNumber: "" };
@@ -653,37 +719,179 @@ export function parseSireneAddress(address: string | undefined): { postcode: str
 export interface BanAddressIndexEntry {
   lon: number;
   lat: number;
+  /** 1 = exact number, 0.8 = a neighbouring number on the same street, 0.6 = a compact street or lieu-dit. */
   score: number;
 }
 
+interface BanStreet {
+  numbers: Map<number, { lon: number; lat: number }>;
+  points: Array<{ lon: number; lat: number }>;
+}
+
+const NEIGHBOUR_NUMBER_SPAN = 10;
+/** A street or lieu-dit whose addresses all fit in this span can place a business without a number. */
+const COMPACT_STREET_METRES = 1200;
+
 export class BanAddressIndex {
-  private readonly cells = new Map<string, BanAddressIndexEntry[]>();
+  private readonly streets = new Map<string, BanStreet>();
+  private count = 0;
 
   insert(postcode: string, streetText: string, houseNumber: string, lon: number, lat: number): void {
-    const key = geocodeKey(postcode, streetText, houseNumber);
-    const bucket = this.cells.get(key);
-    if (bucket === undefined) this.cells.set(key, [{ lon, lat, score: 0 }]);
-    else bucket.push({ lon, lat, score: 0 });
+    const key = `${postcode}|${banStreetKey(streetText)}`;
+    let street = this.streets.get(key);
+    if (street === undefined) {
+      street = { numbers: new Map(), points: [] };
+      this.streets.set(key, street);
+    }
+    const number = Number.parseInt(houseNumber, 10);
+    if (Number.isFinite(number) && !street.numbers.has(number)) street.numbers.set(number, { lon, lat });
+    street.points.push({ lon, lat });
+    this.count += 1;
   }
 
   get size(): number {
-    let total = 0;
-    for (const bucket of this.cells.values()) total += bucket.length;
-    return total;
+    return this.count;
   }
 
+  /**
+   * Exact postcode + street + number first. Then, on the same street, the
+   * nearest number within ten (numbers on French streets run in order), and
+   * last a compact street or lieu-dit's middle. Anything vaguer stays
+   * unplaced: an unplaced business is better than a misplaced one.
+   */
   lookup(postcode: string, streetText: string, houseNumber: string): BanAddressIndexEntry | null {
-    const exact = this.cells.get(geocodeKey(postcode, streetText, houseNumber));
-    if (exact !== undefined && exact.length > 0) return exact[0]!;
-    const normalizedStreet = streetText.toUpperCase().replace(/[^A-Z0-9]+/g, " ").trim();
-    for (const [key, entries] of this.cells) {
-      if (!key.startsWith(`${postcode}|`)) continue;
-      const candidateStreet = key.split("|")[1] ?? "";
-      if (candidateStreet === normalizedStreet) return entries[0]!;
-      if (candidateStreet.includes(normalizedStreet) || normalizedStreet.includes(candidateStreet)) return entries[0]!;
+    const street = this.streets.get(`${postcode}|${banStreetKey(streetText)}`);
+    if (street === undefined || street.points.length === 0) return null;
+    const number = Number.parseInt(houseNumber, 10);
+    if (Number.isFinite(number)) {
+      const exact = street.numbers.get(number);
+      if (exact !== undefined) return { ...exact, score: 1 };
+      let best: { lon: number; lat: number } | undefined;
+      let bestGap = NEIGHBOUR_NUMBER_SPAN + 1;
+      for (const [candidate, point] of street.numbers) {
+        const gap = Math.abs(candidate - number) + (candidate % 2 === number % 2 ? 0 : 0.5);
+        if (gap < bestGap) {
+          best = point;
+          bestGap = gap;
+        }
+      }
+      if (best !== undefined) return { ...best, score: 0.8 };
+    }
+    const lons = street.points.map((point) => point.lon).sort((first, second) => first - second);
+    const lats = street.points.map((point) => point.lat).sort((first, second) => first - second);
+    const spanMetres = Math.hypot((lons[lons.length - 1]! - lons[0]!) * 80_000, (lats[lats.length - 1]! - lats[0]!) * 111_000);
+    if (spanMetres > COMPACT_STREET_METRES) return null;
+    return { lon: lons[lons.length >> 1]!, lat: lats[lats.length >> 1]!, score: 0.6 };
+  }
+}
+
+/** Accent-free uppercase key for a commune or lieu-dit name. */
+function placeKey(value: string): string {
+  return value.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toUpperCase().replace(/[^A-Z0-9]+/g, " ").trim()
+    .split(" ").map((word) => (word === "ST" ? "SAINT" : word === "STE" ? "SAINTE" : word)).join(" ");
+}
+
+const LEADING_ARTICLE = /^(LE|LA|LES|L|AU|AUX|A|EN|DE|DU|DES)\s+/;
+
+function toponymKeys(name: string): string[] {
+  const key = placeKey(name).replace(/^(LD|LIEU DIT)\s+/, "");
+  const bare = key.replace(LEADING_ARTICLE, "");
+  return bare !== key && bare !== "" ? [key, bare] : [key];
+}
+
+type LonLat = [number, number];
+
+function ringsOf(geometry: { type?: string; coordinates?: unknown } | null | undefined): LonLat[][] {
+  if (geometry?.type === "Polygon") return geometry.coordinates as LonLat[][];
+  if (geometry?.type === "MultiPolygon") return (geometry.coordinates as LonLat[][][]).flat();
+  return [];
+}
+
+function insideRings(point: LonLat, rings: readonly LonLat[][]): boolean {
+  let inside = false;
+  for (const ring of rings) {
+    for (let index = 0, previous = ring.length - 1; index < ring.length; previous = index++) {
+      const a = ring[index]!;
+      const b = ring[previous]!;
+      if ((a[1] > point[1]) !== (b[1] > point[1]) && point[0] < ((b[0] - a[0]) * (point[1] - a[1])) / (b[1] - a[1]) + a[0]) inside = !inside;
+    }
+  }
+  return inside;
+}
+
+/**
+ * Lieu-dits of each commune from BD TOPO, so a farm registered at
+ * "LD LABOURDETTE 32120 BAJONNETTE" lands on Labourdette. Only names that are
+ * unique within their commune are used.
+ */
+export class ToponymIndex {
+  private readonly places = new Map<string, LonLat[]>();
+
+  add(commune: string, name: string, point: LonLat): void {
+    for (const key of toponymKeys(name)) {
+      const full = `${placeKey(commune)}|${key}`;
+      const bucket = this.places.get(full);
+      if (bucket === undefined) this.places.set(full, [point]);
+      else bucket.push(point);
+    }
+  }
+
+  get size(): number {
+    return this.places.size;
+  }
+
+  lookup(commune: string, text: string): BanAddressIndexEntry | null {
+    for (const key of toponymKeys(text)) {
+      const points = this.places.get(`${placeKey(commune)}|${key}`);
+      if (points === undefined || points.length === 0) continue;
+      const [lon, lat] = points[0]!;
+      /* Several lieu-dits of that name in one commune: only usable when they sit together. */
+      if (points.some(([otherLon, otherLat]) => Math.hypot((otherLon - lon) * 80_000, (otherLat - lat) * 111_000) > 600)) continue;
+      return { lon, lat, score: 0.5 };
     }
     return null;
   }
+}
+
+export function loadToponymIndex(rawDir: string): ToponymIndex {
+  const index = new ToponymIndex();
+  const read = (name: string): Array<{ properties?: Record<string, unknown>; geometry?: { type?: string; coordinates?: unknown } }> => {
+    const filePath = path.join(rawDir, name);
+    if (!existsSync(filePath)) return [];
+    const parsed = JSON.parse(readFileSync(filePath, "utf8")) as { features?: Array<{ properties?: Record<string, unknown>; geometry?: { type?: string; coordinates?: unknown } }> };
+    return parsed.features ?? [];
+  };
+  const communes = read("bdtopo-communes.geojson").map((feature) => {
+    const rings = ringsOf(feature.geometry);
+    const box = [Infinity, Infinity, -Infinity, -Infinity];
+    for (const ring of rings) for (const [lon, lat] of ring) {
+      box[0] = Math.min(box[0]!, lon); box[1] = Math.min(box[1]!, lat); box[2] = Math.max(box[2]!, lon); box[3] = Math.max(box[3]!, lat);
+    }
+    return { name: typeof feature.properties?.nom_officiel === "string" ? feature.properties.nom_officiel : "", rings, box };
+  }).filter((commune) => commune.name !== "" && commune.rings.length > 0);
+  const communeAt = (point: LonLat): string | undefined => communes.find((commune) => point[0] >= commune.box[0]! && point[0] <= commune.box[2]! && point[1] >= commune.box[1]! && point[1] <= commune.box[3]! && insideRings(point, commune.rings))?.name;
+  const pointOf = (geometry: { type?: string; coordinates?: unknown } | undefined): LonLat | null => {
+    if (geometry?.type === "Point") return geometry.coordinates as LonLat;
+    const rings = ringsOf(geometry);
+    const ring = rings[0];
+    if (ring === undefined || ring.length === 0) return null;
+    let lon = 0;
+    let lat = 0;
+    for (const [x, y] of ring) { lon += x; lat += y; }
+    return [lon / ring.length, lat / ring.length];
+  };
+  const sources: Array<[string, string]> = [["bdtopo-toponymy.geojson", "graphie_du_toponyme"], ["bdtopo-settlements.geojson", "toponyme"], ["bdtopo-uninhabited-places.geojson", "toponyme"]];
+  for (const [file, field] of sources) {
+    for (const feature of read(file)) {
+      const name = feature.properties?.[field];
+      if (typeof name !== "string" || name.trim() === "") continue;
+      const point = pointOf(feature.geometry);
+      if (point === null) continue;
+      const commune = communeAt(point);
+      if (commune !== undefined) index.add(commune, name, point);
+    }
+  }
+  return index;
 }
 
 export function loadBanAddressIndex(rawDir: string): BanAddressIndex {
@@ -719,6 +927,7 @@ export interface SireneReconciliation {
   deduplicated: number;
   excludedNoCoordinate: number;
   geocodedByBan: number;
+  geocodedByToponym?: number;
   geocodeFailed: number;
   bySection: Record<string, number>;
   queryPlan: Array<{ label: string; totalResults: number; pagesFetched: number; truncated: boolean }>;
@@ -787,12 +996,15 @@ async function acquireSirene(
   let cappedQueries = 0;
   let pagesFetchedTotal = 0;
   let geocodedByBan = 0;
+  let geocodedByToponym = 0;
   let geocodeFailed = 0;
   let excludedNoCoordinate = 0;
   let truncated = false;
 
   const banIndex = loadBanAddressIndex(rawDir);
   console.log(`BAN geocode index: ${banIndex.size} address keys loaded`);
+  const toponymIndex = loadToponymIndex(rawDir);
+  console.log(`Lieu-dit geocode index: ${toponymIndex.size} names loaded`);
 
   const communeScope = opts.communeCode !== null;
   const plan = communeScope
@@ -808,8 +1020,11 @@ async function acquireSirene(
   const cappedSectionLabels: string[] = [];
 
   const expandedPlan = await expandCappedPartitions(plan, opts.forceRefresh === true, failures);
+  let partitionsDone = 0;
   for (const entry of expandedPlan) {
     if (opts.signal?.aborted) break;
+    partitionsDone += 1;
+    if (partitionsDone % 250 === 0) console.log(`[sirene] ${partitionsDone}/${expandedPlan.length} partitions, ${acceptedBySiret.size} establishments kept`);
     let firstPage: Record<string, unknown>;
     try {
       firstPage = (await querySirene({ ...entry.params, per_page: SIRENE_PER_PAGE, page: 1 }, opts.forceRefresh)).body;
@@ -872,16 +1087,24 @@ async function acquireSirene(
           const siret = local["siret"];
           if (typeof siret !== "string" || siret === "") continue;
           establishedReceived += 1;
-          const record = extractSireneRecord({ siege: local, matching_etablissements: [local], nom_complet: result["nom_complet"], siren: result["siren"] }, false, { q: entry.label, page });
+          if (!publishableEstablishment(local, result)) continue;
+          const record = extractSireneRecord({ siege: local, matching_etablissements: [local], nom_complet: result["nom_complet"], nom_raison_sociale: result["nom_raison_sociale"], nature_juridique: result["nature_juridique"], activite_principale: result["activite_principale"], siren: result["siren"] }, false, { q: entry.label, page });
           if (record === null) continue;
           if (record.coordinate === null) {
             const parsedAddress = parseSireneAddress(record.address);
             const hit = parsedAddress === null ? null : banIndex.lookup(parsedAddress.postcode, parsedAddress.streetText, parsedAddress.houseNumber);
+            const city = /\b\d{5}\s+(.+)$/.exec(record.address ?? "")?.[1];
+            const toponym = hit !== null || parsedAddress === null || city === undefined || parsedAddress.houseNumber !== "" ? null : toponymIndex.lookup(city, parsedAddress.streetText);
             if (hit !== null) {
               record.coordinate = { lon: hit.lon, lat: hit.lat };
               record.geocodedBy = "ban-addresses";
               record.geocodeScore = hit.score;
               geocodedByBan += 1;
+            } else if (toponym !== null) {
+              record.coordinate = { lon: toponym.lon, lat: toponym.lat };
+              record.geocodedBy = "bdtopo-lieu-dit";
+              record.geocodeScore = toponym.score;
+              geocodedByToponym += 1;
             } else {
               geocodeFailed += 1;
             }
@@ -934,6 +1157,7 @@ async function acquireSirene(
     deduplicated: establishedReceived - excludedNoCoordinate - uniqueRecords.length,
     excludedNoCoordinate,
     geocodedByBan,
+    geocodedByToponym,
     geocodeFailed,
     bySection,
     queryPlan: queryPlanLog,
@@ -991,6 +1215,7 @@ async function acquireSirene(
       sireneQueries: queries.length,
       sireneCappedQueries: cappedQueries,
       sireneGeocodedByBan: geocodedByBan,
+      sireneGeocodedByToponym: geocodedByToponym,
       sirenePagesFetched: pagesFetchedTotal,
       sireneExcludedNoCoordinate: excludedNoCoordinate,
     },

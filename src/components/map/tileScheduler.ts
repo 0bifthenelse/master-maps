@@ -9,7 +9,9 @@ export type TileLod = 0 | 1 | 2;
 
 export const LOD_TILE_METRES: readonly number[] = GERS_TILE_LEVELS.map((tileLevel) => tileLevel.tileSize);
 export const LOD_COUNT = LOD_TILE_METRES.length;
-export const MIN_TILE_PIXELS = 128;
+/* A tile level is used once one of its tiles spans this many CSS pixels:
+   2 km detail tiles from zoom ~14, 8 km town tiles from ~12. */
+export const MIN_TILE_PIXELS = 300;
 export const LOD_METRES_PER_PIXEL: readonly number[] = LOD_TILE_METRES.map((metres) => metres / MIN_TILE_PIXELS);
 export const LOD_HYSTERESIS = 0.12;
 export const PREFETCH_FRACTION = 0.2;
@@ -20,11 +22,12 @@ export const FAST_SAMPLE_RATIO = 0.7;
 export const SLOW_SAMPLE_RATIO = 1.3;
 
 export interface SchedulerViewport {
+  /** Map point at the screen centre, local metres. */
   target: [number, number];
-  zoom: number;
-  frustumWidth: number;
-  frustumHeight: number;
-  headingRadians: number;
+  /** Visible ground polygon (from MapTransform.groundFootprint), local metres. */
+  quad: TileQuad;
+  /** Metres per CSS pixel at the screen centre. */
+  metresPerPixel: number;
 }
 
 export interface TileIndex {
@@ -109,18 +112,9 @@ function isSeparated(bounds: Bounds, quad: TileQuad, axis: WorldPoint): boolean 
     if (projection < quadMin) quadMin = projection;
     if (projection > quadMax) quadMax = projection;
   }
-  const tileLow = Math.min(
-    axis.x >= 0 ? axis.x * bounds[0] : axis.x * bounds[2],
-    axis.z >= 0 ? axis.z * bounds[1] : axis.z * bounds[3],
-    axis.x >= 0 ? axis.x * bounds[2] : axis.x * bounds[0],
-    axis.z >= 0 ? axis.z * bounds[3] : axis.z * bounds[1],
-  );
-  const tileHigh = Math.max(
-    axis.x >= 0 ? axis.x * bounds[0] : axis.x * bounds[2],
-    axis.z >= 0 ? axis.z * bounds[1] : axis.z * bounds[3],
-    axis.x >= 0 ? axis.x * bounds[2] : axis.x * bounds[0],
-    axis.z >= 0 ? axis.z * bounds[3] : axis.z * bounds[1],
-  );
+  /* Projection of the box onto the axis: the nearest and farthest corners. */
+  const tileLow = (axis.x >= 0 ? axis.x * bounds[0] : axis.x * bounds[2]) + (axis.z >= 0 ? axis.z * bounds[1] : axis.z * bounds[3]);
+  const tileHigh = (axis.x >= 0 ? axis.x * bounds[2] : axis.x * bounds[0]) + (axis.z >= 0 ? axis.z * bounds[3] : axis.z * bounds[1]);
   return tileLow > quadMax || tileHigh < quadMin;
 }
 
@@ -128,28 +122,10 @@ export function isUsableViewport(viewport: SchedulerViewport | null): boolean {
   if (viewport === null) return true;
   return Number.isFinite(viewport.target[0])
     && Number.isFinite(viewport.target[1])
-    && Number.isFinite(viewport.zoom)
-    && Number.isFinite(viewport.frustumWidth)
-    && Number.isFinite(viewport.frustumHeight)
-    && Number.isFinite(viewport.headingRadians)
-    && viewport.zoom > 0
-    && viewport.frustumWidth > 0
-    && viewport.frustumHeight > 0;
-}
-
-/* Corners run top-left, top-right, bottom-right, bottom-left in NDC, so top
-   corners have ndcY 1 and screen-up maps to increasing world z. */
-export function visibleWorldQuad(viewport: SchedulerViewport): TileQuad {
-  const halfWidth = viewport.frustumWidth / (2 * viewport.zoom);
-  const halfHeight = viewport.frustumHeight / (2 * viewport.zoom);
-  const cosine = Math.cos(viewport.headingRadians);
-  const sine = Math.sin(viewport.headingRadians);
-  const [targetX, targetZ] = viewport.target;
-  const at = (ndcX: number, ndcY: number): [number, number] => [
-    targetX + cosine * ndcX * halfWidth + sine * ndcY * halfHeight,
-    targetZ - sine * ndcX * halfWidth + cosine * ndcY * halfHeight,
-  ];
-  return [at(-1, 1), at(1, 1), at(1, -1), at(-1, -1)];
+    && Number.isFinite(viewport.metresPerPixel)
+    && viewport.metresPerPixel > 0
+    && viewport.quad.length >= 3
+    && viewport.quad.every(([x, z]) => Number.isFinite(x) && Number.isFinite(z));
 }
 
 export function tileIntersectsQuad(bounds: Bounds, quad: TileQuad): boolean {
@@ -165,14 +141,6 @@ export function tileIntersectsQuad(bounds: Bounds, quad: TileQuad): boolean {
     if (isSeparated(bounds, quad, { x: -edgeZ / length, z: edgeX / length })) return false;
   }
   return true;
-}
-
-export function worldMetresPerPixel(viewport: SchedulerViewport, canvasWidth: number, canvasHeight: number): number {
-  if (!isUsableViewport(viewport)) return Number.POSITIVE_INFINITY;
-  return Math.max(
-    viewport.frustumWidth / viewport.zoom / Math.max(1, canvasWidth),
-    viewport.frustumHeight / viewport.zoom / Math.max(1, canvasHeight),
-  );
 }
 
 export function createTileIndex(entries: readonly TileManifest[]): TileIndex {
@@ -404,7 +372,7 @@ export function planTiles(input: TilePlanInput): TilePlan {
   }
   const targetX = viewport.target[0];
   const targetZ = viewport.target[1];
-  const quad = visibleWorldQuad(viewport);
+  const quad = viewport.quad;
   const required = requiredAt(index, requestedLod, quad, halo, targetX, targetZ);
   const lod = required[0]?.lod ?? requestedLod;
   const requiredIds = new Set(required.map((entry) => entry.tileId));

@@ -2,7 +2,7 @@ import { NextRequest } from "next/server";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { GET } from "../../app/api/map/search/route";
 import { SEARCH_LIMIT_DEFAULT, SEARCH_LIMIT_MAX, SEARCH_MAX_QUERY_LENGTH } from "@/lib/data/searchTypes";
-import { removeSearchFixture, writeSearchFixture } from "./search-fixture";
+import { AUCH, removeSearchFixture, writeSearchFixture } from "./search-fixture";
 
 let dataRoot = "";
 let previousDataDir: string | undefined;
@@ -76,6 +76,30 @@ describe("GET /api/map/search", () => {
     expect(((await low.json()) as unknown[]).length).toBeLessThanOrEqual(1);
     const high = await GET(searchRequest(`?q=rue&limit=${SEARCH_LIMIT_MAX + 10}`));
     expect(((await high.json()) as unknown[]).length).toBeLessThanOrEqual(SEARCH_LIMIT_MAX);
+  });
+
+  it("passes the view centre through to ranking", async () => {
+    const response = await GET(searchRequest(`?q=rue%20gambetta&near=${AUCH[0]},${AUCH[1]}`));
+    expect(response.status).toBe(200);
+    expect(((await response.json()) as Array<{ featureId: string }>)[0]?.featureId).toBe("street-gambetta-auch");
+  });
+
+  it("rejects a malformed view centre", async () => {
+    const response = await GET(searchRequest("?q=auch&near=abc"));
+    expect(response.status).toBe(400);
+  });
+
+  it("lists a category around a point", async () => {
+    const response = await GET(searchRequest(`?category=supermarket&near=${AUCH[0]},${AUCH[1]}&radius=4000&limit=40`));
+    expect(response.status).toBe(200);
+    const hits = (await response.json()) as Array<{ featureId: string; matchType: string }>;
+    expect(hits.map((hit) => hit.featureId)).toContain("leclerc-auch");
+    expect(hits.every((hit) => hit.matchType === "category")).toBe(true);
+  });
+
+  it("rejects an unknown category or a category without a centre", async () => {
+    expect((await GET(searchRequest(`?category=unicorns&near=${AUCH[0]},${AUCH[1]}`))).status).toBe(400);
+    expect((await GET(searchRequest("?category=pharmacy"))).status).toBe(400);
   });
 
   it("answers 503 when the dataset is missing", async () => {

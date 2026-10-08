@@ -86,7 +86,8 @@ export async function GET(
     Vary: "Accept-Encoding",
   };
 
-  const renderDir = join(dataRoot, "generated", "render");
+  /* The data directory is read at runtime; keep the bundler from tracing every tile into the build. */
+  const renderDir = join(/* turbopackIgnore: true */ dataRoot, "generated", "render");
   const gzipPath = join(renderDir, `${tileId}${GZIP_SUFFIX}`);
   const plainPath = join(renderDir, `${tileId}${PLAIN_SUFFIX}`);
   let payloadPath: string;
@@ -110,7 +111,7 @@ export async function GET(
   }
   if (encoding !== null) baseHeaders["Content-Encoding"] = encoding;
 
-  const stream = createReadStream(payloadPath);
+  const stream = createReadStream(/* turbopackIgnore: true */ payloadPath);
   try {
     return new NextResponse(Readable.toWeb(stream) as ReadableStream, { status: 200, headers: baseHeaders });
   } catch (error) {

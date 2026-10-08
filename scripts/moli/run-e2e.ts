@@ -1,4 +1,4 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -20,44 +20,64 @@ async function waitForPort(host: string, port: number, timeoutMs = 30000): Promi
   throw new Error(`Timed out waiting for ${host}:${port}`);
 }
 
+function stopGroup(child: ChildProcess, signal: NodeJS.Signals): void {
+  if (child.pid === undefined) return;
+  try {
+    process.kill(-child.pid, signal);
+  } catch {
+    /* Already gone. */
+  }
+}
+
 async function main(): Promise<void> {
   console.log("Starting Next.js production server...");
+  /* Its own process group, so stopping it also stops the next-server that npm and the shell start. */
   const next: ChildProcess = spawn("npm", ["run", "start", "--", "--port", String(NEXT_PORT)], {
     cwd: ROOT,
     stdio: ["ignore", "pipe", "pipe"],
     shell: true,
+    detached: true,
   });
   next.stdout?.on("data", (data: Buffer) => process.stdout.write(`[next] ${data}`));
   next.stderr?.on("data", (data: Buffer) => process.stderr.write(`[next:err] ${data}`));
 
-  console.log("Starting Moli serve...");
-  const moli: ChildProcess = spawn(
-    "moli",
-    ["serve", "--layout", "--host", "127.0.0.1", "--port", String(MOLI_PORT), "--timeout", "600"],
-    { cwd: ROOT, stdio: ["ignore", "pipe", "pipe"], shell: true },
-  );
-  moli.stdout?.on("data", (data: Buffer) => process.stdout.write(`[moli] ${data}`));
-  moli.stderr?.on("data", (data: Buffer) => process.stderr.write(`[moli:err] ${data}`));
+  /* Without Moli (or with E2E_BROWSER=local) the fixtures launch the local Chromium. */
+  const useMoli = process.env.E2E_BROWSER !== "local" && spawnSync("sh", ["-c", "command -v moli"]).status === 0;
+  let moli: ChildProcess | null = null;
+  if (useMoli) {
+    console.log("Starting Moli serve...");
+    moli = spawn(
+      "moli",
+      ["serve", "--layout", "--host", "127.0.0.1", "--port", String(MOLI_PORT), "--timeout", "600"],
+      { cwd: ROOT, stdio: ["ignore", "pipe", "pipe"], shell: true },
+    );
+    moli.stdout?.on("data", (data: Buffer) => process.stdout.write(`[moli] ${data}`));
+    moli.stderr?.on("data", (data: Buffer) => process.stderr.write(`[moli:err] ${data}`));
+  } else {
+    console.log("Moli not available: using the local Chromium.");
+  }
 
   try {
     console.log(`Waiting for Next.js on port ${NEXT_PORT}...`);
     await waitForPort("127.0.0.1", NEXT_PORT);
     console.log("Next.js ready.");
-    console.log(`Waiting for Moli on port ${MOLI_PORT}...`);
-    await waitForPort("127.0.0.1", MOLI_PORT);
-    console.log("Moli ready.");
-
-    const versionResp = await fetch(`http://127.0.0.1:${MOLI_PORT}/json/version`);
-    const versionData = await versionResp.json() as { Browser?: string; "webSocketDebuggerUrl"?: string };
-    console.log("Moli CDP version:", JSON.stringify(versionData, null, 2));
+    if (useMoli) {
+      console.log(`Waiting for Moli on port ${MOLI_PORT}...`);
+      await waitForPort("127.0.0.1", MOLI_PORT);
+      const versionResp = await fetch(`http://127.0.0.1:${MOLI_PORT}/json/version`);
+      const versionData = await versionResp.json() as { Browser?: string; "webSocketDebuggerUrl"?: string };
+      console.log("Moli CDP version:", JSON.stringify(versionData, null, 2));
+    }
     console.log("\nRunning Playwright E2E tests...");
+    /* No shell: arguments such as a -g pattern with "|" reach Playwright verbatim. */
     const pw: ChildProcess = spawn("npx", ["playwright", "test", "--config", "playwright.config.ts", ...process.argv.slice(2)], {
       cwd: ROOT,
       stdio: "inherit",
-      shell: true,
+      shell: process.platform === "win32",
       env: {
         ...process.env,
         MOLI_CDP: `http://127.0.0.1:${MOLI_PORT}`,
+        ...(useMoli ? {} : { E2E_BROWSER: "local" }),
         NEXT_PUBLIC_MAP_DIAGNOSTICS: "1",
         PLAYWRIGHT_BROWSERS_NONE: "1",
       },
@@ -68,12 +88,12 @@ async function main(): Promise<void> {
     process.exitCode = exitCode;
     console.log(`Playwright exit code: ${exitCode}`);
   } finally {
-    next.kill("SIGTERM");
-    moli.kill("SIGTERM");
+    stopGroup(next, "SIGTERM");
+    moli?.kill("SIGTERM");
     setTimeout(() => {
-      next.kill("SIGKILL");
-      moli.kill("SIGKILL");
-    }, 3000);
+      stopGroup(next, "SIGKILL");
+      moli?.kill("SIGKILL");
+    }, 3000).unref();
   }
 }
 

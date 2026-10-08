@@ -14,6 +14,7 @@ import type {
 import { clipLineStringToPolygon, clipPolygonToPolygon, normalizePolygonGeometry, type PolygonGeometry } from "../../src/lib/geo/polygon";
 import { createBoundaryIndex, type BoundaryIndex } from "./boundaryIndex";
 import { ADOPTED_LAYERS, BD_TOPO_LAYERS, type BdtopoLayerName } from "./bdtopoLayers";
+import { categoryForBdtopoNature } from "../../src/lib/data/categories";
 
 type Coordinate = [number, number];
 type NormalizedGeometry =
@@ -273,15 +274,58 @@ function metadata(values: Record<string, unknown>): Record<string, unknown> {
   return Object.fromEntries(Object.entries(values).filter(([, value]) => value !== undefined && value !== null && value !== ""));
 }
 
-function roadClass(nature: string | undefined): string {
-  const normalized = nature?.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+/* BD TOPO grades every road segment by `importance` (1 = national backbone
+   down to 6 = footpath) and records its administrative class separately. The
+   nature alone only says how many carriageways a road has, so a departmental
+   road and a farm lane both used to come out as "secondary". The class used by
+   the renderer and search is the hierarchy a map reader expects. */
+export function roadClass(
+  nature: string | undefined,
+  importance?: string,
+  classement?: string,
+  urbain?: boolean,
+): string {
+  const normalized = folded(nature);
+  const rank = importance === undefined ? Number.NaN : Number.parseInt(importance, 10);
+  const admin = folded(classement);
+  if (normalized === "sentier") return "path";
+  if (normalized === "escalier") return "steps";
+  if (normalized === "piste cyclable") return "cycleway";
+  if (normalized === "bac ou liaison maritime") return "ferry";
+  if (normalized === "type autoroutier" && (rank === 1 || admin.includes("autoroute"))) return "motorway";
+  if (normalized === "chemin" || normalized === "route empierree") return rank <= 4 ? "tertiary" : "track";
+  if (admin.includes("nationale") || rank === 1) return "trunk";
+  if (rank === 2) return "primary";
+  if (rank === 3) return "secondary";
+  if (rank === 4) return "tertiary";
+  if (rank === 5) return urbain === true ? "residential" : "unclassified";
+  if (rank === 6) return "service";
   if (normalized === "type autoroutier") return "motorway";
-  if (normalized === "route a 2 chaussees") return "trunk";
-  if (normalized === "route a 1 chaussee" || normalized === "bretelle") return "secondary";
-  if (normalized === "rond-point") return "tertiary";
-  if (normalized === "chemin" || normalized === "route empierree") return "track";
-  if (normalized === "sentier" || normalized === "escalier") return "path";
+  if (normalized === "route a 2 chaussees") return "primary";
   return "unclassified";
+}
+
+/** The street name BAN and the collaborative base agree on, left side first. */
+export function roadName(properties: Record<string, unknown>): string | undefined {
+  return text(properties.nom_voie_ban_gauche)
+    ?? text(properties.nom_voie_ban_droite)
+    ?? text(properties.nom_collaboratif_gauche)
+    ?? text(properties.nom_collaboratif_droite)
+    ?? text(properties.cpx_toponyme_route_nommee);
+}
+
+/** Road number such as D930 or N124; several numbers are separated by "/". */
+export function roadRef(properties: Record<string, unknown>): string | undefined {
+  const value = text(properties.cpx_numero);
+  if (value === undefined) return undefined;
+  return value.split("/").map((part) => part.trim()).filter((part) => part.length > 0 && part.toUpperCase() !== "NC").join(" / ") || undefined;
+}
+
+function roadOneway(direction: string | undefined): boolean | undefined {
+  const value = folded(direction);
+  if (value === "sens direct" || value === "sens inverse") return true;
+  if (value === "double sens") return false;
+  return undefined;
 }
 
 function folded(value: string | undefined): string {
@@ -503,12 +547,23 @@ function roadFeature(context: FeatureContext): RoadFeature {
   const bridge = position === "1";
   const tunnel = position === "-1";
   const width = roadWidthMetres(properties);
-  const className = roadClass(text(properties.nature));
+  const className = roadClass(
+    text(properties.nature),
+    text(properties.importance),
+    text(properties.cpx_classement_administratif),
+    parseBdBoolean(properties.urbain),
+  );
+  const ref = roadRef(properties);
+  const oneway = roadOneway(text(properties.sens_de_circulation));
+  const lanes = integerValue(properties.nombre_de_voies);
   return {
     ...common,
     kind: "road",
     highway: className,
     roadClass: className,
+    ...(ref === undefined ? {} : { ref }),
+    ...(oneway === undefined ? {} : { oneway }),
+    ...(lanes === undefined || lanes <= 0 ? {} : { lanes }),
     width,
     widthInferred: width === undefined,
     widthSource: width === undefined ? "inferred_default" : "explicit",
@@ -526,6 +581,11 @@ function roadFeature(context: FeatureContext): RoadFeature {
       width: properties.largeur_de_chaussee,
       namesLeft: properties.nom_voie_ban_gauche,
       namesRight: properties.nom_voie_ban_droite,
+      administrativeClass: properties.cpx_classement_administratif,
+      manager: properties.cpx_gestionnaire,
+      communeLeft: properties.insee_commune_gauche,
+      communeRight: properties.insee_commune_droite,
+      direction: properties.sens_de_circulation,
     }),
   };
 }
@@ -663,6 +723,7 @@ function landuseFeature(context: FeatureContext, sourceLayer: string): LanduseFe
     ...common,
     kind: "landuse",
     landuseType: mappedValue(folded(text(properties.nature)), LANDUSE_TYPE_BY_NATURE),
+    ...(sourceLayer === "zone_d_activite_ou_d_interet" ? optionalCategory(categoryForBdtopoNature(text(properties.nature))) : {}),
     sourceMetadata: metadata({
       layer: sourceLayer,
       officialId: sourceId,
@@ -676,6 +737,10 @@ function landuseFeature(context: FeatureContext, sourceLayer: string): LanduseFe
   };
 }
 
+function optionalCategory(category: string | undefined): { category?: string } {
+  return category === undefined ? {} : { category };
+}
+
 function placeFeature(context: FeatureContext, sourceLayer: string, placeType: string): PlaceFeature {
   const { properties, common, sourceId } = context;
   return {
@@ -687,6 +752,8 @@ function placeFeature(context: FeatureContext, sourceLayer: string, placeType: s
     sourceMetadata: metadata({
       layer: sourceLayer,
       officialId: sourceId,
+      communeCode: properties.code_insee,
+      postcode: properties.code_postal,
       nature: properties.nature,
       detailedNature: properties.nature_detaillee,
       importance: properties.importance,
@@ -703,7 +770,8 @@ function poiFeature(context: FeatureContext, sourceLayer: string, poiType: strin
     ...common,
     kind: "poi",
     poiType,
-    category: text(properties.activite_principale) ?? text(properties.nature),
+    category: categoryForBdtopoNature(text(properties.nature) ?? text(properties.type_principal), text(properties.activite_principale) ?? text(properties.libelle))
+      ?? text(properties.activite_principale) ?? text(properties.nature),
     sourceMetadata: metadata({
       layer: sourceLayer,
       officialId: sourceId,
@@ -812,7 +880,7 @@ const SEARCH_ONLY_LAYERS: ReadonlySet<BdtopoLayerName> = new Set(BD_TOPO_LAYERS.
 function featureName(layer: BdtopoLayerName, properties: Record<string, unknown>): string | undefined {
   switch (layer) {
     case "roads":
-      return text(properties.nom_voie_ban_gauche) ?? text(properties.nom_voie_ban_droite);
+      return roadName(properties);
     case "water-lines":
       return text(properties.cpx_toponyme_de_cours_d_eau) ?? text(properties.cpx_toponyme_d_entite_de_transition);
     case "water-surfaces":
@@ -836,8 +904,35 @@ function featureName(layer: BdtopoLayerName, properties: Record<string, unknown>
   }
 }
 
+/** The first source vertex that lies inside the department. */
+function firstVertexInside(geometry: Geometry, boundaryIndex: BoundaryIndex): Coordinate | null {
+  const lists: Coordinate[][] = geometry.type === "Point" ? [[geometry.coordinates]]
+    : geometry.type === "LineString" ? [geometry.coordinates]
+      : geometry.type === "MultiLineString" || geometry.type === "Polygon" ? geometry.coordinates
+        : geometry.coordinates.flat();
+  for (const list of lists) for (const vertex of list) if (boundaryIndex.contains(vertex)) return vertex;
+  return null;
+}
+
 export interface BdtopoNormalizationOptions {
   edition?: string;
+  /** Local anchor of every inhabited place, keyed by its BD TOPO cleabs, so a
+      commune label sits on its chef-lieu instead of its polygon centroid. */
+  chefLieuAnchors?: ReadonlyMap<string, Coordinate>;
+}
+
+/** Local anchors of the inhabited places a commune links as its chef-lieu. */
+export function settlementAnchors(sourceFeatures: Iterable<Record<string, unknown>>, into: Map<string, Coordinate> = new Map()): Map<string, Coordinate> {
+  for (const candidate of sourceFeatures as Iterable<SourceFeature>) {
+    const id = text(candidate.properties?.cleabs);
+    if (id === undefined) continue;
+    const geometry = asGeometry(candidate.geometry);
+    if (geometry === null) continue;
+    const local = localize(geometry);
+    if (local === null) continue;
+    into.set(id, geometryAnchor(local));
+  }
+  return into;
 }
 
 export function normalizeBdtopo(sourceFeatures: Record<string, unknown>[], boundaryPolygons: number[][][][], options: BdtopoNormalizationOptions = {}): MapFeature[] {
@@ -862,8 +957,18 @@ export function normalizeBdtopo(sourceFeatures: Record<string, unknown>[], bound
     if (!clipped) continue;
     const localGeometry = localize(clipped);
     if (!localGeometry) continue;
-    const localAnchor = geometryAnchor(localGeometry);
-    const [lon, lat] = renderToWgs84(localAnchor);
+    const chefLieu = resolved.name === "communes" ? options.chefLieuAnchors?.get(text(properties.lien_vers_chef_lieu) ?? "") : undefined;
+    let localAnchor = chefLieu ?? geometryAnchor(localGeometry);
+    let [lon, lat] = renderToWgs84(localAnchor);
+    /* A feature clipped along the border (a river that is the border, a concave wood) can have its
+       centroid or midpoint just outside: anchor it on one of its own vertices inside instead. */
+    if (!boundaryIndex.contains([lon, lat])) {
+      const inside = firstVertexInside(clipped, boundaryIndex);
+      if (inside !== null) {
+        [lon, lat] = inside;
+        localAnchor = wgs84ToRender(inside);
+      }
+    }
     const stableId = `ign-bdtopo:${resolved.layer}/${sourceId}`;
     const common = {
       stableId,

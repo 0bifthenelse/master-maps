@@ -1,8 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { Matrix4, Shape, ShapeGeometry, Vector3 } from "three";
+import { Shape, ShapeGeometry } from "three";
 import { mapShapeGeometryToWorld } from "@/lib/scene/geometryCoordinates";
 import { buildBuildings } from "@/lib/scene/buildBuildings";
-import { buildPois } from "@/lib/scene/buildPois";
 import buildWater from "@/lib/scene/buildWater";
 import { buildRoads } from "@/lib/scene/buildRoads";
 function coordinatesOf(geometry: {
@@ -72,7 +71,7 @@ describe("shared local x/z scene coordinate contract", () => {
     geometry.dispose();
   });
 
-  it("uses the same positive northing for buildings, roads, water, and POIs", () => {
+  it("uses the same positive northing for buildings, roads and water", () => {
     const building = buildBuildings([{
       kind: "building",
       stableId: "building",
@@ -90,25 +89,12 @@ describe("shared local x/z scene coordinate contract", () => {
       geometry: { type: "LineString", coordinates: [[0, 0], [0, 3]] },
       waterType: "stream",
     }]);
-    const poi = buildPois([{
-      kind: "poi",
-      stableId: "poi",
-      geometry: { type: "Point", coordinates: [0, 3] },
-    }]);
-
     expect(Math.max(...coordinatesOf(building.geometry).map((position) => position[2]))).toBeGreaterThan(0);
     expect(Math.max(...coordinatesOf(road.geometry).map((position) => position[2]))).toBeGreaterThan(0);
     expect(Math.max(...coordinatesOf(water.geometry).map((position) => position[2]))).toBeGreaterThan(0);
 
-    const matrix = new Matrix4();
-    const markerPosition = new Vector3();
-    poi.mesh.getMatrixAt(0, matrix);
-    markerPosition.setFromMatrixPosition(matrix);
-    expect(markerPosition.z).toBeCloseTo(3, 6);
-
     building.geometry.dispose();
     road.geometry.dispose();
     water.geometry.dispose();
-    poi.mesh.material.dispose();
   });
 });

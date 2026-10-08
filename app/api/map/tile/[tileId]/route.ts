@@ -18,7 +18,8 @@ const TILE_ID_RE = /^[a-zA-Z0-9_-]+$/;
 const TILE_CACHE_ENTRIES = 64;
 const TILE_NOT_INDEXED = "TILE_NOT_INDEXED";
 
-export const dynamic = "force-static";
+/* Read on every request: the data can be refreshed without rebuilding the app. */
+export const dynamic = "force-dynamic";
 
 interface TileManifestIndex {
   byId: Map<string, TileManifest>;

@@ -205,6 +205,7 @@ export const RoadFeatureSchema = FeatureBaseSchema.extend({
   kind: z.literal("road"),
   highway: z.string().optional(),
   roadClass: z.string().optional(),
+  ref: z.string().optional(),
   width: FINITE_NUMBER.nonnegative().optional(),
   widthInferred: z.boolean().optional(),
   widthSource: WidthSourceEnum.optional(),
@@ -253,6 +254,7 @@ export type WaterFeature = z.infer<typeof WaterFeatureSchema>;
 export const LanduseFeatureSchema = FeatureBaseSchema.extend({
   kind: z.literal("landuse"),
   landuseType: z.string().min(1),
+  category: z.string().optional(),
   area: FINITE_NUMBER.nonnegative().optional(),
 }).strict();
 export type LanduseFeature = z.infer<typeof LanduseFeatureSchema>;
@@ -375,6 +377,7 @@ const RoadFeatureMetaSchema = FeatureMetaBaseSchema.extend({
   kind: z.literal("road"),
   highway: z.string().optional(),
   roadClass: z.string().optional(),
+  ref: z.string().optional(),
   width: FINITE_NUMBER.nonnegative().optional(),
   widthInferred: z.boolean().optional(),
   widthSource: WidthSourceEnum.optional(),
@@ -504,6 +507,21 @@ export const SearchRecordSchema = z.object({
   focusLon: FINITE_NUMBER,
   focusLat: FINITE_NUMBER,
   boost: z.number().int().nonnegative(),
+  /** Second result line: commune, postcode, street or length. */
+  context: z.string().optional(),
+  commune: z.string().optional(),
+  postcode: z.string().optional(),
+  /** Street of an address or business, searchable alongside its name. */
+  street: z.string().optional(),
+  housenumber: z.string().optional(),
+  /** Road numbers ("N124;D930"). */
+  ref: z.string().optional(),
+  brand: z.string().optional(),
+  /** Local metres of the anchor. */
+  x: FINITE_NUMBER.optional(),
+  z: FINITE_NUMBER.optional(),
+  /** Local extent to frame (streets, communes, rivers). */
+  bbox: z.tuple([FINITE_NUMBER, FINITE_NUMBER, FINITE_NUMBER, FINITE_NUMBER]).optional(),
 }).strict();
 export type SearchRecord = z.infer<typeof SearchRecordSchema>;
 

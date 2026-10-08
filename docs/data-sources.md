@@ -22,15 +22,15 @@ The reconciliation audit cross-checks the delivered package against the clipped 
 
 BD TOPO supplies canonical road, building, and water geometry. Road width uses `largeur_de_chaussee` only when that field contains a positive numeric value. Road strata use the actual `position_par_rapport_au_sol` enumeration. Water surfaces render as polygons. A true BD TOPO fictive hydrographic axis remains available as metadata but does not render as a duplicate ribbon.
 
-## OpenStreetMap via Geofabrik
+## OpenStreetMap
 
-`fetch-osm.ts` downloads the current `midi-pyrenees-latest.osm.pbf` extract. Osmium extracts the complete Gers boundary and writes a smaller enrichment extract. Bulk normalization keeps path classes and semantic named points or areas. IGN remains canonical for buildings, roads, and hydrographic geometry.
+`fetch-osm.ts` downloads the daily Gers extract `gers-latest.osm.pbf` from download.openstreetmap.fr, falling back to the Geofabrik `midi-pyrenees-latest.osm.pbf` extract. Osmium exports the tagged objects the map uses. Bulk normalization keeps service roads, tracks, paths, footways, cycleways and steps, shops, amenities and landmarks with their hours, phones, websites, brands and cuisine, and the category of every place. IGN remains canonical for buildings, the public road network and hydrographic geometry: OSM roads of the public network classes are not adopted, so no road is drawn twice.
 
 The 2026-08-27 acquisition recorded 261798 Geofabrik records. The later parity run measured a 41 876 027-byte Gers PBF and 138252 highway ways. See `data/qa/osm-parity.json`.
 
 The Overpass fallback uses the complete Gers bounding box. Normalization applies the full Admin Express MultiPolygon afterward. The fallback never reduces a MultiPolygon to its largest ring.
 
-OSM object URLs and the Geofabrik resource are retained in source references. OSM data uses ODbL 1.0 attribution.
+OSM object URLs and the extract resource are retained in source references. OSM data uses ODbL 1.0 attribution.
 
 ## Base Adresse Nationale
 

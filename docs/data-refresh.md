@@ -12,23 +12,23 @@ npm run lint
 npm test
 npm run build
 npm run test:e2e
-npx tsx scripts/chrome/run-verification.ts
+npm run qa:benchmark
 npx tsx scripts/chrome/compare-osm.ts
 ```
 
-`npm run data:refresh` performs an online refresh. `npm run data:build` uses cached raw files and skips network acquisition. Offline mode never proves current source data.
+`npm run data:refresh` performs an online refresh; `-- --fetch-only` stops once every source is in the raw cache. `npm run data:build` uses cached raw files and skips network acquisition, and `npm run data:build -- --from-tiles` reuses the normalized, deduplicated store and rebuilds tiles, search and QA. Offline mode never proves current source data. Every HTTP response is cached under `data/raw/.http-cache`, so a repeated SIRENE acquisition replays in seconds; the rate limiter only paces real requests.
 
 ## Pipeline order
 
 1. `fetch-admin-express.ts` writes the complete Gers boundary and its source record.
 2. `fetch-bdtopo.ts` discovers the current official D032 package from IGN catalog metadata. It inspects the archive with `ogrinfo` and exports four required canonical layers.
-3. `fetch-osm.ts` downloads the current Geofabrik regional extract and uses Osmium for Gers enrichment.
+3. `fetch-osm.ts` downloads the daily Gers extract from openstreetmap.fr (the Geofabrik Midi-Pyrénées extract is the fallback) and uses Osmium to export the tagged objects the map uses.
 4. `fetch-addresses.ts` downloads BAN D32 and applies complete-boundary containment.
-5. `fetch-businesses.ts` queries department establishments and records corroborative sources.
+5. `fetch-businesses.ts` queries active, publicly listed establishments commune by commune and places those without coordinates on BAN or BD TOPO lieu-dits.
 6. `normalize.ts` creates canonical WGS84 and Lambert-93 feature records.
 7. `deduplicate.ts` performs exact-ID merging and conservative metric conflation.
 8. `build-tiles.ts` writes LOD0, LOD1, and LOD2 tiles.
-9. `build-search-index.ts` writes canonical feature IDs with detailed tile targets.
+9. `build-search-index.ts` writes the search records: communes, places, streets per commune, road numbers, addresses, businesses, POIs and rivers, each with context, anchor, extent and detailed tile target.
 10. `qa-spatial.ts` checks distributed source vertices, CRS round trips, normalized geometry, tile fragments, and scene-builder input.
 11. `validate.ts` parses the final data volume and fails on contract or budget errors.
 
@@ -62,6 +62,6 @@ All served LOD tiles stay below the 2 MiB payload ceiling. LOD0 targets about 1 
 
 ## Browser roles
 
-`scripts/moli/run-e2e.ts` provides browser navigation, DOM inspection, request counts, search, pan, zoom, reset, keyboard, and OpenStreetMap navigation. It does not prove hardware WebGPU pixels.
+`scripts/moli/run-e2e.ts` starts the production server and runs the Playwright specs in `tests/e2e/` against a Moli browser when one is available, otherwise against the local Chromium with SwiftShader WebGL: rendering, cursor-anchored zoom, drag, rotation, tilt, keyboard panning, shared views, satellite mode, the phone layout and search, plus reference screenshots.
 
-Installed Chrome provides the visual oracle. `run-verification.ts` checks the real adapter, renderer initialization, draw calls, visible feature counts, console errors, page errors, and screenshots. `compare-osm.ts` captures Master Maps and current OpenStreetMap at matching WGS84 locations and equivalent ground spans.
+`compare-osm.ts` captures Master Maps and current OpenStreetMap at matching WGS84 locations and the same zoom.

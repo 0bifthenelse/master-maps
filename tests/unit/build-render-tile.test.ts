@@ -1,393 +1,184 @@
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
-import { MapFeatureSchema, type Geometry, type MapFeature } from "@/lib/data/schema";
-import { decodeRenderTile, encodeRenderTile, renderLayerIndices, renderLayerPositions, renderLayerRanges, type DecodedRenderLayer, type DecodedRenderTile, type RenderLayerId } from "@/lib/render/codec";
-import { DEFAULT_BUILDING_HEIGHT_METRES, buildRenderTile, landuseLayerFor, resolveRoadWidth, roadLayerFor } from "@/lib/render/buildRenderTile";
-import { layerObjectKind } from "@/lib/render/sceneFromDecoded";
+import { MapFeatureSchema, type MapFeature } from "@/lib/data/schema";
+import {
+  RANGE_STRIDE,
+  decodeRenderTile,
+  encodeRenderTile,
+  renderLayerEdges,
+  renderLayerIndices,
+  renderLayerRanges,
+  renderLayerVertices,
+  type DecodedRenderLayer,
+  type DecodedRenderTile,
+  type RenderLayerId,
+} from "@/lib/render/codec";
+import { DEFAULT_BUILDING_HEIGHT_METRES, buildRenderTile, geometryAnchor, resolveRoadWidth, roadLayerFor } from "@/lib/render/buildRenderTile";
 
 const BOUNDS: [number, number, number, number] = [0, 0, 2048, 2048];
-const TILE_ID = "l0_0_0";
 
-function feature(value: unknown): MapFeature {
-  return MapFeatureSchema.parse({ geometry: { type: "Point", coordinates: [0, 0] }, ...value } as Record<string, unknown>);
+function feature(value: Record<string, unknown>): MapFeature {
+  const geometry = value.localGeometry ?? value.geometry ?? { type: "Point", coordinates: [0, 0] };
+  return MapFeatureSchema.parse({ geometry, localGeometry: geometry, ...value });
 }
 
-function build(features: MapFeature[], overrides: Partial<Parameters<typeof buildRenderTile>[1]> = {}): DecodedRenderTile {
-  const input = buildRenderTile(features, { tileId: TILE_ID, lod: 0, bounds: BOUNDS, datasetVersion: "0.1.0", ...overrides });
-  return decodeRenderTile(encodeRenderTile(input));
+function build(features: MapFeature[], includeBoundary = false): DecodedRenderTile {
+  return decodeRenderTile(encodeRenderTile(buildRenderTile(features, { tileId: "l0_0_0", lod: 0, bounds: BOUNDS, datasetVersion: "test", includeBoundary })));
 }
 
-function layer(tile: DecodedRenderTile, id: RenderLayerId): DecodedRenderLayer | undefined {
-  return tile.layers.find((candidate) => candidate.id === id);
+function layer(tile: DecodedRenderTile, id: RenderLayerId): DecodedRenderLayer {
+  const found = tile.layers.find((candidate) => candidate.id === id);
+  if (found === undefined) throw new Error(`layer ${id} missing`);
+  return found;
 }
 
-function metaFor(tile: DecodedRenderTile, layerId: RenderLayerId, featureIndex: number): { indices: Uint32Array; positions: Float32Array; ranges: Uint32Array } {
-  const found = layer(tile, layerId);
-  if (!found) throw new Error(`layer ${layerId} missing`);
-  const ranges = renderLayerRanges(tile.payload, found);
-  const start = ranges[featureIndex * 3]!;
-  const count = ranges[featureIndex * 3 + 1]!;
-  const indices = renderLayerIndices(tile.payload, found).slice(start, start + count);
-  const positions = renderLayerPositions(tile.payload, found);
-  return { indices, positions, ranges };
+/** Position (x, y, z) of each vertex of a layer. */
+function positions(tile: DecodedRenderTile, found: DecodedRenderLayer): Array<[number, number, number]> {
+  const values = renderLayerVertices(tile.payload, found);
+  const out: Array<[number, number, number]> = [];
+  for (let at = 0; at < values.length; at += found.stride) out.push([values[at]!, values[at + 1]!, values[at + 2]!]);
+  return out;
 }
 
-describe("buildRenderTile", () => {
-  it("pre-extrudes a building footprint into roof plus wall triangles", () => {
-    const tile = build([feature({
-      kind: "building",
-      stableId: "building/1",
-      geometry: { type: "Polygon", coordinates: [[[0, 0], [10, 0], [10, 10], [0, 10], [0, 0]]] },
-      height: 12,
-    })]);
-    const buildings = layer(tile, "buildings");
-    expect(buildings).toBeDefined();
-    const { indices, positions } = metaFor(tile, "buildings", 0);
-    expect(indices.length).toBe(36);
-    expect(positions.length / 3).toBe(8);
-    const heights = new Set(Array.from({ length: positions.length / 3 }, (_unused, index) => positions[index * 3 + 1]!));
-    expect([...heights].sort()).toEqual([0, 12]);
-    const topY = Math.max(...Array.from({ length: positions.length / 3 }, (_unused, index) => positions[index * 3 + 1]!));
-    expect(topY).toBe(12);
-    expect(tile.meta[0]).toEqual({ s: "building/1", k: "building", c: "yes", a: [0, 0], h: 12 });
+function triangles(tile: DecodedRenderTile, found: DecodedRenderLayer): Array<[number, number, number]> {
+  const indices = renderLayerIndices(tile.payload, found);
+  const out: Array<[number, number, number]> = [];
+  for (let at = 0; at < indices.length; at += 3) out.push([indices[at]!, indices[at + 1]!, indices[at + 2]!]);
+  return out;
+}
+
+const square = (x: number, z: number, size: number): number[][] => [[x, z], [x + size, z], [x + size, z + size], [x, z + size], [x, z]];
+
+describe("buildRenderTile: buildings", () => {
+  it("extrudes a footprint into a roof, four walls and a roof outline", () => {
+    const tile = build([feature({ kind: "building", stableId: "b/1", geometry: { type: "Polygon", coordinates: [square(10, 10, 10)] }, height: 12 })]);
+    const buildings = layer(tile, "building");
+    const vertices = positions(tile, buildings);
+    expect(vertices).toHaveLength(8);
+    expect(new Set(vertices.map(([, y]) => y))).toEqual(new Set([0, 12]));
+    expect(triangles(tile, buildings)).toHaveLength(2 + 4 * 2);
+    expect(renderLayerEdges(tile.payload, buildings)).toHaveLength(8);
+    expect(tile.meta[0]).toMatchObject({ s: "b/1", k: "building", h: 12, a: [15, 15] });
   });
 
-  it("falls back to the default height and flags the inference", () => {
-    const tile = build([feature({
-      kind: "building",
-      stableId: "building/2",
-      fragmentId: "building/2@l0_0_0",
-      geometry: { type: "Polygon", coordinates: [[[0, 0], [6, 0], [6, 6], [0, 6], [0, 0]]] },
-      heightInferred: true,
-    })]);
-    const { positions } = metaFor(tile, "buildings", 0);
-    const topY = Math.max(...Array.from({ length: positions.length / 3 }, (_unused, index) => positions[index * 3 + 1]!));
-    expect(topY).toBe(DEFAULT_BUILDING_HEIGHT_METRES);
-    expect(tile.meta[0]!.s).toBe("building/2@l0_0_0");
-    expect(tile.meta[0]!.p).toMatchObject({ heightInferred: true });
+  it("falls back to the default height", () => {
+    const tile = build([feature({ kind: "building", stableId: "b/2", geometry: { type: "Polygon", coordinates: [square(50, 50, 5)] } })]);
+    expect(Math.max(...positions(tile, layer(tile, "building")).map(([, y]) => y))).toBe(DEFAULT_BUILDING_HEIGHT_METRES);
   });
 
-  it("tessellates a building footprint with a hole and keeps the ring wall", () => {
-    const tile = build([feature({
-      kind: "building",
-      stableId: "building/3",
-      geometry: {
-        type: "Polygon",
-        coordinates: [
-          [[0, 0], [20, 0], [20, 20], [0, 20], [0, 0]],
-          [[5, 5], [5, 10], [10, 10], [10, 5], [5, 5]],
-        ],
-      },
-      height: 8,
-    })]);
-    const { indices, positions } = metaFor(tile, "buildings", 0);
-    expect(positions.length / 3).toBe(16);
-    expect(indices.length).toBeGreaterThan(6);
-  });
-
-  it("splits roads into tunnel, normal, and bridge strata ribbons", () => {
-    const road = (stableId: string, extra: Record<string, unknown>): MapFeature => feature({
-      kind: "road",
-      stableId,
-      geometry: { type: "LineString", coordinates: [[0, 0], [100, 0]] },
-      roadClass: "residential",
-      ...extra,
-    });
-    const tile = build([road("road/tunnel", { stratum: "tunnel" }), road("road/normal", {}), road("road/bridge", { bridge: true })]);
-    expect(tile.layers.map((candidate) => candidate.id)).toEqual(["road_tunnel", "road_normal", "road_bridge"]);
-    const normal = metaFor(tile, "road_normal", 0);
-    const normalY = new Set(Array.from({ length: normal.positions.length / 3 }, (_unused, index) => normal.positions[index * 3 + 1]!));
-    expect([...normalY]).toEqual([0]);
-    const bridge = metaFor(tile, "road_bridge", 0);
-    const bridgeY = new Set(Array.from({ length: bridge.positions.length / 3 }, (_unused, index) => bridge.positions[index * 3 + 1]!));
-    expect([...bridgeY].every((value) => value > 0)).toBe(true);
-    const normalZs = Array.from({ length: normal.positions.length / 3 }, (_unused, index) => normal.positions[index * 3 + 2]!);
-    expect(Math.abs(Math.min(...normalZs))).toBeCloseTo(2.5, 6);
-    expect(tile.meta.filter((entry) => entry.k === "road").map((entry) => entry.w)).toEqual([5, 5, 5]);
-  });
-
-  it("honours an explicit road width and the class default table", () => {
-    const explicit = build([feature({ kind: "road", stableId: "road/w", geometry: { type: "LineString", coordinates: [[0, 0], [10, 0]] }, roadClass: "residential", width: 20 })]);
-    const explicitMeta = explicit.meta[0]!;
-    expect(explicitMeta.w).toBe(20);
-    const { positions } = metaFor(explicit, "road_normal", 0);
-    const zs = Array.from({ length: positions.length / 3 }, (_unused, index) => positions[index * 3 + 2]!);
-    expect(Math.min(...zs)).toBeCloseTo(-10, 6);
-    expect(Math.max(...zs)).toBeCloseTo(10, 6);
-    expect(resolveRoadWidth(feature({ kind: "road", stableId: "road/x", geometry: { type: "Point", coordinates: [0, 0] }, highway: "motorway" }))).toBe(12);
-  });
-
-  it("routes water surfaces to water_surface and axes to water_line, skipping fictive axes", () => {
-    const tile = build([
-      feature({ kind: "water", stableId: "water/lake", geometry: { type: "Polygon", coordinates: [[[0, 0], [40, 0], [40, 40], [0, 40], [0, 0]]] }, isSurface: true }),
-      feature({ kind: "water", stableId: "water/river", geometry: { type: "LineString", coordinates: [[0, 0], [80, 0]] }, waterType: "river" }),
-      feature({ kind: "water", stableId: "water/fictive", geometry: { type: "LineString", coordinates: [[0, 0], [80, 0]] }, fictiveAxis: true }),
-    ]);
-    expect(tile.layers.map((candidate) => candidate.id)).toEqual(["water_surface", "water_line"]);
-    expect(tile.meta.map((entry) => entry.s)).toEqual(["water/lake", "water/river"]);
-    const river = metaFor(tile, "water_line", 0);
-    const riverZs = Array.from({ length: river.positions.length / 3 }, (_unused, index) => river.positions[index * 3 + 2]!);
-    expect(Math.min(...riverZs)).toBeCloseTo(-5, 6);
-    expect(Math.max(...riverZs)).toBeCloseTo(5, 6);
-  });
-
-  it("separates habitat landuse from other landuse and triangulates both", () => {
-    const tile = build([
-      feature({ kind: "landuse", stableId: "landuse/forest", geometry: { type: "Polygon", coordinates: [[[0, 0], [30, 0], [30, 30], [0, 30], [0, 0]]] }, landuseType: "forest" }),
-      feature({ kind: "landuse", stableId: "landuse/village", geometry: { type: "Polygon", coordinates: [[[50, 0], [70, 0], [70, 20], [50, 20], [50, 0]]] }, landuseType: "habitat" }),
-    ]);
-    expect(tile.layers.map((candidate) => candidate.id)).toEqual(["habitat", "landuse"]);
-    expect(layer(tile, "landuse")!.positionLength).toBe(2 * 3 * 3);
-    expect(layer(tile, "habitat")!.indexLength).toBe(6);
-    expect(landuseLayerFor("forest")).toBe("landuse");
-    expect(landuseLayerFor("habitat")).toBe("habitat");
-    expect(landuseLayerFor("zone_d_habitation")).toBe("habitat");
-  });
-
-  it("routes transport areas, lines, and point stops", () => {
-    const tile = build([
-      feature({ kind: "transport", stableId: "transport/rail", geometry: { type: "LineString", coordinates: [[0, 0], [200, 0]] }, transportType: "rail" }),
-      feature({ kind: "transport", stableId: "transport/aero", geometry: { type: "Polygon", coordinates: [[[0, 0], [50, 0], [50, 50], [0, 50], [0, 0]]] }, transportType: "aerodrome" }),
-      feature({ kind: "transport", stableId: "transport/stop", geometry: { type: "Point", coordinates: [12, 14] }, transportType: "bus_stop" }),
-    ]);
-    expect(tile.layers.map((candidate) => candidate.id)).toEqual(["transport_area", "transport_line"]);
-    expect(tile.meta.map((entry) => entry.c)).toEqual(["rail", "aerodrome", "bus_stop"]);
-    const stop = metaFor(tile, "transport_area", 1);
-    expect(stop.indices.length).toBe(0);
-    expect(stop.positions.length).toBeGreaterThanOrEqual(6);
-    expect(Array.from(stop.positions.slice(-3))).toEqual([12, 2, 14]);
-  });
-
-  it("routes structures by geometry into line, area, and point layers", () => {
-    const tile = build([
-      feature({ kind: "structure", stableId: "structure/pont", structureType: "pont", geometry: { type: "LineString", coordinates: [[0, 0], [60, 0]] }, height: 8 }),
-      feature({ kind: "structure", stableId: "structure/reservoir", structureType: "reservoir", geometry: { type: "Polygon", coordinates: [[[0, 0], [20, 0], [20, 20], [0, 20], [0, 0]]] } }),
-      feature({ kind: "structure", stableId: "structure/pylone", structureType: "pylone", geometry: { type: "Point", coordinates: [33, 44] } }),
-    ]);
-    expect(tile.layers.map((candidate) => candidate.id)).toEqual(["structure_line", "structure_area", "structures_point"]);
-    const point = metaFor(tile, "structures_point", 0);
-    expect(Array.from(point.positions)).toEqual([33, 2, 44]);
-    expect(tile.meta[2]!.s).toBe("structure/pylone");
-  });
-
-  it("puts poi, business, address, and place in separate point layers", () => {
-    const tile = build([
-      feature({ kind: "poi", stableId: "poi/1", poiType: "erp:mairie", geometry: { type: "Point", coordinates: [1, 2] }, name: "Mairie" }),
-      feature({ kind: "business", stableId: "business/1", businessName: "Boulangerie", geometry: { type: "Point", coordinates: [3, 4] } }),
-      feature({ kind: "address", stableId: "address/1", street: "Rue du Gers", housenumber: "12", geometry: { type: "Point", coordinates: [5, 6] } }),
-      feature({ kind: "place", stableId: "place/1", placeType: "commune", importance: 4, geometry: { type: "Point", coordinates: [7, 8] } }),
-    ]);
-    expect(tile.layers.map((candidate) => candidate.id)).toEqual(["poi", "address", "place"]);
-    expect(layer(tile, "poi")!.positionLength).toBe(6);
-    expect(tile.meta.map((entry) => entry.k)).toEqual(["poi", "business", "address", "place"]);
-    expect(tile.meta[0]).toMatchObject({ n: "Mairie", c: "erp:mairie", p: { poiType: "erp:mairie" } });
-    expect(tile.meta[3]!.p).toMatchObject({ importance: 4 });
-  });
-
-  it("omits the boundary layer when the caller disables it and keeps the meta ordering aligned with ranges", () => {
-    const boundary = feature({
-      kind: "boundary",
-      stableId: "boundary/32",
-      territoryCode: "32",
-      geometry: { type: "Polygon", coordinates: [[[0, 0], [500, 0], [500, 500], [0, 500], [0, 0]]] },
-    });
-    const withBoundary = build([boundary]);
-    expect(withBoundary.layers.map((candidate) => candidate.id)).toEqual(["boundary"]);
-    const withoutBoundary = build([boundary], { includeBoundary: false });
-    expect(withoutBoundary.layers).toHaveLength(0);
-    expect(withoutBoundary.meta).toEqual([]);
-  });
-
-  it("keeps featureRanges contiguous and pointing at the right meta entry for every layer", () => {
-    const features: MapFeature[] = [
-      feature({ kind: "landuse", stableId: "landuse/1", geometry: { type: "Polygon", coordinates: [[[0, 0], [10, 0], [10, 10], [0, 10], [0, 0]]] }, landuseType: "forest" }),
-      feature({ kind: "landuse", stableId: "landuse/2", geometry: { type: "Polygon", coordinates: [[[20, 0], [30, 0], [30, 10], [20, 10], [20, 0]]] }, landuseType: "wood" }),
-      feature({ kind: "road", stableId: "road/1", geometry: { type: "LineString", coordinates: [[0, 20], [60, 20]] }, roadClass: "track" }),
-      feature({ kind: "road", stableId: "road/2", geometry: { type: "LineString", coordinates: [[0, 40], [60, 40]] }, roadClass: "primary", bridge: true }),
-    ];
-    const tile = build(features);
-    expect(tile.layers.map((candidate) => candidate.id)).toEqual(["landuse", "road_normal", "road_bridge"]);
-    for (const found of tile.layers) {
-      const ranges = renderLayerRanges(tile.payload, found);
-      const indices = renderLayerIndices(tile.payload, found);
-      const featureCount = found.rangeLength / 3;
-      expect(featureCount).toBeGreaterThan(0);
-      for (let index = 0; index < featureCount; index += 1) {
-        const start = ranges[index * 3]!;
-        const count = ranges[index * 3 + 1]!;
-        const metaIndex = ranges[index * 3 + 2]!;
-        expect(metaIndex).toBeLessThan(tile.meta.length);
-        expect(["landuse", "road"]).toContain(tile.meta[metaIndex]!.k);
-        expect(count).toBeGreaterThan(0);
-        expect(start + count).toBeLessThanOrEqual(indices.length);
-        expect(tile.meta[metaIndex]).toBeDefined();
+  it("keeps a courtyard open and never stretches a triangle beyond the footprint", () => {
+    const outer = square(100, 100, 30);
+    const hole = [[110, 110], [110, 120], [120, 120], [120, 110], [110, 110]];
+    const tile = build([feature({ kind: "building", stableId: "b/3", geometry: { type: "Polygon", coordinates: [outer, hole] }, height: 9 })]);
+    const buildings = layer(tile, "building");
+    const vertices = positions(tile, buildings);
+    const diagonal = Math.hypot(30, 30);
+    for (const [a, b, c] of triangles(tile, buildings)) {
+      for (const [p, q] of [[a, b], [b, c], [c, a]] as const) {
+        expect(Math.hypot(vertices[p]![0] - vertices[q]![0], vertices[p]![2] - vertices[q]![2])).toBeLessThanOrEqual(diagonal + 1e-6);
       }
-      expect(ranges[(featureCount - 1) * 3]! + ranges[(featureCount - 1) * 3 + 1]!).toBe(indices.length);
+      /* No roof triangle covers the courtyard. */
+      if (vertices[a]![1] === 9 && vertices[b]![1] === 9 && vertices[c]![1] === 9) {
+        const cx = (vertices[a]![0] + vertices[b]![0] + vertices[c]![0]) / 3;
+        const cz = (vertices[a]![2] + vertices[b]![2] + vertices[c]![2]) / 3;
+        expect(cx > 110 && cx < 120 && cz > 110 && cz < 120).toBe(false);
+      }
     }
-    expect(tile.meta.map((entry) => entry.s)).toEqual(["landuse/1", "landuse/2", "road/1", "road/2"]);
+    /* 8 walls (4 outer + 4 courtyard) of two triangles each, plus the roof ring. */
+    expect(triangles(tile, buildings).length).toBe(8 * 2 + 8);
   });
 
-  it("classifies road strata consistently with the canonical stratum field", () => {
-    const buildRoad = (extra: Record<string, unknown>): Extract<MapFeature, { kind: "road" }> => feature({ kind: "road", stableId: "road/z", geometry: { type: "Point", coordinates: [0, 0] }, ...extra });
-    expect(roadLayerFor(buildRoad({ stratum: "bridge" }))).toBe("road_bridge");
-    expect(roadLayerFor(buildRoad({ tunnel: true }))).toBe("road_tunnel");
-    expect(roadLayerFor(buildRoad({ layer: "1" }))).toBe("road_bridge");
-    expect(roadLayerFor(buildRoad({ layer: "-1" }))).toBe("road_tunnel");
-    expect(roadLayerFor(buildRoad({}))).toBe("road_normal");
+  it("gives every feature of a multi-building tile its own vertices", () => {
+    const tile = build([
+      feature({ kind: "building", stableId: "b/4", geometry: { type: "MultiPolygon", coordinates: [[square(0, 0, 10)], [square(100, 100, 10)]] }, height: 6 }),
+      feature({ kind: "building", stableId: "b/5", geometry: { type: "Polygon", coordinates: [square(500, 500, 20)] }, height: 15 }),
+    ]);
+    const buildings = layer(tile, "building");
+    const ranges = renderLayerRanges(tile.payload, buildings);
+    const indices = renderLayerIndices(tile.payload, buildings);
+    expect(ranges.length / RANGE_STRIDE).toBe(2);
+    for (let row = 0; row < ranges.length; row += RANGE_STRIDE) {
+      const [indexStart, indexCount, , vertexStart, vertexCount] = Array.from(ranges.slice(row, row + RANGE_STRIDE));
+      for (let at = indexStart!; at < indexStart! + indexCount!; at += 1) {
+        expect(indices[at]).toBeGreaterThanOrEqual(vertexStart!);
+        expect(indices[at]).toBeLessThan(vertexStart! + vertexCount!);
+      }
+    }
   });
 
-  it("converts and decodes a real LOD0 tile from the generated dataset", () => {
-    const tilePath = resolve("data/generated/tiles/l0_137_27_s2_1_1.json");
-    let raw: unknown;
-    try {
-      raw = JSON.parse(readFileSync(tilePath, "utf8"));
-    } catch {
-      return;
-    }
-    expect(Array.isArray(raw)).toBe(true);
-    const features = (raw as unknown[]).map((value) => MapFeatureSchema.parse(value));
-    const bounds: [number, number, number, number] = [2048 * 137, 2048 * 27, 2048 * 138, 2048 * 28];
-    const input = buildRenderTile(features, { tileId: "l0_137_27_s2_1_1", lod: 0, bounds, datasetVersion: "0.1.0" });
-    const encoded = encodeRenderTile(input);
-    const decoded = decodeRenderTile(encoded);
-    expect(decoded.header.tileId).toBe("l0_137_27_s2_1_1");
-    expect(decoded.header.bounds).toEqual(bounds);
-    const layerIds = decoded.layers.map((candidate) => candidate.id);
-    expect(layerIds).toContain("buildings");
-    expect(layerIds).toContain("road_normal");
-    expect(layerIds).toContain("address");
-    for (const [index, found] of decoded.layers.entries()) {
-      const source = input.layers.find((candidate) => candidate.id === found.id)!;
-      expect(found.positionLength).toBe(source.positions.length);
-      expect(found.indexLength).toBe(source.indices.length);
-      expect(found.rangeLength).toBe(source.ranges.length);
-      expect(Array.from(renderLayerPositions(decoded.payload, found))).toEqual(Array.from(source.positions));
-      expect(Array.from(renderLayerIndices(decoded.payload, found))).toEqual(Array.from(source.indices));
-    }
-    const buildings = decoded.layers.find((candidate) => candidate.id === "buildings")!;
-    const buildingRanges = renderLayerRanges(decoded.payload, buildings);
-    expect(buildingRanges.length / 3).toBe(features.filter((entry) => entry.kind === "building").length);
-    const buildingHeights = new Set<number>();
-    const positions = renderLayerPositions(decoded.payload, buildings);
-    for (let index = 0; index < positions.length / 3; index += 1) {
-      const y = positions[index * 3 + 1]!;
-      if (y > 0) buildingHeights.add(y);
-    }
-    expect(buildingHeights.size).toBeGreaterThan(1);
-    expect(encoded.byteLength).toBeGreaterThan(0);
+  it("draws no wall along a cut made by the tile edge", () => {
+    const tile = build([feature({ kind: "building", stableId: "b/6", geometry: { type: "Polygon", coordinates: [[[2038, 100], [2048, 100], [2048, 110], [2038, 110], [2038, 100]]] }, height: 6 })]);
+    /* Roof (2 triangles) and three walls; the wall on x = 2048 is a clip artefact. */
+    expect(triangles(tile, layer(tile, "building"))).toHaveLength(2 + 3 * 2);
   });
 });
 
-type Point = readonly [number, number];
-
-function boundaryFeature(geometry: Geometry): MapFeature {
-  return feature({ kind: "boundary", stableId: "boundary/32", territoryCode: "32", geometry });
-}
-
-function rings(geometry: Geometry): readonly (readonly Point[])[] {
-  if (geometry.type === "Polygon") return geometry.coordinates;
-  if (geometry.type === "MultiPolygon") return geometry.coordinates.flatMap((polygon) => polygon);
-  throw new Error("expected an area geometry");
-}
-
-function perimeterEdges(geometry: Geometry): Set<string> {
-  const edges = new Set<string>();
-  for (const closed of rings(geometry)) {
-    const ring = closed[0]![0] === closed[closed.length - 1]![0] && closed[0]![1] === closed[closed.length - 1]![1] ? closed.slice(0, -1) : closed;
-    for (let index = 0; index < ring.length; index += 1) {
-      const [ax, az] = ring[index]!;
-      const [bx, bz] = ring[(index + 1) % ring.length]!;
-      edges.add(ax < bx || (ax === bx && az <= bz) ? `${ax},${az}|${bx},${bz}` : `${bx},${bz}|${ax},${az}`);
-    }
-  }
-  return edges;
-}
-
-function emittedEdges(tile: DecodedRenderTile): Set<string> {
-  const found = layer(tile, "boundary")!;
-  const indices = renderLayerIndices(tile.payload, found);
-  const positions = renderLayerPositions(tile.payload, found);
-  const edges = new Set<string>();
-  for (let index = 0; index < indices.length; index += 2) {
-    const a = indices[index]!;
-    const b = indices[index + 1]!;
-    const ax = positions[a * 3]!;
-    const az = positions[a * 3 + 2]!;
-    const bx = positions[b * 3]!;
-    const bz = positions[b * 3 + 2]!;
-    edges.add(ax < bx || (ax === bx && az <= bz) ? `${ax},${az}|${bx},${bz}` : `${bx},${bz}|${ax},${az}`);
-  }
-  return edges;
-}
-
-describe("boundary layer geometry", () => {
-  it("emits exactly the ring perimeter of a Polygon, with no diagonal", () => {
-    const geometry: Geometry = {
-      type: "Polygon",
-      coordinates: [
-        [[0, 0], [40, 0], [40, 25], [0, 25], [0, 0]],
-        [[10, 5], [10, 20], [30, 20], [30, 5], [10, 5]],
-      ],
-    };
-    const tile = build([boundaryFeature(geometry)]);
-    const expected = perimeterEdges(geometry);
-    const emitted = emittedEdges(tile);
-    expect(emitted).toEqual(expected);
-    const positions = renderLayerPositions(tile.payload, layer(tile, "boundary")!);
-    const heights = new Set(Array.from({ length: positions.length / 3 }, (_unused, index) => positions[index * 3 + 1]!));
-    expect([...heights]).toEqual([0.5]);
+describe("buildRenderTile: lines", () => {
+  it("emits a road as a centreline ribbon with square caps and its true half width", () => {
+    const road = feature({ kind: "road", stableId: "r/1", geometry: { type: "LineString", coordinates: [[0, 0], [100, 0]] }, roadClass: "primary", ref: "D930", name: "Route de Toulouse" });
+    const tile = build([road]);
+    const roads = layer(tile, "road");
+    const values = renderLayerVertices(tile.payload, roads);
+    expect(values.length / roads.stride).toBe(4);
+    expect(triangles(tile, roads)).toHaveLength(2);
+    /* halfWidth component and distance along the line. */
+    expect(values[5]).toBe(resolveRoadWidth(road as Extract<MapFeature, { kind: "road" }>) / 2);
+    expect([values[7], values[15], values[23], values[31]]).toEqual([0, 0, 100, 100]);
+    /* Start cap extrudes backwards (-x) on both sides, end cap forwards. */
+    expect(values[3]).toBe(-1);
+    expect(values[11]).toBe(-1);
+    expect(values[19]).toBe(1);
+    expect(values[27]).toBe(1);
+    expect(tile.meta[0]).toMatchObject({ k: "road", c: "primary", r: "D930", n: "Route de Toulouse" });
   });
 
-  it("keeps every polygon of a MultiPolygon separate and never joins two of them", () => {
-    const geometry: Geometry = {
-      type: "MultiPolygon",
-      coordinates: [
-        [[[0, 0], [30, 0], [30, 30], [0, 30], [0, 0]]],
-        [[[100, 100], [140, 100], [140, 160], [100, 160], [100, 100]], [[110, 110], [110, 150], [130, 150], [130, 110], [110, 110]]],
-      ],
-    };
-    const tile = build([boundaryFeature(geometry)]);
-    const emitted = emittedEdges(tile);
-    expect(emitted).toEqual(perimeterEdges(geometry));
-    /* Every emitted edge must have both endpoints in the same polygon, so no
-       chord can bridge the two parts of a MultiPolygon. */
-    const rings = geometry.coordinates.map((polygon) => new Set(polygon.flatMap((ring) => ring.map(([x, z]) => `${x},${z}`))));
-    for (const edge of emitted) {
-      const [from, to] = edge.split("|") as [string, string];
-      expect(rings.filter((ring) => ring.has(from) && ring.has(to)), `edge ${edge} bridges two polygons`).toHaveLength(1);
-    }
-    expect(layerObjectKind("boundary")).toBe("lineSegments");
-  });
-
-  it("emits one closing segment for a minimal triangle and never triangulates it", () => {
-    /* Three vertices yield three segments, four indices, where the old
-       triangulation produced six triangle indices and long chords. */
-    const geometry: Geometry = { type: "Polygon", coordinates: [[[0, 0], [30, 0], [15, 25], [0, 0]]] };
-    const tile = build([boundaryFeature(geometry)]);
-    expect(layer(tile, "boundary")!.indexLength).toBe(6);
-    expect([...emittedEdges(tile)].sort()).toEqual([...perimeterEdges(geometry)].sort());
-    expect(emittedEdges(tile).size).toBe(3);
-  });
-
-  it("keeps the boundary index slab even, contiguous and valid for picking", () => {
+  it("paints major roads over minor ones", () => {
     const tile = build([
-      boundaryFeature({ type: "Polygon", coordinates: [[[0, 0], [50, 0], [50, 50], [0, 50], [0, 0]]] }),
-      boundaryFeature({ type: "Polygon", coordinates: [[[80, 80], [90, 80], [90, 90], [80, 80]]] }),
+      feature({ kind: "road", stableId: "r/trunk", geometry: { type: "LineString", coordinates: [[0, 0], [100, 0]] }, roadClass: "trunk" }),
+      feature({ kind: "road", stableId: "r/lane", geometry: { type: "LineString", coordinates: [[50, -50], [50, 50]] }, roadClass: "residential" }),
     ]);
-    const found = layer(tile, "boundary")!;
-    const indices = renderLayerIndices(tile.payload, found);
-    const ranges = renderLayerRanges(tile.payload, found);
-    expect(indices.length % 2).toBe(0);
-    expect(found.rangeLength / 3).toBe(2);
-    let covered = 0;
-    for (let range = 0; range < found.rangeLength / 3; range += 1) {
-      expect(ranges[range * 3]).toBe(covered);
-      expect(ranges[range * 3 + 1]! % 2).toBe(0);
-      expect(ranges[range * 3 + 2]! < tile.meta.length).toBe(true);
-      covered += ranges[range * 3 + 1]!;
+    const ranges = renderLayerRanges(tile.payload, layer(tile, "road"));
+    expect(tile.meta[ranges[2]!]!.s).toBe("r/lane");
+    expect(tile.meta[ranges[RANGE_STRIDE + 2]!]!.s).toBe("r/trunk");
+  });
+
+  it("puts bridges and tunnels on their own layers", () => {
+    const base = { kind: "road", geometry: { type: "LineString", coordinates: [[0, 0], [10, 0]] } } as const;
+    expect(roadLayerFor(feature({ ...base, stableId: "a", bridge: true }) as Extract<MapFeature, { kind: "road" }>)).toBe("road_bridge");
+    expect(roadLayerFor(feature({ ...base, stableId: "b", tunnel: true }) as Extract<MapFeature, { kind: "road" }>)).toBe("road_tunnel");
+    expect(roadLayerFor(feature({ ...base, stableId: "c" }) as Extract<MapFeature, { kind: "road" }>)).toBe("road");
+  });
+
+  it("splits a hairpin instead of shooting a miter spike", () => {
+    const tile = build([feature({ kind: "road", stableId: "r/hairpin", geometry: { type: "LineString", coordinates: [[0, 0], [100, 0], [0, 2]] }, roadClass: "residential" })]);
+    const roads = layer(tile, "road");
+    const values = renderLayerVertices(tile.payload, roads);
+    for (let at = 0; at < values.length; at += roads.stride) {
+      expect(Math.hypot(values[at + 3]!, values[at + 4]!)).toBeLessThan(3);
     }
-    expect(covered).toBe(indices.length);
-    for (const index of indices) expect(index).toBeLessThan(found.positionLength / 3);
+  });
+
+  it("outlines communes, skipping the stretches cut by the tile edge", () => {
+    const tile = build([feature({ kind: "place", stableId: "c/1", placeType: "commune", name: "Auch", geometry: { type: "Polygon", coordinates: [[[1000, 1000], [2048, 1000], [2048, 1500], [1000, 1500], [1000, 1000]]] } })]);
+    const values = renderLayerVertices(tile.payload, layer(tile, "boundary"));
+    for (let at = 0; at < values.length; at += 8) expect(values[at] === 2048 && values[at + 3] === 0 && values[at + 4] !== 0).toBe(false);
+    expect(tile.meta[0]).toMatchObject({ k: "place", c: "commune", n: "Auch" });
+  });
+});
+
+describe("buildRenderTile: points and anchors", () => {
+  it("keeps points in the meta table only", () => {
+    const tile = build([
+      feature({ kind: "poi", stableId: "p/1", poiType: "pharmacy", category: "pharmacy", name: "Pharmacie", geometry: { type: "Point", coordinates: [5, 5] } }),
+      feature({ kind: "address", stableId: "a/1", street: "Rue Gambetta", housenumber: "12", geometry: { type: "Point", coordinates: [6, 6] } }),
+    ]);
+    expect(tile.layers).toHaveLength(0);
+    expect(tile.meta.map((entry) => entry.k)).toEqual(["poi", "address"]);
+    expect(tile.meta[0]).toMatchObject({ c: "pharmacy", a: [5, 5] });
+    expect(tile.meta[1]!.p).toEqual({ hn: "12", st: "Rue Gambetta" });
+  });
+
+  it("anchors areas on their centroid and lines on their midpoint", () => {
+    expect(geometryAnchor({ type: "Polygon", coordinates: [square(0, 0, 10)] as [number, number][][] })).toEqual([5, 5]);
+    expect(geometryAnchor({ type: "LineString", coordinates: [[0, 0], [10, 0], [10, 30]] })).toEqual([10, 10]);
   });
 });

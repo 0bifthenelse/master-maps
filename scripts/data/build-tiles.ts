@@ -6,8 +6,9 @@ import { createInterface } from "node:readline";
 import * as path from "node:path";
 import { promisify } from "node:util";
 import { gzip } from "node:zlib";
-import { MapFeatureSchema, TileManifestSchema, type Bbox, type Geometry, type MapFeature, type TileManifest } from "../../src/lib/data/schema";
+import { FeatureBaseSchema, MapFeatureSchema, TileManifestSchema, type Bbox, type Geometry, type MapFeature, type TileManifest } from "../../src/lib/data/schema";
 import { clipPolygonToBounds, ensureRingClosed, ringArea, ringWindingOrder } from "../../src/lib/geo/polygon";
+import { simplifyLine } from "../../src/lib/geo/simplify";
 import { buildRenderTile, RENDER_LAYER_BUDGET_BYTES } from "../../src/lib/render/buildRenderTile";
 import { encodeRenderTile } from "../../src/lib/render/codec";
 
@@ -23,7 +24,7 @@ const AUDIT_EVERY = envNumber("MASTER_MAPS_TILE_AUDIT_SAMPLE", 64);
 const ZOD_AUDIT_PER_TILE = envNumber("MASTER_MAPS_TILE_ZOD_AUDIT", 2);
 const META_BYTES_PER_FEATURE_ESTIMATE = 1200;
 const RENDER_HEADER_UPPER_BYTES = 8192;
-const RENDER_BYTES_PER_GEOMETRY_POINT = 48;
+const RENDER_BYTES_PER_GEOMETRY_POINT = 96;
 const RENDER_BYTES_PER_FEATURE = 512;
 
 interface TileOptions { inDir: string; outDir: string; renderOutDir: string; metaOutDir: string; datasetVersion: string; forceSize?: number; benchmarkOnly: boolean; emitJsonTiles: boolean; quiet: boolean }
@@ -62,31 +63,20 @@ const DETAILED_TARGET_BYTES = 1024 * 1024;
 const DETAILED_HARD_LIMIT_BYTES = 2 * 1024 * 1024;
 const META_TILE_HARD_LIMIT_BYTES = 2 * 1024 * 1024;
 const DEFAULT_DATASET_VERSION = "0.1.0";
-const BOUNDARY_TILE_ID = "boundary";
+/** The territory outline ships as one tile outside the LOD grid, fetched once by every client. */
+export const BOUNDARY_TILE_ID = "boundary";
 const IGNORED_FILES: ReadonlySet<string> = new Set([
   "provenance.json", "boundary-source.json", "bdtopo-manifest.json", "ign-unavailable.json",
   "osm-manifest.json", "osm-bulk-manifest.json", "relation-issues.json", "normalization-issues.json",
   "auch-boundary-source.json", "auch-osm-manifest.json", "osm-normalization.json",
 ]);
 const GEOMETRY_TYPES: ReadonlySet<string> = new Set(["Point", "LineString", "MultiLineString", "Polygon", "MultiPolygon"]);
-const BASE_FEATURE_FIELDS: ReadonlySet<string> = new Set([
-  "stableId", "kind", "geometry", "sourceId", "name", "lon", "lat", "x", "z", "localGeometry",
-  "sourceGeometry", "names", "displayName", "address", "confidence", "status", "provenance",
-  "sourceRefs", "fragmentId", "parentStableId", "fragmentOf", "sourceMetadata",
-]);
-const KIND_FIELDS: Readonly<Record<string, ReadonlySet<string>>> = {
-  boundary: new Set(["territoryCode"]),
-  building: new Set(["height", "heightInferred", "levels", "heightSource", "buildingType", "roofType", "wallType", "buildingLevels", "buildingColour", "roofColour", "startDate", "yearConstructed"]),
-  road: new Set(["highway", "roadClass", "width", "widthInferred", "widthSource", "surface", "bridge", "tunnel", "maxSpeed", "layer", "stratum", "oneway", "lanes", "lit", "sidewalk"]),
-  water: new Set(["waterType", "intermittent", "width", "widthInferred", "tidal", "salt", "fictiveAxis", "isSurface"]),
-  landuse: new Set(["landuseType", "area"]),
-  poi: new Set(["poiType", "category", "website", "phone", "openingHours", "wheelchair", "operator"]),
-  business: new Set(["businessName", "poiType", "category", "siret", "siren", "businessId", "brand", "legalName", "website", "phone", "openingHours", "operator", "wheelchair", "nafCode", "nafLabel", "administrativeStatus", "creationDate"]),
-  address: new Set(["street", "housenumber", "postcode", "city", "source", "banId"]),
-  transport: new Set(["transportType", "line", "route", "network", "operator", "ref", "publicTransport", "wheelchair"]),
-  structure: new Set(["structureType", "height", "heightSource"]),
-  place: new Set(["placeType", "importance", "population"]),
-};
+/* Field allow-lists come from the schemas themselves so the audit never drifts from them. */
+const BASE_FEATURE_FIELDS: ReadonlySet<string> = new Set(["kind", ...Object.keys(FeatureBaseSchema.shape)]);
+const KIND_FIELDS: Readonly<Record<string, ReadonlySet<string>>> = Object.fromEntries(MapFeatureSchema.options.map((option) => {
+  const shape = option.shape as Record<string, unknown> & { kind: { value: string } };
+  return [shape.kind.value, new Set(Object.keys(shape).filter((key) => !BASE_FEATURE_FIELDS.has(key) && key !== "kind"))];
+}));
 
 function parseFeatureRecords(text: string): MapFeature[] {
   const records: MapFeature[] = [];
@@ -212,37 +202,6 @@ function roadWidth(feature: MapFeature): number {
   return 0;
 }
 
-function pointToSegmentDistance(point: Point, start: Point, end: Point): number {
-  const dx = end[0] - start[0];
-  const dz = end[1] - start[1];
-  const lengthSquared = dx * dx + dz * dz;
-  if (lengthSquared === 0) return Math.hypot(point[0] - start[0], point[1] - start[1]);
-  const ratio = Math.max(0, Math.min(1, ((point[0] - start[0]) * dx + (point[1] - start[1]) * dz) / lengthSquared));
-  return Math.hypot(point[0] - (start[0] + ratio * dx), point[1] - (start[1] + ratio * dz));
-}
-
-function simplifyLine(points: Point[], tolerance: number): Point[] {
-  if (points.length <= 2 || tolerance <= 0) return points.slice();
-  const keep = new Uint8Array(points.length);
-  keep[0] = 1;
-  keep[points.length - 1] = 1;
-  const pending: Array<[number, number]> = [[0, points.length - 1]];
-  while (pending.length > 0) {
-    const [startIndex, endIndex] = pending.pop()!;
-    let greatest = tolerance;
-    let split = -1;
-    for (let index = startIndex + 1; index < endIndex; index += 1) {
-      const distance = pointToSegmentDistance(points[index]!, points[startIndex]!, points[endIndex]!);
-      if (distance > greatest) { greatest = distance; split = index; }
-    }
-    if (split >= 0) {
-      keep[split] = 1;
-      pending.push([startIndex, split], [split, endIndex]);
-    }
-  }
-  return points.filter((_point, index) => keep[index] === 1);
-}
-
 function pointInRing(ring: Point[], x: number, z: number): boolean {
   let inside = false;
   for (let index = 0, previous = ring.length - 1; index < ring.length; previous = index++) {
@@ -363,30 +322,34 @@ function lineLength(geometry: Geometry): number {
 }
 
 function roadRank(feature: MapFeature): number {
-  const ranks: Record<string, number> = { motorway: 0, trunk: 1, primary: 2, secondary: 3, tertiary: 4, residential: 5, unclassified: 6, service: 7, track: 8, path: 9, footway: 9 };
+  const ranks: Record<string, number> = { motorway: 0, trunk: 1, primary: 2, secondary: 3, tertiary: 4, residential: 5, unclassified: 6, service: 7, track: 8, path: 9, footway: 9, cycleway: 9, steps: 9 };
   return ranks[feature.kind === "road" ? feature.roadClass ?? feature.highway ?? "" : ""] ?? 10;
 }
 
+/* LOD0 (2 km tiles, street level and closer) keeps everything. LOD1 (8 km
+   tiles, town level) keeps the road network down to local roads, water,
+   land cover and named places but only the largest buildings, which are
+   sub-pixel at that scale anyway. LOD2 (32 km tiles, department overview)
+   keeps the skeleton: main roads, rivers, forests, communes and towns. */
 function keepAtLod(feature: MapFeature, lod: 0 | 1 | 2): boolean {
   if (lod === 0 || feature.kind === "boundary") return true;
+  if (feature.kind === "place" && feature.placeType === "commune") return true;
   if (lod === 1) {
-    if (feature.kind === "building") return featureArea(feature) >= 25 || feature.name !== undefined;
-    if (feature.kind === "road") return roadRank(feature) <= 5 || feature.name !== undefined;
-    if (feature.kind === "water") return feature.isSurface === true ? featureArea(feature) >= 100 : lineLength(feature.localGeometry ?? feature.geometry) >= 100;
-    if (feature.kind === "poi" || feature.kind === "business") return feature.name !== undefined || feature.businessName !== undefined;
-    if (feature.kind === "landuse") return featureArea(feature) >= 500 || feature.name !== undefined;
-    if (feature.kind === "transport") return feature.transportType !== "parking" || feature.name !== undefined;
-    if (feature.kind === "structure") return featureArea(feature) >= 500 || feature.name !== undefined;
-    if (feature.kind === "place") return (feature.importance ?? 6) <= 5 || feature.name !== undefined;
+    if (feature.kind === "building") return featureArea(feature) >= 1_500;
+    if (feature.kind === "road") return roadRank(feature) <= 7;
+    if (feature.kind === "water") return feature.isSurface === true ? featureArea(feature) >= 400 : lineLength(feature.localGeometry ?? feature.geometry) >= 150;
+    if (feature.kind === "poi" || feature.kind === "business") return feature.name !== undefined;
+    if (feature.kind === "landuse") return featureArea(feature) >= 2_000;
+    if (feature.kind === "transport") return feature.transportType !== "bus_stop" || feature.name !== undefined;
+    if (feature.kind === "structure") return featureArea(feature) >= 1_000;
+    if (feature.kind === "place") return (feature.importance ?? 6) <= 5;
     return false;
   }
-  if (feature.kind === "road") return roadRank(feature) <= 3 || feature.name !== undefined;
-  if (feature.kind === "water") return feature.isSurface === true ? featureArea(feature) >= 1_000 : lineLength(feature.localGeometry ?? feature.geometry) >= 500;
-  if (feature.kind === "poi") return ["city", "town", "village", "municipality", "townhall"].includes(feature.poiType) || feature.category === "townhall";
-  if (feature.kind === "landuse") return feature.name !== undefined && featureArea(feature) >= 1_000;
+  if (feature.kind === "road") return roadRank(feature) <= 4;
+  if (feature.kind === "water") return feature.isSurface === true ? featureArea(feature) >= 20_000 : lineLength(feature.localGeometry ?? feature.geometry) >= 1_500 && (feature.name !== undefined || (feature.width ?? 0) >= 5);
+  if (feature.kind === "landuse") return featureArea(feature) >= 150_000 && ["forest", "wood", "vineyard", "orchard", "reserve", "industrial", "residential"].includes(feature.landuseType);
   if (feature.kind === "place") return (feature.importance ?? 6) <= 3;
   if (feature.kind === "transport") return feature.transportType === "rail" || feature.transportType === "station" || feature.transportType === "aerodrome" || feature.transportType === "runway";
-  if (feature.kind === "building") return feature.name !== undefined;
   return false;
 }
 
@@ -726,7 +689,7 @@ async function writeRenderTile(context: BuildContext, features: MapFeature[], ti
     fs.writeFile(path.join(context.renderDir, `${tile}.mmt.gz`), compressed),
   ]);
   for (const layer of input.layers) {
-    const bytes = layer.positions.byteLength + layer.indices.byteLength + layer.ranges.byteLength;
+    const bytes = layer.vertices.byteLength + layer.indices.byteLength + layer.ranges.byteLength + (layer.edges?.byteLength ?? 0);
     context.layerBytes.set(layer.id, (context.layerBytes.get(layer.id) ?? 0) + bytes);
   }
   return { bytes: payload.byteLength, featureCount: input.meta.length };

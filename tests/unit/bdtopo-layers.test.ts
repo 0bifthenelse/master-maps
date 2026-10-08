@@ -114,7 +114,7 @@ describe("BD TOPO layer to canonical kind mapping", () => {
     if (feature.kind !== "poi") throw new Error("expected poi");
     expect(feature.poiType).toBe("erp:5");
     expect(feature.name).toBe("MAIRIE");
-    expect(feature.category).toBe("Hotel de ville");
+    expect(feature.category).toBe("town_hall");
     expect(feature.sourceMetadata?.publicAccess).toBe(true);
   });
 

@@ -485,7 +485,8 @@ export function deduplicateFeatures(features: MapFeature[], accounting?: DedupAc
       const merged = mergedByKey.get(key) ?? 0;
       const identical = exactIdentities.get(key)?.size ?? 0;
       const metric = Math.max(0, merged - identical);
-      accounting.sources.record(source, layer, kind, input, accepted, { excludedCount: merged, excluded: DROP_REASONS.dedupExactIdentity, reason: "duplicate canonical identity collapsed into the group winner" });
+      /* Merges split into exact identities and metric conflations; each is booked once. */
+      accounting.sources.record(source, layer, kind, input, accepted, { excludedCount: merged - metric, excluded: DROP_REASONS.dedupExactIdentity, reason: "duplicate canonical identity collapsed into the group winner" });
       if (metric > 0) {
         accounting.sources.record(source, layer, kind, 0, 0, { excludedCount: metric, excluded: DROP_REASONS.dedupMetricConflation, reason: "metric conflation collapsed a second source record into the group winner" });
       }
@@ -1029,8 +1030,9 @@ async function runScan(
     const merged = mergedByKey.get(key) ?? 0;
     const identical = exactIdentities.get(key)?.size ?? 0;
     const metric = Math.max(0, merged - identical);
+    /* Merges split into exact identities and metric conflations; each is booked once. */
     accounting.sources.record(source, layer, kind, input, accepted, {
-      excludedCount: merged,
+      excludedCount: merged - metric,
       excluded: DROP_REASONS.dedupExactIdentity,
       reason: "duplicate canonical identity collapsed into the group winner",
     });
@@ -1062,8 +1064,10 @@ async function runScan(
 }
 
 async function writeProvenance(source: string, destination: string): Promise<void> {
-  const reader = readline.createInterface({ input: createReadStream(source), crlfDelay: Infinity });
+  /* Open the destination before the reader: a readline interface that finishes a small file while
+     an await is pending closes before `for await` attaches, and the loop then waits forever. */
   const handle = await fs.open(destination, "w");
+  const reader = readline.createInterface({ input: createReadStream(source), crlfDelay: Infinity });
   let buffer = "[";
   let first = true;
   try {

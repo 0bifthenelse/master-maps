@@ -52,8 +52,7 @@ describe("business source normalization", () => {
     expect(businesses[0]).toMatchObject({
       businessName: "Example Shop",
       legalName: "Example Legal Name",
-      brand: "Example Shop",
-      category: "Retail",
+      category: "beauty",
       nafCode: "47.75Z",
       nafLabel: "Retail",
       address: "1 Rue Source 32000 Auch",
@@ -65,6 +64,29 @@ describe("business source normalization", () => {
     });
     expect(businesses[0].sourceRefs).toContainEqual(expect.objectContaining({ source: "sirene" }));
     expect(businesses[0].sourceRefs[0]?.url).toBe("https://recherche-entreprises.api.gouv.fr/search");
+    expect(businesses[0].brand).toBeUndefined();
+  });
+
+  it("takes the brand from the shop sign only", async () => {
+    const [business] = await normalizeBusinesses(sireneSources([{
+      siret: "12345678901235",
+      legalName: "SAS Distribution Auscitaine",
+      tradingName: "E.Leclerc",
+      signName: "E.Leclerc",
+      nafCode: "47.11F",
+      address: "Route de Toulouse 32000 Auch",
+      coordinate: { lon: 5, lat: 5 },
+      administrativeStatus: "A",
+    }]), boundary);
+    expect(business).toMatchObject({ businessName: "E.Leclerc", brand: "E.Leclerc", category: "supermarket" });
+  });
+
+  it("drops establishments that are not places people visit, and closed ones", async () => {
+    const businesses = await normalizeBusinesses(sireneSources([
+      { siret: "12345678901236", tradingName: "Holding Example", nafCode: "64.20Z", address: "1 Rue Source 32000 Auch", coordinate: { lon: 5, lat: 5 }, administrativeStatus: "A" },
+      { siret: "12345678901237", tradingName: "Closed Bakery", nafCode: "10.71C", address: "2 Rue Source 32000 Auch", coordinate: { lon: 5, lat: 5 }, administrativeStatus: "F" },
+    ]), boundary);
+    expect(businesses).toHaveLength(0);
   });
 });
 
@@ -130,5 +152,16 @@ describe("department wide SIRENE records", () => {
       "business:siret/11111111100011",
       "business:siret/22222222200022",
     ]);
+  });
+});
+
+describe("displayBusinessName", () => {
+  it("title-cases shouted names, drops legal forms, parentheticals and dangling punctuation", async () => {
+    const { displayBusinessName } = await import("../../scripts/data/fetch-businesses");
+    expect(displayBusinessName("SALON DE COIFFURE -")).toBe("Salon de Coiffure");
+    expect(displayBusinessName("CLINIQUE VETERINAIRE (PLACE DU")).toBe("Clinique Veterinaire");
+    expect(displayBusinessName("PHARMACIE DU CENTRE (SELARL)")).toBe("Pharmacie du Centre");
+    expect(displayBusinessName("SARL LES DELICES D'AUCH")).toBe("Les Delices d'Auch");
+    expect(displayBusinessName("Le 8 Pool 32")).toBe("Le 8 Pool 32");
   });
 });

@@ -1,55 +1,89 @@
 import { describe, expect, it } from "vitest";
-import { editDistanceScore, levenshteinBounded, MAX_EDIT_DISTANCE, normalizeSearchText, scoreTerm, tokenizeSearchText } from "@/lib/data/search";
+import {
+  allowedEdits,
+  canonicalHouseNumber,
+  levenshteinBounded,
+  normalizeSearchText,
+  parseSearchQuery,
+  searchTokens,
+  tokenizeSearchText,
+  tokenVariants,
+} from "@/lib/data/search";
 
 describe("normalizeSearchText", () => {
-  it("removes accents from Nocibé", () => {
-    expect(normalizeSearchText("Nocibé")).toBe("nocibe");
+  it("removes accents, lowercases and trims", () => {
+    expect(normalizeSearchText("  Nocibé AUCH ")).toBe("nocibe auch");
   });
 
-  it("lowercases AUCH", () => {
-    expect(normalizeSearchText("AUCH")).toBe("auch");
-  });
-
-  it("trims surrounding whitespace", () => {
-    expect(normalizeSearchText("  Rue Pasteur  ")).toBe("rue pasteur");
+  it("folds ligatures and curly apostrophes", () => {
+    expect(normalizeSearchText("Cœur d’Armagnac")).toBe("coeur d'armagnac");
   });
 });
 
 describe("tokenizeSearchText", () => {
-  it("splits on punctuation and whitespace", () => {
+  it("splits on punctuation, hyphens and apostrophes", () => {
     expect(tokenizeSearchText("Boulevard Sadi-Carnot, Auch")).toEqual(["boulevard", "sadi", "carnot", "auch"]);
+    expect(tokenizeSearchText("Rue d'Alsace")).toEqual(["rue", "d", "alsace"]);
   });
 });
 
-describe("scoreTerm", () => {
-  it("ranks exact above accent-insensitive above prefix above contains", () => {
-    const term = "Cathédrale Sainte-Marie";
-    const normalizedTerm = "cathedrale sainte-marie";
-    const exact = scoreTerm("Cathédrale Sainte-Marie", "cathedrale sainte-marie", term, normalizedTerm);
-    const accent = scoreTerm("Cathedrale Sainte-Marie", "cathedrale sainte-marie", term, normalizedTerm);
-    const prefix = scoreTerm("cathedrale", "cathedrale", term, normalizedTerm);
-    const contains = scoreTerm("marie", "marie", term, normalizedTerm);
-    expect(exact).toEqual({ score: 1000, matchType: "exact" });
-    expect(accent).toEqual({ score: 900, matchType: "accent-insensitive" });
-    expect(prefix).toEqual({ score: 500, matchType: "prefix" });
-    expect(contains).toEqual({ score: 300, matchType: "contains" });
-    expect(exact && accent && prefix && contains).toBeTruthy();
-    expect(exact!.score).toBeGreaterThan(accent!.score);
-    expect(accent!.score).toBeGreaterThan(prefix!.score);
-    expect(prefix!.score).toBeGreaterThan(contains!.score);
+describe("searchTokens", () => {
+  it("treats hyphenated and spaced names alike", () => {
+    expect(searchTokens("Saint-Jean-Poutge")).toEqual(searchTokens("saint jean poutge"));
   });
 
-  it("returns null when no tier matches", () => {
-    expect(scoreTerm("nocire", "nocire", "Rue Pasteur", "rue pasteur")).toBeNull();
+  it("expands the abbreviations people type and sources use", () => {
+    expect(searchTokens("St Clar")).toEqual(["saint", "clar"]);
+    expect(searchTokens("av de la Marne")).toEqual(["avenue", "marne"]);
+    expect(searchTokens("bd Sadi Carnot")).toEqual(["boulevard", "sadi", "carnot"]);
+  });
+
+  it("joins road numbers whatever the spacing", () => {
+    expect(searchTokens("D 930")).toEqual(["d930"]);
+    expect(searchTokens("RN124")).toEqual(["n124"]);
+    expect(searchTokens("N124")).toEqual(["n124"]);
+  });
+
+  it("drops stop words unless nothing else is left", () => {
+    expect(searchTokens("Place de la Libération")).toEqual(["place", "liberation"]);
+    expect(searchTokens("Le")).toEqual(["le"]);
   });
 });
 
-describe("editDistanceScore", () => {
-  it("keeps the fixed tier ladder", () => {
-    expect(MAX_EDIT_DISTANCE).toBe(2);
-    expect(editDistanceScore(0)).toBe(130);
-    expect(editDistanceScore(1)).toBe(120);
-    expect(editDistanceScore(MAX_EDIT_DISTANCE)).toBe(110);
+describe("parseSearchQuery", () => {
+  it("reads a leading house number", () => {
+    const parsed = parseSearchQuery("12 rue Gambetta Auch");
+    expect(parsed.houseNumber).toBe("12");
+    expect(parsed.tokens).toEqual(["rue", "gambetta", "auch"]);
+  });
+
+  it("keeps bis/ter suffixes, spaced or glued", () => {
+    expect(parseSearchQuery("12 bis rue Gambetta").houseNumber).toBe("12 bis");
+    expect(parseSearchQuery("12bis rue Gambetta").houseNumber).toBe("12 bis");
+  });
+
+  it("does not mistake a postcode or a lone number for a house number", () => {
+    expect(parseSearchQuery("32000 Auch").houseNumber).toBeUndefined();
+    expect(parseSearchQuery("124").houseNumber).toBeUndefined();
+  });
+});
+
+describe("canonicalHouseNumber", () => {
+  it("normalises glued suffixes", () => {
+    expect(canonicalHouseNumber("12B")).toBe("12 b");
+    expect(canonicalHouseNumber("3 bis")).toBe("3 bis");
+  });
+});
+
+describe("tokenVariants", () => {
+  it("offers singular and plural forms", () => {
+    expect(tokenVariants("pharmacies")).toContain("pharmacie");
+    expect(tokenVariants("restaurant")).toContain("restaurants");
+    expect(tokenVariants("chateaux")).toContain("chateau");
+  });
+
+  it("leaves numbers alone", () => {
+    expect(tokenVariants("32000")).toEqual([]);
   });
 });
 
@@ -62,5 +96,13 @@ describe("levenshteinBounded", () => {
   it("returns maxDistance + 1 past the bound", () => {
     expect(levenshteinBounded("kartoffel", "nocibe", 2)).toBe(3);
     expect(levenshteinBounded("abc", "nocibe", 2)).toBe(3);
+  });
+});
+
+describe("allowedEdits", () => {
+  it("scales typo tolerance with word length", () => {
+    expect(allowedEdits(3)).toBe(0);
+    expect(allowedEdits(5)).toBe(1);
+    expect(allowedEdits(9)).toBe(2);
   });
 });

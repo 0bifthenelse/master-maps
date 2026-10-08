@@ -4,7 +4,7 @@ import * as path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { normalizeAll } from "./normalize";
-import { deduplicateAll } from "./deduplicate";
+import { createDedupAccounting, deduplicateAll } from "./deduplicate";
 import { buildTilesAll } from "./build-tiles";
 import { buildIndexAll } from "./build-search-index";
 import { validate } from "./validate";
@@ -59,6 +59,10 @@ function createPaths(scope: "gers" | "auch"): RefreshPaths {
 
 interface RefreshOptions {
   offline: boolean;
+  /** Acquire every source into the raw cache and stop before normalization. */
+  fetchOnly?: boolean;
+  /** Reuse the normalized, deduplicated intermediate store and rebuild from the tiles on. */
+  fromTiles?: boolean;
   forceIgn: boolean;
   force: Set<string>;
   scope: "gers" | "auch";
@@ -85,7 +89,7 @@ function parseArgs(args: string[]): RefreshOptions {
   const scopeArgument = args.find((argument) => argument.startsWith("--scope="));
   const scopeValue = scopeArgument?.slice("--scope=".length) ?? "gers";
   if (scopeValue !== "gers" && scopeValue !== "auch") throw new Error(`Unsupported scope "${scopeValue}"`);
-  return { offline: args.includes("--offline"), forceIgn: args.includes("--force-ign"), force, scope: scopeValue };
+  return { offline: args.includes("--offline"), fetchOnly: args.includes("--fetch-only"), fromTiles: args.includes("--from-tiles"), forceIgn: args.includes("--force-ign"), force, scope: scopeValue };
 }
 
 async function ensureDirs(paths: RefreshPaths): Promise<void> {
@@ -476,18 +480,27 @@ export async function refreshAll(options: RefreshOptions = { offline: false, for
   await phaseAddresses(paths, options);
   await phaseBusinesses(paths, options);
   await phaseOptionalIgn(paths, options);
+  if (options.fetchOnly === true) {
+    console.error(`[refresh] sources acquired in ${Math.round((Date.now() - started) / 1000)} s; stopping before normalization (--fetch-only)`);
+    return;
+  }
   const normalizeScope = paths.scope === "auch"
     ? { boundaryRawFile: AUCH_DETAIL_SCOPE.boundaryRawFile, osmExtractFile: AUCH_DETAIL_SCOPE.osmGeojsonFile, bdtopoDir: path.join(paths.rawDir, AUCH_DETAIL_SCOPE.bdtopoOutputDir) }
     : undefined;
   const stageDrops: StageDropAccounting[] = [];
   const stageSink = createStageDropSink(stageDrops);
   const dedupAccounting = createDedupAccounting();
-  await normalizeAll(paths.rawDir, paths.intermediateDir, normalizeScope);
-  await deduplicateAll(paths.intermediateDir, paths.intermediateDir, dedupAccounting);
+  if (options.fromTiles !== true) {
+    await normalizeAll(paths.rawDir, paths.intermediateDir, normalizeScope);
+    await deduplicateAll(paths.intermediateDir, paths.intermediateDir, dedupAccounting);
+  }
   await buildTilesAll(paths.intermediateDir, paths.tilesDir);
   await buildIndexAll(paths.tilesDir, paths.searchDir);
-  const exclusionReport = await buildPipelineReport({ sources: dedupAccounting.sources, stageDrops, dataRoot: DATA_ROOT });
-  await writeExclusionReport(exclusionReport, defaultExclusionReportPath(DATA_ROOT));
+  /* A resumed build has no normalisation accounting; keep the last full report. */
+  if (options.fromTiles !== true) {
+    const exclusionReport = await buildPipelineReport({ sources: dedupAccounting.sources, stageDrops, dataRoot: DATA_ROOT });
+    await writeExclusionReport(exclusionReport, defaultExclusionReportPath(DATA_ROOT));
+  }
   await writeSourceManifest(paths);
   await writeCoverageReport(paths);
   await writeGenerationManifest(paths);
@@ -497,7 +510,7 @@ export async function refreshAll(options: RefreshOptions = { offline: false, for
 }
 
 if (process.argv[1]?.endsWith("refresh.ts")) {
-  if (process.argv.includes("--help") || process.argv.includes("-h")) console.log("Usage: tsx scripts/data/refresh.ts [--offline] [--force-ign] [--force=<source[,source]>] [--scope=auch]");
+  if (process.argv.includes("--help") || process.argv.includes("-h")) console.log("Usage: tsx scripts/data/refresh.ts [--offline] [--fetch-only] [--from-tiles] [--force-ign] [--force=<source[,source]>] [--scope=auch]");
   else refreshAll(parseArgs(process.argv.slice(2))).catch((error: unknown) => {
     console.error("[refresh] Fatal:", error);
     process.exit(1);

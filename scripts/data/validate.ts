@@ -15,7 +15,8 @@ import {
 import { GERS_TERRITORY } from "../../src/lib/data/territory";
 import { reconcileCoverage, readExclusionReport, type CoverageReconciliation, type ExclusionReport } from "./exclusion-report";
 import { createBoundaryIndex, type BoundaryIndex } from "./boundaryIndex";
-import { decodeRenderTile, renderLayerIndices, renderLayerPositions, renderLayerRanges, type DecodedRenderTile } from "../../src/lib/render/codec";
+import { BOUNDARY_TILE_ID } from "./build-tiles";
+import { RANGE_STRIDE, RENDER_LAYER_KINDS, decodeRenderTile, renderLayerIndices, renderLayerRanges, renderLayerVertices, type DecodedRenderTile } from "../../src/lib/render/codec";
 
 const MAX_HEIGHT_METRES = 100;
 const MAX_TILE_BYTES = 2 * 1024 * 1024;
@@ -69,13 +70,20 @@ function parseArgs(args: string[]): ValidateOptions {
   return { generatedDir, coverageOnly };
 }
 
+/** About a metre in degrees: roads and streams that are the border itself carry anchors on the line. */
+const BORDER_TOLERANCE_DEGREES = 1e-5;
+
+function onBorder(lon: number, lat: number, boundaryIndex: BoundaryIndex): boolean {
+  const d = BORDER_TOLERANCE_DEGREES;
+  return boundaryIndex.touches([[lon - d, lat], [lon + d, lat]]) || boundaryIndex.touches([[lon, lat - d], [lon, lat + d]]);
+}
 
 function coordinateIssues(feature: TileMetaFeature, boundaryIndex: BoundaryIndex): ValidationIssue[] {
   const issues: ValidationIssue[] = [];
   const featureId = feature.stableId;
   if (feature.lon === undefined || feature.lat === undefined || !Number.isFinite(feature.lon) || !Number.isFinite(feature.lat)) {
     issues.push({ severity: "error", message: "feature has no finite WGS84 anchor", featureId });
-  } else if (!boundaryIndex.contains([feature.lon, feature.lat]) && feature.kind !== "boundary") {
+  } else if (feature.kind !== "boundary" && !boundaryIndex.contains([feature.lon, feature.lat]) && !onBorder(feature.lon, feature.lat, boundaryIndex)) {
     issues.push({ severity: "error", message: "feature anchor lies outside the Gers boundary", featureId });
   }
   if (feature.x === undefined || feature.z === undefined || !Number.isFinite(feature.x) || !Number.isFinite(feature.z)) {
@@ -129,25 +137,28 @@ function renderStructureIssues(manifest: TileManifest, decoded: DecodedRenderTil
   if (decoded.header.lod !== manifest.lod) issues.push({ severity: "error", message: `render tile LOD ${decoded.header.lod} disagrees with the manifest LOD ${manifest.lod}`, tileId });
   if (decoded.header.bounds.some((value, position) => Math.abs(value - manifest.bounds[position]!) > 1e-6)) issues.push({ severity: "error", message: "render tile bounds disagree with the manifest bounds", tileId });
   for (const layer of decoded.layers) {
-    const positions = renderLayerPositions(decoded.payload, layer);
+    const vertices = renderLayerVertices(decoded.payload, layer);
     const indices = renderLayerIndices(decoded.payload, layer);
     const ranges = renderLayerRanges(decoded.payload, layer);
-    if (positions.length % 3 !== 0) issues.push({ severity: "error", message: `layer ${layer.id} vertex count is not a multiple of three`, tileId });
+    const vertexCount = vertices.length / layer.stride;
+    if (!Number.isInteger(vertexCount)) issues.push({ severity: "error", message: `layer ${layer.id} vertex data is not a whole number of vertices`, tileId });
     for (let vertex = 0; vertex < indices.length; vertex += 1) {
-      if (indices[vertex]! >= positions.length / 3) {
+      if (indices[vertex]! >= vertexCount) {
         issues.push({ severity: "error", message: `layer ${layer.id} index ${indices[vertex]} exceeds the vertex count`, tileId });
         break;
       }
     }
-    for (let vertex = 0; vertex < positions.length; vertex += 3) {
-      const x = positions[vertex]!;
-      const z = positions[vertex + 2]!;
-      if (!Number.isFinite(x) || !Number.isFinite(z) || x < manifest.bounds[0] || x > manifest.bounds[2] || z < manifest.bounds[1] || z > manifest.bounds[3]) {
+    /* Line vertices are centrelines that may bleed a road's width past the tile edge. */
+    const slack = RENDER_LAYER_KINDS[layer.id] === "line" ? 60 : 1e-3;
+    for (let vertex = 0; vertex < vertices.length; vertex += layer.stride) {
+      const x = vertices[vertex]!;
+      const z = vertices[vertex + 2]!;
+      if (!Number.isFinite(x) || !Number.isFinite(z) || x < manifest.bounds[0] - slack || x > manifest.bounds[2] + slack || z < manifest.bounds[1] - slack || z > manifest.bounds[3] + slack) {
         issues.push({ severity: "error", message: `layer ${layer.id} vertex lies outside the tile bounds`, tileId });
         break;
       }
     }
-    for (let entry = 0; entry < ranges.length; entry += 3) {
+    for (let entry = 0; entry < ranges.length; entry += RANGE_STRIDE) {
       const indexStart = ranges[entry]!;
       const indexCount = ranges[entry + 1]!;
       const metaIndex = ranges[entry + 2]!;
@@ -196,7 +207,8 @@ async function renderTileIssues(generatedDir: string, manifests: TileManifest[])
 function fictiveFlagIssues(features: TileMetaFeature[]): ValidationIssue[] {
   const issues: ValidationIssue[] = [];
   for (const feature of features) {
-    if (feature.kind !== "water" && feature.kind !== "road") continue;
+    /* Only water carries the flag: fictive road segments are simply not drawn. */
+    if (feature.kind !== "water") continue;
     const sourceFlag = (feature.sourceMetadata as Record<string, unknown> | undefined)?.[FICTIVE_SOURCE_METADATA_FLAG];
     if (sourceFlag === true && feature.fictiveAxis !== true) {
       issues.push({ severity: "error", message: `source marks the record as ${FICTIVE_SOURCE_METADATA_FLAG} but the canonical record lacks the fictiveAxis flag`, featureId: feature.stableId });
@@ -309,6 +321,11 @@ async function loadTiles(generatedDir: string): Promise<{ features: TileMetaFeat
   for (const entry of entries) {
     if (!entry.isFile() || !entry.name.endsWith(".json.gz")) continue;
     const tileId = entry.name.slice(0, -".json.gz".length);
+    if (tileId === BOUNDARY_TILE_ID) {
+      /* The territory outline lives outside the LOD grid: it has no manifest row, only its own sidecar and render tile. */
+      for (const feature of await loadMetaFeatures(metaDir, tileId, issues)) featuresById.set(feature.stableId, { lod: -1, feature });
+      continue;
+    }
     const tile = manifestById.get(tileId);
     if (!tile) {
       issues.push({ severity: "error", message: "meta sidecar has no manifest entry", tileId });

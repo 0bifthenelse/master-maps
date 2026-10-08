@@ -32,6 +32,20 @@ describe("adopted OSM tag taxonomy", () => {
     expect(result.report.droppedByReason.unclassified_tags).toBe(0);
   });
 
+  it("leaves the public road network to BD TOPO when the pipeline asks it to", () => {
+    const classes = ["primary", "residential", "unclassified", "service", "track", "footway", "cycleway", "steps"];
+    const result = normalizeOsmBulkWithReport(classes.map((highway, index) => ({ id: `way/${index}`, geometry: line, properties: { highway } })), undefined, {
+      sourceName: "osm-bulk",
+      sourceUrl: "https://download.openstreetmap.fr/extracts/europe/france/midi_pyrenees/gers-latest.osm.pbf",
+      stableIdPrefix: "osm-bulk:",
+      priority: 60,
+      retention: "complete",
+      roadNetworkFromBdtopo: true,
+    });
+    expect(result.features.map((feature) => (feature.kind === "road" ? feature.roadClass : null))).toEqual(["service", "track", "footway", "cycleway", "steps"]);
+    expect(result.report.droppedByReason.excluded_tag).toBe(3);
+  });
+
   it("maps railway lines to transport rail and stations to transport points", () => {
     const result = run([
       { id: "way/1", geometry: line, properties: { railway: "rail", name: "Ligne d'Auch" } },
