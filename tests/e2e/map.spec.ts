@@ -6,6 +6,9 @@ test.describe("WebGL map", () => {
     await openMap(page);
     expect(["webgl", "webgl2"]).toContain(await diagnostic(page, "backend"));
     await expect(page.locator("nextjs-portal")).toHaveCount(0);
+    /* The first visit after a server start streams its tiles cold: capture once they have landed. */
+    await page.waitForLoadState("networkidle").catch(() => undefined);
+    await settle(page);
     const path = `${ARTIFACTS_DIR}/render-overview.png`;
     await page.locator(".mm-stage").screenshot({ path });
     expect(checkPngNotBlank(path).notBlank).toBe(true);

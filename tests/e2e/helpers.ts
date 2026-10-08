@@ -58,3 +58,21 @@ export async function stageBox(page: Page): Promise<{ x: number; y: number; widt
   if (box === null) throw new Error("map stage not laid out");
   return box;
 }
+
+/** Wait until the loaded tile count holds steady: the view has streamed in (software WebGL is slow). */
+export async function tilesSettled(page: Page, quietMs = 3000, timeoutMs = 120_000): Promise<number> {
+  const started = Date.now();
+  let count = -1;
+  let since = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    await page.waitForTimeout(500);
+    const current = Number(await diagnostic(page, "loaded-tile-count"));
+    if (current !== count) {
+      count = current;
+      since = Date.now();
+    } else if (Date.now() - since >= quietMs) {
+      return count;
+    }
+  }
+  return count;
+}

@@ -1,6 +1,6 @@
 import { mkdirSync } from "node:fs";
 import { test, expect, checkPngNotBlank } from "./fixtures";
-import { openMap, settle, viewHash } from "./helpers";
+import { openMap, settle, tilesSettled, viewHash } from "./helpers";
 
 /** Reference captures of the main views, written to docs/media for the README. */
 const OUT = process.env.SCREENSHOT_DIR ?? "tests/artifacts/screens";
@@ -24,6 +24,7 @@ for (const view of VIEWS) {
     }
     await page.waitForLoadState("networkidle").catch(() => undefined);
     await settle(page);
+    await tilesSettled(page);
     await page.waitForTimeout(800);
     const path = `${OUT}/${view.name}.png`;
     await page.screenshot({ path });
