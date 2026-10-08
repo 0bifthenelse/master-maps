@@ -39,7 +39,7 @@ export const BD_TOPO_LAYERS = [
   { name: "uninhabited-places", layer: "lieu_dit_non_habite", output: "bdtopo-uninhabited-places.geojson", adoption: "search" },
   { name: "public-forests", layer: "foret_publique", output: "bdtopo-public-forests.geojson", adoption: "search" },
   { name: "activity-areas", layer: "zone_d_activite_ou_d_interet", output: "bdtopo-activity-areas.geojson", adoption: "render" },
-  { name: "communes", layer: "commune", output: "bdtopo-communes.geojson", adoption: "render" },
+  { name: "communes", layer: "commune", output: "bdtopo-communes.geojson", adoption: "render", filter: "code_insee_du_departement = '32'" },
   { name: "reference-points", layer: "point_de_repere", output: "bdtopo-reference-points.geojson", adoption: "search" },
   { name: "toponymy", layer: "toponymie", output: "bdtopo-toponymy.geojson", adoption: "search" },
   { name: "vegetation", layer: "zone_de_vegetation", output: "bdtopo-vegetation.geojson", adoption: "render", filter: `nature IN (${VEGETATION_NATURES}) AND ST_Area(geometrie) >= ${VEGETATION_MIN_AREA_SQM}` },

@@ -297,6 +297,8 @@ export async function acquireJson(options: {
   maxBytes?: number;
   forceRefresh?: boolean;
   signal?: AbortSignal;
+  /** Runs only on a cache miss, before the request (e.g. a rate limiter). */
+  beforeNetwork?: () => Promise<void>;
 }): Promise<{
   body: string;
   sha256: string;
@@ -335,6 +337,7 @@ export async function acquireJson(options: {
       rateLimitCount: 0,
     };
   }
+  await options.beforeNetwork?.();
   const stats: RequestStats = { requestCount: 0, retryCount: 0, rateLimitCount: 0 };
   const init: RequestInit = { method, headers: options.headers, signal: options.signal };
   if (method === "POST") init.body = requestBody;
