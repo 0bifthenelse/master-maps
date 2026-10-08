@@ -117,21 +117,15 @@ async function selectMaster(page: Page, view: View): Promise<{ record: SearchRec
   return { record, manifest: await readManifest(page), zoom: camera.zoom ?? 1 };
 }
 
-function osmZoom(manifest: Manifest, zoom: number, latitude: number): number {
-  const worldWidth = manifest.bounds[2] - manifest.bounds[0];
-  const worldHeight = manifest.bounds[3] - manifest.bounds[1];
-  const aspect = VIEWPORT.width / VIEWPORT.height;
-  const frustumWidth = worldWidth / worldHeight > aspect ? worldWidth * 1.15 : worldHeight * aspect * 1.15;
-  const groundWidth = frustumWidth / Math.max(zoom, 1e-6);
-  const metresPerPixel = groundWidth / VIEWPORT.width;
-  const equatorResolution = 156543.03392804097 * Math.cos(latitude * Math.PI / 180);
-  return Math.max(1, Math.min(19, Math.round(Math.log2(equatorResolution / metresPerPixel))));
+/** The map's zoom follows the web-map scale at the Gers' latitude, so OSM opens at the same zoom. */
+function osmZoom(zoom: number): number {
+  return Math.max(1, Math.min(19, Math.round(zoom)));
 }
 
 async function capturePair(page: Page, view: View, consoleErrors: string[], pageErrors: string[]): Promise<Record<string, unknown>> {
   const master = await selectMaster(page, view);
   await page.screenshot({ path: resolve(ARTIFACTS_DIR, `${view.slug}-master.png`) });
-  const selectedZoom = osmZoom(master.manifest, master.zoom, view.coordinate[1]);
+  const selectedZoom = osmZoom(master.zoom);
   const osmUrl = `https://www.openstreetmap.org/#map=${selectedZoom}/${view.coordinate[1]}/${view.coordinate[0]}`;
   await page.goto(osmUrl, { waitUntil: "domcontentloaded", timeout: 30_000 });
   await sleep(3000);

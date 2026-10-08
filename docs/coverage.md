@@ -8,7 +8,7 @@ IGN Admin Express COG supplies the department MultiPolygon in EPSG:4326. The nor
 
 IGN BD TOPO supplies canonical `batiment`, `troncon_de_route`, `surface_hydrographique`, and `troncon_hydrographique` records. LOD0 detailed tiles retain source geometry. LOD1 and LOD2 filter subpixel detail and simplify only their local geometry.
 
-Geofabrik OSM enrichment supplies paths and named semantic POIs. SIRENE supplies department business identity. Source references and property provenance remain on every canonical feature.
+OpenStreetMap supplies service roads, paths, and named shops, amenities and landmarks with their details. SIRENE supplies department business identity, merged with the OSM place when both describe the same shop. Source references and property provenance remain on every canonical feature.
 
 `data/qa/coverage-report.json` samples the department on an 8 by 8 grid. Its report records 32 grid cells intersecting the department and every adopted kind present in all 32 cells, except transport with 31.
 
@@ -24,7 +24,7 @@ The integration suite resolves generated search records and source-backed anchor
 
 `data/qa/scene-geometry-debug.json` contains bounded snapshots from the real Three.js building, road, and water builders. `data/generated/tile-metrics.json` contains per-LOD maximum, median, and p95 payload sizes, split between the render payload and the metadata sidecar.
 
-`npm run verify:chrome` runs `scripts/chrome/run-verification.ts`, which checks WebGPU adapter creation, renderer initialization, draw calls, visible counts, console errors, page errors, and screenshots. Its last recorded result is `data/qa/runtime-verification.json`. `npm run test:e2e` runs `scripts/moli/run-e2e.ts`, which checks browser requests, search, pan, zoom, reset, keyboard directions, and stale-request aborts. `npm run compare:osm` runs `scripts/chrome/compare-osm.ts`, which captures equal-viewport Master Maps and current OpenStreetMap reference pairs.
+`npm run test:e2e` runs `scripts/moli/run-e2e.ts`, which runs the Playwright specs for rendering, navigation and search against the production server. `npm run qa:benchmark` writes `docs/coverage-benchmark.md`. `npm run compare:osm` runs `scripts/chrome/compare-osm.ts`, which captures equal-viewport Master Maps and current OpenStreetMap reference pairs.
 
 ## Coverage limits
 

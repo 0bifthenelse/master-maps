@@ -12,7 +12,6 @@
     "test:unit": "vitest run tests/unit tests/visual",
     "test:integration": "vitest run tests/integration",
     "test:e2e": "tsx scripts/moli/run-e2e.ts",
-    "verify:chrome": "tsx scripts/chrome/run-verification.ts",
     "compare:osm": "tsx scripts/chrome/compare-osm.ts",
     "data": "NODE_OPTIONS=--max-old-space-size=12288 tsx scripts/data/refresh.ts",
     "data:refresh": "NODE_OPTIONS=--max-old-space-size=12288 tsx scripts/data/refresh.ts",
