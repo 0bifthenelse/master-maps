@@ -73,6 +73,14 @@ describe("SearchEngine: businesses and categories", () => {
     expect(engine.search("pharmacy", { limit: 5, near: AUCH })[0]?.matchType).toBe("category");
   });
 
+  it("favours the named kind of place in a longer query", () => {
+    expect(top("hopital auch")).toBe("ch-auch");
+  });
+
+  it("lists stations for 'gare', not hamlets that happen to be called la Gare", () => {
+    expect(top("gare", CONDOM)).toBe("gare-auch");
+  });
+
   it("puts a brand ahead of its category", () => {
     expect(top("leclerc", CONDOM)).toBe("leclerc-auch");
   });

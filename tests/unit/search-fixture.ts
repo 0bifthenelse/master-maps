@@ -48,6 +48,10 @@ export const FIXTURE_RECORDS: SearchRecord[] = [
   record({ featureId: "nocibe-auch", canonicalName: "Nocibé", kind: "business", category: "beauty", boost: 70, context: "Auch", commune: "Auch", ...at(AUCH, 160, 40) }),
   record({ featureId: "cathedrale-sainte-marie", canonicalName: "Cathédrale Sainte-Marie", kind: "poi", category: "place_of_worship", boost: 100, context: "Auch", commune: "Auch", ...at(AUCH, 50, 120) }),
   record({ featureId: "tour-armagnac", canonicalName: "Tour d'Armagnac", kind: "poi", category: "castle", boost: 100, aliases: ["Prison de l'Évêché"], context: "Auch", commune: "Auch", ...at(AUCH, 60, 140) }),
+  record({ featureId: "gare-auch", canonicalName: "Gare d'Auch", kind: "transport", category: "train_station", boost: 110, context: "Auch", commune: "Auch", ...at(AUCH, 1300, 400) }),
+  record({ featureId: "hamlet-la-gare", canonicalName: "La Gare", kind: "place", category: "hamlet", boost: 66, context: "Hamlet · Condom", commune: "Condom", ...at(CONDOM, 2000, 1000) }),
+  record({ featureId: "bus-hopital", canonicalName: "Hôpital", kind: "transport", category: "bus_stop", boost: 25, context: "Auch", commune: "Auch", ...at(AUCH, 600, -800) }),
+  record({ featureId: "ch-auch", canonicalName: "Centre Hospitalier d'Auch", kind: "poi", category: "hospital", boost: 115, context: "Auch", commune: "Auch", ...at(AUCH, 650, -820) }),
   record({ featureId: "river-baise", canonicalName: "La Baïse", kind: "water", category: "river", boost: 90, context: "88 km · 30 communes", ...at(CONDOM, 500, 0), bbox: [-35000, -40000, -20000, 40000] }),
 ];
 

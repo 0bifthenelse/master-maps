@@ -36,6 +36,8 @@ const PROXIMITY_BONUS = 180;
 const PROXIMITY_SCALE_KM = 15;
 const DUPLICATE_RADIUS_METRES = 150;
 const MISS_PENALTY = 380;
+/** Lift for records of the category a longer query names. */
+const CATEGORY_MATCH_BONUS = 240;
 /** Below this share of a category carrying the query word in its names, the word is a brand, not a generic term. */
 const BRAND_SHARE = 0.3;
 
@@ -393,6 +395,16 @@ export class SearchEngine {
 
     const browse = parsed.houseNumber === undefined ? this.categoryBrowse(parsed.words) : null;
     if (browse !== null) candidates = this.mergeCategory(candidates, browse, near);
+    else {
+      /* "hopital auch", "piscine condom": a category word in a longer query favours places of that kind. */
+      const wanted = this.namedCategories(parsed.words);
+      if (wanted.size > 0) {
+        for (const candidate of candidates) {
+          const category = this.records[candidate.record]!.category;
+          if (category !== undefined && wanted.has(category)) candidate.score += CATEGORY_MATCH_BONUS;
+        }
+      }
+    }
 
     /* Nothing matched every word: allow one word to miss (an extra word, a wrong commune). */
     if (candidates.length === 0 && parsed.tokens.length >= 2 && browse === null) {
@@ -408,6 +420,12 @@ export class SearchEngine {
     }
 
     return this.finish(candidates, limit);
+  }
+
+  private namedCategories(words: readonly string[]): Set<string> {
+    const categories = new Set<string>();
+    for (const intent of categoryIntents(words)) for (const id of categoryFamily(intent.category)) categories.add(id);
+    return categories;
   }
 
   /** Categories a query names and nothing else ("pharmacies", "gare", "boulangerie"). */
@@ -437,7 +455,8 @@ export class SearchEngine {
       if (candidate.named !== true) continue;
       named.add(candidate.record);
       const record = this.records[candidate.record]!;
-      if (candidate.exact === true && (record.category === undefined || !categories.has(record.category))) {
+      /* Only a commune outranks the category it is named like ("Bars"); hamlets called "la Gare" do not. */
+      if (candidate.exact === true && record.category === "commune" && !categories.has(record.category)) {
         merged.set(candidate.record, { ...candidate, score: 4000 + record.boost });
       }
     }

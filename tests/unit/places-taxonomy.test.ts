@@ -28,6 +28,11 @@ describe("category taxonomy", () => {
     expect(categoryIntents(["auch"])).toEqual([]);
   });
 
+  it("prefers whole words to prefixes and still completes a word being typed", () => {
+    expect(categoryIntents(["gare"])[0]?.category).toBe("train_station");
+    expect(categoryIntents(["restau"])[0]?.category).toBe("restaurant");
+  });
+
   it("widens chips to their neighbouring categories", () => {
     expect(categoryFamily("bank")).toEqual(["bank", "atm"]);
     expect(categoryFamily("pharmacy")).toEqual(["pharmacy"]);

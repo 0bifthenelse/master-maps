@@ -517,21 +517,25 @@ export interface CategoryIntent {
 export function categoryIntents(tokens: readonly string[]): CategoryIntent[] {
   const found: CategoryIntent[] = [];
   const used = new Set<number>();
-  for (const entry of terms()) {
-    for (let start = 0; start + entry.tokens.length <= tokens.length; start += 1) {
-      let matches = true;
-      for (let offset = 0; offset < entry.tokens.length; offset += 1) {
-        const token = tokens[start + offset]!;
-        const term = entry.tokens[offset]!;
-        if (used.has(start + offset)) { matches = false; break; }
-        const last = start + offset === tokens.length - 1;
-        /* Plural and prefix tolerance: "pharmacies", "restau" while typing. */
-        if (!(token === term || token === `${term}s` || `${token}s` === term || (last && token.length >= 4 && term.startsWith(token)))) { matches = false; break; }
+  /* Whole words first, so "gare" means a station before it is read as the start of "garer". */
+  for (const allowPrefix of [false, true]) {
+    for (const entry of terms()) {
+      for (let start = 0; start + entry.tokens.length <= tokens.length; start += 1) {
+        let matches = true;
+        for (let offset = 0; offset < entry.tokens.length; offset += 1) {
+          const token = tokens[start + offset]!;
+          const term = entry.tokens[offset]!;
+          if (used.has(start + offset)) { matches = false; break; }
+          const last = start + offset === tokens.length - 1;
+          /* Plural tolerance ("pharmacies"), and while typing a prefix of the last word ("restau"). */
+          const whole = token === term || token === `${term}s` || `${token}s` === term;
+          if (!(whole || (allowPrefix && last && token.length >= 4 && term.startsWith(token)))) { matches = false; break; }
+        }
+        if (!matches) continue;
+        const consumed = entry.tokens.map((_, offset) => start + offset);
+        for (const index of consumed) used.add(index);
+        if (!found.some((intent) => intent.category === entry.category)) found.push({ category: entry.category, consumed });
       }
-      if (!matches) continue;
-      const consumed = entry.tokens.map((_, offset) => start + offset);
-      for (const index of consumed) used.add(index);
-      if (!found.some((intent) => intent.category === entry.category)) found.push({ category: entry.category, consumed });
     }
   }
   return found;

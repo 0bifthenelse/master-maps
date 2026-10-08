@@ -361,6 +361,12 @@ const TRANSPORT_BOOST: Readonly<Record<string, number>> = {
 
 const LANDMARK_GROUPS = new Set(["landmark", "culture", "religion"]);
 
+/** Transport types expressed in the shared category taxonomy, so "gare" or "bus" find them. */
+const TRANSPORT_CATEGORY: Readonly<Record<string, string>> = {
+  station: "train_station", halt: "train_station", bus_stop: "bus_stop", bus_station: "bus_stop", platform: "bus_stop", stop_position: "bus_stop",
+  aerodrome: "airport", airport: "airport", parking: "parking",
+};
+
 function placeBoost(feature: Extract<MapFeature, { kind: "place" }>): number {
   if (feature.placeType === "commune") {
     const population = feature.population ?? 0;
@@ -685,7 +691,7 @@ export function buildSearchIndex(features: MapFeature[], tiles: Map<string, stri
         if (name === undefined) break;
         const category = feature.publicTransport ?? feature.transportType;
         drafts.push({
-          featureId: feature.stableId, name: displayCase(name), kind: "transport", category: feature.transportType === "station" || category === "station" ? "station" : category,
+          featureId: feature.stableId, name: displayCase(name), kind: "transport", category: TRANSPORT_CATEGORY[feature.transportType] ?? TRANSPORT_CATEGORY[category] ?? category,
           aliases: new Set([name, ...feature.names]), context: commune?.name ?? "", ...(commune === undefined ? {} : { commune: commune.name }),
           ...(feature.ref === undefined ? {} : { ref: feature.ref }), anchor, boost: TRANSPORT_BOOST[feature.transportType] ?? TRANSPORT_BOOST[category] ?? 15, richness: 6,
         });

@@ -76,8 +76,8 @@ describe("buildSearchIndex place and transport coverage", () => {
     expect(byId("place-hameau").category).toBe("lieu_dit_non_habite");
   });
 
-  it("exposes the transport classification as the record category", () => {
-    expect(byId("transport-gare").category).toBe("station");
+  it("expresses transport types in the shared category taxonomy", () => {
+    expect(byId("transport-gare").category).toBe("train_station");
     expect(byId("transport-bus").category).toBe("bus_stop");
   });
 
