@@ -37,6 +37,9 @@ const PROXIMITY_SCALE_KM = 15;
 const DUPLICATE_RADIUS_METRES = 150;
 const MISS_PENALTY = 380;
 /** Lift for records of the category a longer query names. */
+/** Lifts the road carrying a number queried on its own above places merely named after it. */
+const ROAD_NUMBER_BONUS = 600;
+const ROAD_NUMBER = /^[adne]\d{1,4}[a-z]?$/;
 const CATEGORY_MATCH_BONUS = 240;
 /** Below this share of a category carrying the query word in its names, the word is a brand, not a generic term. */
 const BRAND_SHARE = 0.3;
@@ -394,7 +397,7 @@ export class SearchEngine {
     }
 
     const browse = parsed.houseNumber === undefined ? this.categoryBrowse(parsed.words) : null;
-    if (browse !== null) candidates = this.mergeCategory(candidates, browse, near);
+    if (browse !== null) candidates = this.mergeCategory(candidates, browse, near, parsed.words.filter((word) => !isStopWord(word)).length);
     else {
       /* "hopital auch", "piscine condom": a category word in a longer query favours places of that kind. */
       const wanted = this.namedCategories(parsed.words);
@@ -403,6 +406,15 @@ export class SearchEngine {
           const category = this.records[candidate.record]!.category;
           if (category !== undefined && wanted.has(category)) candidate.score += CATEGORY_MATCH_BONUS;
         }
+      }
+    }
+
+    /* "N124", "D 930": a road number means the road that carries it, before a shop named after it. */
+    if (parsed.tokens.length === 1 && ROAD_NUMBER.test(parsed.tokens[0]!)) {
+      const wanted = parsed.tokens[0]!.toUpperCase();
+      for (const candidate of candidates) {
+        const record = this.records[candidate.record]!;
+        if (record.kind === "road" && record.ref?.split(/[;,]/).some((ref) => ref.trim().toUpperCase() === wanted) === true) candidate.score += ROAD_NUMBER_BONUS;
       }
     }
 
@@ -448,15 +460,16 @@ export class SearchEngine {
    * as "leclerc" rather than the generic "pharmacie" most pharmacies carry —
    * the places named that way come first.
    */
-  private mergeCategory(textual: Candidate[], categories: Set<string>, near: LocalPoint | undefined): Candidate[] {
+  private mergeCategory(textual: Candidate[], categories: Set<string>, near: LocalPoint | undefined, wordCount: number): Candidate[] {
     const merged = new Map<number, Candidate>();
     const named = new Set<number>();
     for (const candidate of textual) {
       if (candidate.named !== true) continue;
       named.add(candidate.record);
       const record = this.records[candidate.record]!;
-      /* Only a commune outranks the category it is named like ("Bars"); hamlets called "la Gare" do not. */
-      if (candidate.exact === true && record.category === "commune" && !categories.has(record.category)) {
+      /* A commune outranks the category it is named like ("Bars"), and so does a place whose whole
+         name is a longer query ("Tour d'Armagnac" is not a castle browse); hamlets called "la Gare" do not. */
+      if (candidate.exact === true && (record.category === "commune" || wordCount >= 2) && !categories.has(record.category ?? "")) {
         merged.set(candidate.record, { ...candidate, score: 4000 + record.boost });
       }
     }

@@ -54,6 +54,12 @@ describe("SearchEngine: streets and addresses", () => {
     expect(top("rn124")).toBe("route-n124");
   });
 
+  it("puts the road carrying a number ahead of a place named after it", () => {
+    expect(top("N124")).toBe("route-n124");
+    expect(top("N21")).toBe("route-d1021");
+    expect(top("rn 21")).toBe("route-d1021");
+  });
+
   it("finds a street by its road number and commune", () => {
     expect(ids("n124 auch")).toContain("street-marne");
   });
@@ -75,6 +81,12 @@ describe("SearchEngine: businesses and categories", () => {
 
   it("favours the named kind of place in a longer query", () => {
     expect(top("hopital auch")).toBe("ch-auch");
+  });
+
+  it("puts a place whose whole name is the query ahead of the categories its words name", () => {
+    /* "tour" names castles and "armagnac" wineries, yet the query is a landmark's name. */
+    expect(top("tour d'armagnac", CONDOM)).toBe("tour-armagnac");
+    expect(ids("chateau", CONDOM)).toContain("chateau-lavardens");
   });
 
   it("lists stations for 'gare', not hamlets that happen to be called la Gare", () => {

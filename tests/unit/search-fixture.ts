@@ -47,11 +47,15 @@ export const FIXTURE_RECORDS: SearchRecord[] = [
   record({ featureId: "boulangerie-dupont", canonicalName: "Boulangerie Dupont", kind: "business", category: "bakery", boost: 66, context: "Rue Dessoles, Auch", commune: "Auch", street: "Rue Dessoles", ...at(AUCH, 150, 150) }),
   record({ featureId: "nocibe-auch", canonicalName: "Nocibé", kind: "business", category: "beauty", boost: 70, context: "Auch", commune: "Auch", ...at(AUCH, 160, 40) }),
   record({ featureId: "cathedrale-sainte-marie", canonicalName: "Cathédrale Sainte-Marie", kind: "poi", category: "place_of_worship", boost: 100, context: "Auch", commune: "Auch", ...at(AUCH, 50, 120) }),
-  record({ featureId: "tour-armagnac", canonicalName: "Tour d'Armagnac", kind: "poi", category: "castle", boost: 100, aliases: ["Prison de l'Évêché"], context: "Auch", commune: "Auch", ...at(AUCH, 60, 140) }),
+  record({ featureId: "tour-armagnac", canonicalName: "Tour d'Armagnac", kind: "poi", category: "attraction", boost: 100, aliases: ["Prison de l'Évêché"], context: "Auch", commune: "Auch", ...at(AUCH, 60, 140) }),
   record({ featureId: "gare-auch", canonicalName: "Gare d'Auch", kind: "transport", category: "train_station", boost: 110, context: "Auch", commune: "Auch", ...at(AUCH, 1300, 400) }),
   record({ featureId: "hamlet-la-gare", canonicalName: "La Gare", kind: "place", category: "hamlet", boost: 66, context: "Hamlet · Condom", commune: "Condom", ...at(CONDOM, 2000, 1000) }),
   record({ featureId: "bus-hopital", canonicalName: "Hôpital", kind: "transport", category: "bus_stop", boost: 25, context: "Auch", commune: "Auch", ...at(AUCH, 600, -800) }),
   record({ featureId: "ch-auch", canonicalName: "Centre Hospitalier d'Auch", kind: "poi", category: "hospital", boost: 115, context: "Auch", commune: "Auch", ...at(AUCH, 650, -820) }),
+  record({ featureId: "chateau-lavardens", canonicalName: "Château de Lavardens", kind: "poi", category: "castle", boost: 100, context: "Lavardens", commune: "Lavardens", ...at(AUCH, -9000, 12000) }),
+  record({ featureId: "domaine-armagnac", canonicalName: "Domaine d'Armagnac", kind: "business", category: "winery", boost: 80, context: "Eauze", commune: "Eauze", ...at(CONDOM, -20000, -10000) }),
+  record({ featureId: "bar-n124", canonicalName: "N 124", kind: "business", category: "restaurant", boost: 160, context: "Village, Bascous", commune: "Bascous", ...at(CONDOM, -15000, -15000) }),
+  record({ featureId: "route-d1021", canonicalName: "D1021", kind: "road", category: "primary", boost: 200, context: "Former N21 · 60 km · 12 communes", ref: "D1021;N21", aliases: ["N21"], ...at(AUCH, 0, 9000), bbox: [-10000, -40000, 10000, 40000] }),
   record({ featureId: "river-baise", canonicalName: "La Baïse", kind: "water", category: "river", boost: 90, context: "88 km · 30 communes", ...at(CONDOM, 500, 0), bbox: [-35000, -40000, -20000, 40000] }),
 ];
 

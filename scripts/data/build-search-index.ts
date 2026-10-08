@@ -425,11 +425,13 @@ const MIN_ROUTE_METRES = 300;
 
 /**
  * Numbers a road carried before it was transferred and renumbered. People and
- * older signs still use them, so they stay searchable: the national road from
- * Auch to Toulouse is now the departmental D1124 in BD TOPO and OpenStreetMap.
+ * older signs still use them, so they stay searchable: in BD TOPO and
+ * OpenStreetMap the national road from Auch to Toulouse is now the D1124, and
+ * the Agen–Auch–Tarbes road the D1021.
  */
 export const FORMER_ROUTE_NUMBERS: Readonly<Record<string, readonly string[]>> = {
   D1124: ["N124"],
+  D1021: ["N21"],
 };
 
 /** BD TOPO kilometre markers: survey references, not places anyone looks for. */

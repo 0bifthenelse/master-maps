@@ -517,15 +517,18 @@ export interface CategoryIntent {
 export function categoryIntents(tokens: readonly string[], options: { prefix?: boolean } = {}): CategoryIntent[] {
   const found: CategoryIntent[] = [];
   const used = new Set<number>();
+  /* The same words may name several categories ("chateau": a castle or a wine estate). */
+  const spans = new Set<string>();
   /* Whole words first, so "gare" means a station before it is read as the start of "garer". */
   for (const allowPrefix of options.prefix === false ? [false] : [false, true]) {
     for (const entry of terms()) {
       for (let start = 0; start + entry.tokens.length <= tokens.length; start += 1) {
+        const span = `${start}:${entry.tokens.length}`;
         let matches = true;
         for (let offset = 0; offset < entry.tokens.length; offset += 1) {
           const token = tokens[start + offset]!;
           const term = entry.tokens[offset]!;
-          if (used.has(start + offset)) { matches = false; break; }
+          if (used.has(start + offset) && !spans.has(span)) { matches = false; break; }
           const last = start + offset === tokens.length - 1;
           /* Plural tolerance ("pharmacies"), and while typing a prefix of the last word ("restau"). */
           const whole = token === term || token === `${term}s` || `${token}s` === term;
@@ -534,6 +537,7 @@ export function categoryIntents(tokens: readonly string[], options: { prefix?: b
         if (!matches) continue;
         const consumed = entry.tokens.map((_, offset) => start + offset);
         for (const index of consumed) used.add(index);
+        spans.add(span);
         if (!found.some((intent) => intent.category === entry.category)) found.push({ category: entry.category, consumed });
       }
     }
