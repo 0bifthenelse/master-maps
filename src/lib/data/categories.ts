@@ -69,7 +69,7 @@ export const CATEGORIES: readonly CategoryDefinition[] = [
   C("car_repair", "Car repair", "transport", "wrench", 15.5, ["car repair", "garage", "mecanique", "mechanic", "carrosserie", "body shop", "controle technique", "pneus", "tyres"]),
   C("car_dealer", "Car dealer", "transport", "car", 15.5, ["car dealer", "concessionnaire", "automobile", "voitures", "occasion", "car sales"]),
   C("train_station", "Train station", "transport", "train", 12, ["train", "train station", "railway station", "gare", "sncf", "railway"]),
-  C("bus_stop", "Bus stop", "transport", "bus", 16.5, ["bus", "bus stop", "arret", "autocar", "car", "liO", "lio"]),
+  C("bus_stop", "Bus stop", "transport", "bus", 16.5, ["bus", "bus stop", "arret", "autocar", "car", "lio"]),
   C("airport", "Airfield", "transport", "plane", 12, ["airport", "aerodrome", "airfield", "aeroport", "aviation"]),
   C("taxi", "Taxi & ambulance", "transport", "car", 16, ["taxi", "vtc", "ambulance", "transport sanitaire"]),
   C("bank", "Bank", "money", "bank", 15, ["bank", "banque", "credit agricole", "caisse d'epargne", "banque populaire", "credit mutuel", "bnp", "societe generale", "lcl", "la banque postale"]),

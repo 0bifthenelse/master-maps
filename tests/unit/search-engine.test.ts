@@ -81,6 +81,7 @@ describe("SearchEngine: businesses and categories", () => {
 
   it("favours the named kind of place in a longer query", () => {
     expect(top("hopital auch")).toBe("ch-auch");
+    expect(top("cinema auch")).toBe("cine-32");
   });
 
   it("puts a place whose whole name is the query ahead of the categories its words name", () => {

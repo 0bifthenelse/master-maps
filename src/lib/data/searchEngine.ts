@@ -41,6 +41,7 @@ const MISS_PENALTY = 380;
 const ROAD_NUMBER_BONUS = 600;
 const ROAD_NUMBER = /^[adne]\d{1,4}[a-z]?$/;
 const CATEGORY_MATCH_BONUS = 240;
+const STOP_NAMESAKE_PENALTY = 400;
 /** Below this share of a category carrying the query word in its names, the word is a brand, not a generic term. */
 const BRAND_SHARE = 0.3;
 
@@ -405,6 +406,8 @@ export class SearchEngine {
         for (const candidate of candidates) {
           const category = this.records[candidate.record]!.category;
           if (category !== undefined && wanted.has(category)) candidate.score += CATEGORY_MATCH_BONUS;
+          /* Stops take the name of what they serve: the "Cinéma" stop is not the cinema. */
+          else if (category === "bus_stop") candidate.score -= STOP_NAMESAKE_PENALTY;
         }
       }
     }

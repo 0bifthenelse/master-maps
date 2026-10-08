@@ -56,6 +56,8 @@ export const FIXTURE_RECORDS: SearchRecord[] = [
   record({ featureId: "domaine-armagnac", canonicalName: "Domaine d'Armagnac", kind: "business", category: "winery", boost: 80, context: "Eauze", commune: "Eauze", ...at(CONDOM, -20000, -10000) }),
   record({ featureId: "bar-n124", canonicalName: "N 124", kind: "business", category: "restaurant", boost: 160, context: "Village, Bascous", commune: "Bascous", ...at(CONDOM, -15000, -15000) }),
   record({ featureId: "route-d1021", canonicalName: "D1021", kind: "road", category: "primary", boost: 200, context: "Former N21 · 60 km · 12 communes", ref: "D1021;N21", aliases: ["N21"], ...at(AUCH, 0, 9000), bbox: [-10000, -40000, 10000, 40000] }),
+  record({ featureId: "bus-cinema", canonicalName: "Cinéma", kind: "transport", category: "bus_stop", boost: 25, context: "Auch", commune: "Auch", ...at(AUCH, 400, 300) }),
+  record({ featureId: "cine-32", canonicalName: "Ciné 32", kind: "poi", category: "cinema", boost: 90, context: "Auch", commune: "Auch", ...at(AUCH, 420, 330) }),
   record({ featureId: "river-baise", canonicalName: "La Baïse", kind: "water", category: "river", boost: 90, context: "88 km · 30 communes", ...at(CONDOM, 500, 0), bbox: [-35000, -40000, -20000, 40000] }),
 ];
 
