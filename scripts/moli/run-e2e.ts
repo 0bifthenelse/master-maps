@@ -20,12 +20,23 @@ async function waitForPort(host: string, port: number, timeoutMs = 30000): Promi
   throw new Error(`Timed out waiting for ${host}:${port}`);
 }
 
+function stopGroup(child: ChildProcess, signal: NodeJS.Signals): void {
+  if (child.pid === undefined) return;
+  try {
+    process.kill(-child.pid, signal);
+  } catch {
+    /* Already gone. */
+  }
+}
+
 async function main(): Promise<void> {
   console.log("Starting Next.js production server...");
+  /* Its own process group, so stopping it also stops the next-server that npm and the shell start. */
   const next: ChildProcess = spawn("npm", ["run", "start", "--", "--port", String(NEXT_PORT)], {
     cwd: ROOT,
     stdio: ["ignore", "pipe", "pipe"],
     shell: true,
+    detached: true,
   });
   next.stdout?.on("data", (data: Buffer) => process.stdout.write(`[next] ${data}`));
   next.stderr?.on("data", (data: Buffer) => process.stderr.write(`[next:err] ${data}`));
@@ -58,10 +69,11 @@ async function main(): Promise<void> {
       console.log("Moli CDP version:", JSON.stringify(versionData, null, 2));
     }
     console.log("\nRunning Playwright E2E tests...");
+    /* No shell: arguments such as a -g pattern with "|" reach Playwright verbatim. */
     const pw: ChildProcess = spawn("npx", ["playwright", "test", "--config", "playwright.config.ts", ...process.argv.slice(2)], {
       cwd: ROOT,
       stdio: "inherit",
-      shell: true,
+      shell: process.platform === "win32",
       env: {
         ...process.env,
         MOLI_CDP: `http://127.0.0.1:${MOLI_PORT}`,
@@ -76,12 +88,12 @@ async function main(): Promise<void> {
     process.exitCode = exitCode;
     console.log(`Playwright exit code: ${exitCode}`);
   } finally {
-    next.kill("SIGTERM");
+    stopGroup(next, "SIGTERM");
     moli?.kill("SIGTERM");
     setTimeout(() => {
-      next.kill("SIGKILL");
+      stopGroup(next, "SIGKILL");
       moli?.kill("SIGKILL");
-    }, 3000);
+    }, 3000).unref();
   }
 }
 
