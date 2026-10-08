@@ -33,3 +33,28 @@ export function tidyLabel(value: string): string {
     .trim();
   return tidied === "" ? value.trim() : tidied;
 }
+
+/** Street types the address registers abbreviate, spelled out as on a street sign. */
+const STREET_TYPES: Readonly<Record<string, string>> = {
+  r: "Rue", rue: "Rue", av: "Avenue", ave: "Avenue", bd: "Boulevard", bld: "Boulevard", che: "Chemin", chem: "Chemin", ch: "Chemin",
+  rte: "Route", pl: "Place", imp: "Impasse", all: "Allée", sq: "Square", prom: "Promenade", rpt: "Rond-Point", res: "Résidence",
+  lot: "Lotissement", crs: "Cours", fg: "Faubourg", fbg: "Faubourg", qu: "Quai", pkg: "Parking", ham: "Hameau", sen: "Sentier",
+  rle: "Ruelle", rlle: "Ruelle", tra: "Traverse", pass: "Passage", esp: "Esplanade", cr: "Chemin rural", vc: "Voie communale",
+};
+
+const COMPOUND_PARTICLES = new Set(["de", "du", "des", "d", "la", "le", "les", "l", "sur", "sous", "en", "et", "lès", "lez", "ès", "à", "aux", "au", "dit"]);
+
+/** Each part of a compound proper name capitalised: "Sadi-carnot" → "Sadi-Carnot"; "Saint-Jean-de-Luz" is unchanged. */
+export function capitaliseCompounds(value: string): string {
+  return value.replace(/([\p{Lu}][\p{Ll}'’]*)-(\p{Ll}+)/gu, (match, before: string, after: string) => (
+    COMPOUND_PARTICLES.has(after) ? match : `${before}-${after[0]!.toUpperCase()}${after.slice(1)}`
+  ));
+}
+
+/** A street name as signposted: the abbreviated type spelled out ("Che du Moulin" → "Chemin du Moulin") and its compounds capitalised. */
+export function displayStreetName(value: string): string {
+  const words = displayCase(value).split(" ");
+  const type = STREET_TYPES[words[0]!.replace(/\.$/, "").toLowerCase()];
+  if (type !== undefined && words.length > 1) words[0] = type;
+  return capitaliseCompounds(words.join(" "));
+}

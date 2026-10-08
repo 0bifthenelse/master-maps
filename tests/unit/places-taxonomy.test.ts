@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { conflateBusinesses, nameSimilarity } from "../../scripts/data/conflate";
 import { categoryFamily, categoryForFreeText, categoryForNaf, categoryForOsmTags, categoryIntents, nafIsPlace } from "@/lib/data/categories";
-import { displayCase, tidyLabel } from "@/lib/data/displayText";
+import { capitaliseCompounds, displayCase, displayStreetName, tidyLabel } from "@/lib/data/displayText";
 import { formatDay, openState, parseOpeningHours } from "@/lib/data/openingHours";
 import type { BusinessFeature, PoiFeature } from "@/lib/data/schema";
 
@@ -139,5 +139,25 @@ describe("tidyLabel", () => {
     expect(tidyLabel("Musée (annexe)")).toBe("Musée (annexe)");
     expect(tidyLabel("Saint-Clar")).toBe("Saint-Clar");
     expect(tidyLabel(" / ")).toBe("/");
+  });
+});
+
+describe("displayStreetName", () => {
+  it("spells out abbreviated street types and capitalises compound names", () => {
+    expect(displayStreetName("Che du Moulin")).toBe("Chemin du Moulin");
+    expect(displayStreetName("R Gambetta")).toBe("Rue Gambetta");
+    expect(displayStreetName("Pl Jean Jaures")).toBe("Place Jean Jaures");
+    expect(displayStreetName("Vc 3")).toBe("Voie communale 3");
+    expect(displayStreetName("Boulevard Sadi-carnot")).toBe("Boulevard Sadi-Carnot");
+    expect(displayStreetName("Route de l'Isle-jourdain")).toBe("Route de l'Isle-Jourdain");
+    expect(displayStreetName("rue des écoles")).toBe("Rue des Écoles");
+    expect(displayStreetName("Rd 930")).toBe("Rd 930");
+  });
+
+  it("leaves particles of compound place names alone", () => {
+    expect(capitaliseCompounds("Saint-Martin-d'Armagnac")).toBe("Saint-Martin-d'Armagnac");
+    expect(capitaliseCompounds("Saint-Jean-de-Luz")).toBe("Saint-Jean-de-Luz");
+    expect(capitaliseCompounds("Lieu-dit les Cabanes")).toBe("Lieu-dit les Cabanes");
+    expect(capitaliseCompounds("Bel-air")).toBe("Bel-Air");
   });
 });

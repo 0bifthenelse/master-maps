@@ -38,7 +38,7 @@ import { ADOPTED_LAYERS } from "./bdtopoLayers";
 import { createBoundaryIndex, type BoundaryIndex } from "./boundaryIndex";
 import { normalizeBdtopo, settlementAnchors } from "./normalizeBdtopo";
 import { categoryForNaf, categoryForOsmTags, nafIsPlace } from "../../src/lib/data/categories";
-import { displayCase, tidyLabel } from "../../src/lib/data/displayText";
+import { capitaliseCompounds, displayCase, displayStreetName, tidyLabel } from "../../src/lib/data/displayText";
 import { conflateBusinesses } from "./conflate";
 import {
   emptyOsmNormalizeReport,
@@ -1297,14 +1297,18 @@ const TITLE_CASED_KINDS = new Set(["poi", "business", "landuse", "building", "tr
 
 function canonicalLabel(kind: string, value: string): string {
   const tidied = tidyLabel(value);
+  /* Streets read as signposted ("Che du Moulin" is "Chemin du Moulin"), places with every compound part capitalised. */
+  if (kind === "road") return displayStreetName(tidied);
+  if (kind === "place") return capitaliseCompounds(tidied);
   return TITLE_CASED_KINDS.has(kind) && !/[a-zß-ÿ]/.test(tidied) && /[A-Z]{3}/.test(tidied) ? displayCase(tidied) : tidied;
 }
 
 function canonicalFeature(input: MapFeature): MapFeature {
   const name = input.name === undefined ? undefined : canonicalLabel(input.kind, input.name);
   const businessName = input.kind === "business" ? canonicalLabel(input.kind, input.businessName) : undefined;
-  const feature = (name !== input.name || (input.kind === "business" && businessName !== input.businessName))
-    ? { ...input, ...(name === undefined ? {} : { name }), ...(businessName === undefined ? {} : { businessName }) } as MapFeature
+  const street = input.kind === "address" && input.street !== undefined ? displayStreetName(input.street) : undefined;
+  const feature = (name !== input.name || (input.kind === "business" && businessName !== input.businessName) || (input.kind === "address" && street !== input.street))
+    ? { ...input, ...(name === undefined ? {} : { name }), ...(businessName === undefined ? {} : { businessName }), ...(street === undefined ? {} : { street }) } as MapFeature
     : input;
   const geometry = canonicalGeometry(feature.geometry);
   const localGeometry = feature.localGeometry ? canonicalGeometry(feature.localGeometry) : undefined;
@@ -1344,7 +1348,7 @@ async function normalizeAddressesInto(source: AddressSourceInput, boundary: Boun
       if (longitude === undefined || latitude === undefined || !boundaryIndex.contains([longitude, latitude])) continue;
       const housenumber = [text(record.numero), text(record.repetition)].filter((part) => part !== undefined).join(" ");
       const rawStreet = text(record.streetName ?? record.street) ?? text(record.localityName);
-      const street = rawStreet === undefined ? "unknown street" : displayCase(rawStreet);
+      const street = rawStreet === undefined ? "unknown street" : displayStreetName(rawStreet);
       const postcode = text(record.postalCode) ?? "";
       const city = text(record.city) ?? GERS_TERRITORY.name;
       const banId = text(record.banId);
