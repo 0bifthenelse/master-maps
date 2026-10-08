@@ -153,7 +153,7 @@ void main() {
     float period = vDash.x + vDash.y;
     if (mod(vDistancePx, period) > vDash.x) discard;
   }
-  float alpha = vColor.a * uLayerOpacity * vFade;
+  float alpha = vColor.a * uLayerOpacity * vFade * mix(1.0, 0.82, uSatellite);
   if (alpha <= 0.002) discard;
   vec3 rgb = mix(vColor.rgb, max(vColor.rgb, uSatelliteTint), uSatellite * 0.35);
   gl_FragColor = vec4(rgb, alpha);
@@ -239,7 +239,8 @@ void main() {
   /* A cold band of light along the top of each wall: the Machine's wireframe city. */
   float rim = (1.0 - roof) * smoothstep(0.86, 1.0, vRelative);
   color = mix(color, uEdge, rim * 0.55);
-  float alpha = uOpacity * mix(1.0, 0.82, uSatellite);
+  /* Over aerial imagery the roofs turn to glass so the photo shows through a wireframe city. */
+  float alpha = uOpacity * mix(1.0, mix(0.5, 0.08, roof), uSatellite);
   gl_FragColor = vec4(color, alpha);
 }
 `;
