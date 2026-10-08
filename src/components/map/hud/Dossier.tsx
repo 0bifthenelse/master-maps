@@ -51,16 +51,22 @@ export default function Dossier({ data, loading, onClose, onCenter, onCopyCoordi
   }
   const closeRef = useRef<HTMLButtonElement | null>(null);
 
+  /* One listener for the dossier's lifetime: a listener re-subscribed because an earlier
+     handler of the same key press re-rendered the map would miss that press. */
+  const onCloseRef = useRef(onClose);
+  useEffect(() => {
+    onCloseRef.current = onClose;
+  }, [onClose]);
   useEffect(() => {
     const onKey = (event: KeyboardEvent): void => {
       if (event.key !== "Escape") return;
       const target = event.target as HTMLElement | null;
       if (target !== null && (target.tagName === "INPUT" || target.tagName === "TEXTAREA")) return;
-      onClose();
+      onCloseRef.current();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
+  }, []);
 
   return (
     <aside className="mm-dossier mm-panel mm-brackets" aria-label={`Details: ${data.title}`} data-collapsed={collapsed} data-testid="feature-dossier">

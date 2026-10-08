@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 
 const ROWS: ReadonlyArray<[string[], string]> = [
   [["Drag"], "Pan the map (it glides when thrown)"],
@@ -21,16 +21,21 @@ const ROWS: ReadonlyArray<[string[], string]> = [
 ];
 
 export default function ShortcutHelp({ onClose }: { onClose: () => void }) {
+  /* Stable listener, as in the dossier: a re-subscription during the same key press would miss it. */
+  const onCloseRef = useRef(onClose);
+  useEffect(() => {
+    onCloseRef.current = onClose;
+  }, [onClose]);
   useEffect(() => {
     const onKey = (event: KeyboardEvent): void => {
       if (event.key === "Escape" || event.key === "?") {
         event.preventDefault();
-        onClose();
+        onCloseRef.current();
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
+  }, []);
   return (
     <div className="mm-help" role="dialog" aria-modal="true" aria-label="Keyboard and gesture shortcuts" onClick={onClose}>
       <div className="mm-help__card mm-panel mm-brackets" onClick={(event) => event.stopPropagation()}>
